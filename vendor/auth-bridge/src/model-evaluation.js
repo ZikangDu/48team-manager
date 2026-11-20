@@ -1,219 +1,33 @@
 import { createProxiedFetch, resolveSessionProxy } from '../login-service/lib/proxy-config.js';
 import { runAccountTask } from '../login-service/lib/task-concurrency.js';
-import { readEvaluationEvents } from '../docs/evaluation-stream.js';
+import { evaluationParameters, evaluationApi, requestEvaluation, evaluationTimeoutMs } from '../docs/evaluation-core.js';
 
-const REASONING_EFFORTS = new Set(['default', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']);
-
-export const EVALUATION_QUESTIONS = {
-  candy: '在一个黑色的袋子里放有三种口味的馒头，每种馒头有两种不同的形状（圆形和五角星形，不同的形状靠手感可以分辨）。数量如下：\n形状 | 苹果味 | 桃子味 | 西瓜味\n圆形 | 7 | 9 | 8\n五角星形 | 7 | 6 | 4\n参赛者需要在活动前决定摸出的馒头数目，那么最少取出多少个才能保证手中同时拥有不同形状的苹果味和桃子味馒头？圆形苹果配五角星桃子，或者圆形桃子配五角星苹果，都满足要求。帮我做一下，不调用任何工具、不联网、不要读取本地文件。请解释理由，最后单独一行写“答案：数字”。',
-  pelican: '创建一个HTML，内容是用SVG绘制一个鹈鹕骑自行车的2D动画，你不能进行任何测试，不能调用skills，不能网络检索，不能调用子智能体，直接生成。\n只输出一个可独立打开的完整HTML文件，不要解释或Markdown围栏。用内联SVG和CSS/SMIL实现循环动画，保留可辨认的鹈鹕、大嘴、双轮自行车和踩踏动作。代码尽量控制在120行、6000字符以内，使用defs/use复用图形，避免复杂背景、装饰和重复路径；无需JavaScript和外部资源。',
-};
+export { EVALUATION_QUESTIONS, gradeEvaluation, parseEvaluationResponse } from '../docs/evaluation-core.js';
 
 export function validateEvaluation(body = {}) {
-  const { account, api, question, model = 'gpt-6-astra' } = body || {};
-  const reasoningEffort = body?.reasoningEffort === undefined ? (api?.protocol === 'chat' ? 'default' : 'medium') : body.reasoningEffort;
-  if (!REASONING_EFFORTS.has(reasoningEffort)) {
-    throw Object.assign(new Error('请选择有效的思考程度'), { statusCode: 400 });
-  }
-  if (!api && reasoningEffort === 'ultra') {
+  const { account, api, question, model, reasoningEffort } = body || {};
+  const params = evaluationParameters({ question, model, reasoningEffort, protocol: api?.protocol });
+  if (api) return { ...params, ...evaluationApi(api) };
+  if (params.reasoningEffort === 'ultra') {
     throw Object.assign(new Error('账号模式的 ultra 需要 Codex 客户端执行任务委派。单次模型测试请另选思考程度。'), { statusCode: 400 });
   }
-  if (!Object.hasOwn(EVALUATION_QUESTIONS, question) || typeof model !== 'string' || !/^[a-zA-Z0-9._-]{1,100}$/.test(model)
-    || (!api && (typeof account?.accessToken !== 'string' || !account.accessToken.trim() || account.accessToken.length > 32768 || /[\r\n]/.test(account.accessToken)
-    || (account.accountId != null && (typeof account.accountId !== 'string' || account.accountId.length > 200 || /[\r\n]/.test(account.accountId)))))) {
+  if (typeof account?.accessToken !== 'string' || !account.accessToken.trim() || account.accessToken.length > 32768 || /[\r\n]/.test(account.accessToken)
+    || (account.accountId != null && (typeof account.accountId !== 'string' || account.accountId.length > 200 || /[\r\n]/.test(account.accountId)))) {
     throw Object.assign(new Error('请提供有效账号、模型和测试题'), { statusCode: 400 });
-  }
-  if (api) {
-    let endpoint;
-    try {
-      if (typeof api.baseUrl !== 'string' || api.baseUrl.length > 2048 || typeof api.key !== 'string' || !api.key.trim()
-        || api.key.length > 32768 || /[\r\n]/.test(api.key) || !['responses', 'chat'].includes(api.protocol)) throw new Error();
-      endpoint = new URL(api.baseUrl.trim());
-      if (!['https:', 'http:'].includes(endpoint.protocol) || endpoint.username || endpoint.password || endpoint.search || endpoint.hash) throw new Error();
-      let path = endpoint.pathname.replace(/\/+$/, '').replace(/\/(?:responses|chat\/completions)$/, '');
-      if (!path) path = '/v1';
-      endpoint.pathname = `${path}/${api.protocol === 'chat' ? 'chat/completions' : 'responses'}`;
-    } catch {
-      throw Object.assign(new Error('请提供有效的 HTTP(S) API 地址、Key 和接口类型'), { statusCode: 400 });
-    }
-    return { question, model, reasoningEffort, endpoint: endpoint.href, key: api.key.trim(), protocol: api.protocol };
   }
   if (String(account.planType || account.plan_type || '').trim().toLowerCase() === 'free') {
     throw Object.assign(new Error('free 账号不参与模型测试'), { statusCode: 400 });
   }
-  return { account, question, model, reasoningEffort, endpoint: 'https://chatgpt.com/backend-api/codex/responses', key: account.accessToken.trim(), protocol: 'responses' };
-}
-
-function completedEvaluationText(response, streamedOutput = '') {
-  if (!response || response.error || response.status && response.status !== 'completed') throw new Error('模型响应未完成');
-  const content = (response.output || []).flatMap(item => item.type === 'message' ? item.content || [] : [])
-    .filter(item => item.type === 'output_text').map(item => item.text || '').join('');
-  // Some providers only send status/usage at completion; the deltas already contain the answer.
-  const output = [content, response.output_text, streamedOutput].find(text => typeof text === 'string' && text.trim());
-  if (!output) throw new Error('模型未返回文本');
-  if (output.length > 256 * 1024) throw new Error('模型输出过大');
-  return output;
-}
-
-// Report only the locally validated effort. Provider error strings can contain credentials.
-function checkEffortError(payload, effort, status) {
-  if (!payload || effort === 'default') return;
-  const detail = payload.error || payload.response?.error || payload.detail || payload;
-  const message = typeof detail === 'string' ? detail : String(detail.message || '');
-  const effortParam = /^(reasoning(?:[._]effort)?|effort)$/i.test(detail.param || '');
-  const namesEffort = /reasoning[\s._-]*effort/i.test(message) || message.toLowerCase().includes(`'${effort}'`) || message.toLowerCase().includes(`"${effort}"`);
-  if ((effortParam || namesEffort) && /unsupported|not supported|does not support|invalid|only supports?|supported values|not allowed|unknown parameter|unrecognized/i.test(`${detail.code || ''} ${message}`)) {
-    throw new Error(`模型接口不接受所选思考程度 ${effort}${status ? `（HTTP ${status}）` : ''}。请改选该接口支持的档位或“模型默认”。`);
-  }
-}
-
-async function readErrorPayload(body) {
-  if (!body) return null;
-  const reader = body.getReader();
-  const decoder = new TextDecoder();
-  let text = '', size = 0;
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) return JSON.parse(text + decoder.decode());
-      size += value.byteLength;
-      if (size > 16 * 1024) return null;
-      text += decoder.decode(value, { stream: true });
-    }
-  } catch {
-    return null;
-  } finally {
-    await reader.cancel().catch(() => {});
-    reader.releaseLock();
-  }
-}
-
-export function parseEvaluationResponse(text) {
-  let completed;
-  let deltas = '';
-  if (text.trim().startsWith('{')) {
-    completed = JSON.parse(text);
-  } else {
-    for (const line of text.split(/\r?\n/)) {
-      if (!line.startsWith('data:')) continue;
-      const data = line.slice(5).trim();
-      if (!data || data === '[DONE]') continue;
-      const event = JSON.parse(data);
-      if (event.error || ['error', 'response.failed', 'response.incomplete', 'response.cancelled'].includes(event.type)) throw new Error('模型返回失败或不完整的结果');
-      if (event.type === 'response.output_text.delta') deltas += event.delta || '';
-      if (['response.completed', 'response.done'].includes(event.type)) completed = event.response;
-    }
-  }
-  return completedEvaluationText(completed, deltas);
-}
-
-export function gradeEvaluation(question, output) {
-  if (question === 'candy') {
-    const answer = output.trim().match(/(?:^|\n)\s*(?:\*\*)?答案\s*[:：]\s*(\d+)(?:\*\*)?\s*[。.]?\s*$/)?.[1];
-    return { status: answer ? (answer === '21' ? 'passed' : 'wrong_answer') : 'invalid_format', answer: answer || '' };
-  }
-  const html = output.trim().replace(/^```(?:html)?\s*/i, '').replace(/\s*```$/, '');
-  return { status: /<html\b/i.test(html) && /<\/html>/i.test(html) && /<svg\b/i.test(html) ? 'manual_review' : 'invalid_format', html };
+  return { ...params, account, endpoint: 'https://chatgpt.com/backend-api/codex/responses', key: account.accessToken.trim(), protocol: 'responses' };
 }
 
 export async function evaluateModel(body, { signal, fetchImpl, onEvent = () => {} } = {}) {
-  const { account, question, model, reasoningEffort, endpoint, key, protocol } = validateEvaluation(body);
+  const settings = validateEvaluation(body);
   const started = Date.now();
   onEvent({ type: 'phase', phase: 'queued' });
-  const upstreamTimeoutMs = ['xhigh', 'max', 'ultra'].includes(reasoningEffort) ? 20 * 60_000 : 150_000;
-  const requestModel = async (fetchImpl, requestSignal, progress) => {
-    onEvent({ type: 'phase', phase: 'connecting' });
-    const requestBody = protocol === 'chat'
-      ? { model, stream: true, messages: [{ role: 'user', content: EVALUATION_QUESTIONS[question] }] }
-      : { model, stream: true, store: false, instructions: "Follow the user's request. No tools are available.",
-        input: [{ role: 'user', content: [{ type: 'input_text', text: EVALUATION_QUESTIONS[question] }] }] };
-    if (reasoningEffort !== 'default') {
-      if (protocol === 'chat') requestBody.reasoning_effort = reasoningEffort;
-      else requestBody.reasoning = { effort: reasoningEffort };
-    }
-    const response = await fetchImpl(endpoint, {
-      method: 'POST', redirect: 'manual',
-      signal: requestSignal,
-      headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json', Accept: 'text/event-stream',
-        ...(account?.accountId ? { 'ChatGPT-Account-Id': account.accountId } : {}) },
-      body: JSON.stringify(requestBody),
-    });
-    if (!response.ok) {
-      if ([400, 422].includes(response.status) && reasoningEffort !== 'default') {
-        checkEffortError(await readErrorPayload(response.body), reasoningEffort, response.status);
-      } else await response.body?.cancel();
-      throw new Error(`模型请求失败（HTTP ${response.status}）`);
-    }
-    progress.stage = '已收到响应头，仍在等待首字';
-    onEvent({ type: 'phase', phase: 'waiting' });
-    let output = '', completed = false, firstTokenMs = null, usage = null;
-    const append = delta => {
-      if (typeof delta !== 'string' || !delta) return;
-      output += delta;
-      if (output.length > 256 * 1024) throw new Error('模型输出过大');
-      firstTokenMs ??= Date.now() - started;
-      progress.stage = '已收到部分正文，仍在等待模型完成';
-      onEvent({ type: 'delta', delta, firstTokenMs, durationMs: Date.now() - started });
-    };
-    if (response.headers.get('content-type')?.includes('application/json')) {
-      const text = await response.text();
-      if (text.length > 1024 * 1024) throw new Error('模型响应过大');
-      const data = JSON.parse(text);
-      if (data.error || data.status === 'failed') checkEffortError(data, reasoningEffort);
-      if (protocol === 'chat') {
-        if (data.error || data.choices?.[0]?.finish_reason !== 'stop') throw new Error('模型响应未完成');
-        append(data.choices[0].message?.content);
-      } else append(parseEvaluationResponse(text));
-      completed = true;
-      usage = data.usage;
-    } else {
-      await readEvaluationEvents(response.body, event => {
-        if (event.error || event.type === 'error' || event.type === 'response.failed' || event.response?.error) checkEffortError(event, reasoningEffort);
-        if (event.error || ['error', 'response.failed', 'response.incomplete', 'response.cancelled'].includes(event.type)) throw new Error('模型返回失败或不完整的结果');
-        if (event.type === 'response.output_text.delta') append(event.delta);
-        if (['response.completed', 'response.done'].includes(event.type)) {
-          const canonical = completedEvaluationText(event.response, output);
-          if (!output) append(canonical);
-          output = canonical;
-          completed = true;
-          usage = event.response?.usage;
-        }
-        if (protocol === 'chat') {
-          const choice = event.choices?.find(item => item.index === 0) || event.choices?.[0];
-          append(choice?.delta?.content);
-          if (choice?.finish_reason) {
-            if (choice.finish_reason !== 'stop') throw new Error('模型返回失败或不完整的结果');
-            completed = true;
-          }
-          if (event.usage) usage = event.usage;
-        }
-      });
-    }
-    if (!completed) throw new Error('模型响应未完成');
-    if (!output.trim()) throw new Error('模型未返回文本');
-    return { model, reasoningEffort, question, output, ...gradeEvaluation(question, output), firstTokenMs,
-      outputChars: output.length, outputTokens: usage?.output_tokens ?? usage?.completion_tokens ?? null, durationMs: Date.now() - started };
-  };
-  const run = async transport => {
-    const progress = { stage: '仍在等待上游响应头' };
-    const deadline = new AbortController();
-    const timer = setTimeout(() => deadline.abort(), upstreamTimeoutMs);
-    timer.unref?.();
-    const requestSignal = signal ? AbortSignal.any([signal, deadline.signal]) : deadline.signal;
-    try {
-      requestSignal.throwIfAborted();
-      return await requestModel(transport, requestSignal, progress);
-    } catch (error) {
-      signal?.throwIfAborted();
-      if (deadline.signal.aborted || ['UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT'].includes(error.cause?.code || error.code)) {
-        throw new Error(`模型请求超时（${upstreamTimeoutMs / 1000} 秒），${progress.stage}。`);
-      }
-      throw error;
-    } finally {
-      clearTimeout(timer);
-    }
-  };
+  const run = transport => requestEvaluation(settings, { fetchImpl: transport, signal, onEvent, started });
   if (fetchImpl) return run(fetchImpl);
+  const upstreamTimeoutMs = evaluationTimeoutMs(settings.reasoningEffort);
   return runAccountTask(async () => {
     const transport = createProxiedFetch(resolveSessionProxy().proxyUrl, { upstreamTimeoutMs });
     try { return await run(transport); }

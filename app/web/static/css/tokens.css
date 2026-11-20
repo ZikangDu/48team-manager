@@ -5,7 +5,7 @@
 
   /* 底色层次（浅色） */
   --bg: #ffffff;
-  --sidebar: #ffffff;
+  --sidebar: #f8f9f7;
   --surface: #f1f2f0;          /* tile：卡片、面板 */
   --surface-subtle: #f1f2f0;   /* 与 tile 同色：表头、区块不再另铺一层 */
   --surface-muted: #e6e8e4;    /* tile-2：悬停、卡内二级块、标签底 */
@@ -72,7 +72,7 @@
   --radius-pill: 9999px;
 
   /* 尺寸与布局 */
-  --sidebar-w: 240px;
+  --sidebar-w: 224px;
   --sheet-w: 600px;
   --content-max: 1440px;
   --settings-max: 1200px;
@@ -153,7 +153,7 @@
 
   /* 底色层次（深色，默认）：纯黑底 + 近黑 tile */
   --bg: #000000;
-  --sidebar: #000000;
+  --sidebar: #0c0d0c;
   --surface: #141514;
   --surface-subtle: #141514;
   --surface-muted: #1d1f1d;

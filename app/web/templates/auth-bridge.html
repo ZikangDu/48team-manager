@@ -1,0 +1,71 @@
+<section id="bridge-workbench" aria-label="授权工具">
+  <div class="bridge-context">
+    <label id="evaluation-source-label" hidden>评测来源
+      <select id="evaluation-source"><option value="account">Team48 账号</option><option value="api">自己的 API</option></select>
+    </label>
+    <label for="bridge-account" id="bridge-account-label"><span id="bridge-account-name">当前账号</span>
+      <select id="bridge-account" aria-labelledby="bridge-account-name" disabled><option value="">正在读取账号…</option></select>
+    </label>
+    <p id="bridge-account-note" class="hint" role="status"></p>
+    <a class="button" id="bridge-account-detail" hidden>查看账号详情</a>
+    <button type="button" class="button" id="bridge-reload" hidden>重新读取账号</button>
+    <a class="button" href="/accounts?assist=protocol">打开协议登录</a>
+  </div>
+  <nav class="bridge-tabs" aria-label="当前账号的工具">
+    <a data-tool="health" href="?tool=health">会话测活</a>
+    <a data-tool="model-evaluation" href="?tool=model-evaluation">模型评测</a>
+    <a data-tool="workspaces" href="?tool=workspaces">工作区</a>
+  </nav>
+  <section data-panel="health" class="bridge-panel" aria-labelledby="health-title">
+    <header><h2 id="health-title">会话测活</h2><p class="hint">检查所选账号的授权状态，以及五小时和七天的额度用量。</p></header>
+    <div class="bridge-actions"><button type="button" id="bridge-check" class="button primary" disabled>检查会话</button></div>
+    <p id="health-status" class="bridge-status" role="status"></p>
+    <dl class="bridge-facts" id="health-details" hidden>
+      <div><dt>响应状态</dt><dd id="health-code">—</dd></div>
+      <div><dt>五小时已用</dt><dd id="health-five">—</dd></div>
+      <div><dt>七天已用</dt><dd id="health-week">—</dd></div>
+      <div><dt>设备数</dt><dd id="health-devices">—</dd></div>
+    </dl>
+    <p class="hint" id="health-timing" hidden></p>
+  </section>
+  <section data-panel="model-evaluation" class="bridge-panel" aria-labelledby="evaluation-title" hidden>
+    <header><h2 id="evaluation-title">模型评测</h2><p class="hint">发送一道测试题，查看模型的回答、判定和耗时。每次评测使用一次模型请求。</p></header>
+    <form id="evaluation-form">
+      <fieldset id="evaluation-api" class="bridge-api" disabled hidden>
+        <legend>API 连接</legend>
+        <div class="bridge-fields">
+          <label>API 地址<input type="url" name="baseUrl" placeholder="https://api.openai.com/v1" required spellcheck="false" autocomplete="off"></label>
+          <label>API Key<input type="password" name="key" required autocomplete="off" spellcheck="false"></label>
+          <label>接口类型<select name="protocol"><option value="responses">Responses</option><option value="chat">Chat Completions</option></select></label>
+        </div>
+        <p class="hint">浏览器会把密钥直接发送给上面填写的地址。服务端需允许跨域请求。</p>
+      </fieldset>
+      <div class="bridge-fields">
+        <label>测试题<select name="question"><option value="candy">逻辑推理 · 摸馒头</option><option value="pelican">SVG 动画 · 鹈鹕骑车</option></select></label>
+        <label>模型<input name="model" value="gpt-6-astra" maxlength="100" required spellcheck="false" autocomplete="off"></label>
+        <label>思考程度<select name="reasoning_effort">
+          {% for value, label in [('default','模型默认'),('none','无'),('minimal','最低'),('low','低'),('medium','中'),('high','高'),('xhigh','很高'),('max','最高'),('ultra','Ultra')] %}
+          <option value="{{ value }}"{% if value == 'medium' %} selected{% endif %}>{{ label }}</option>
+          {% endfor %}
+        </select></label>
+      </div>
+      <div class="bridge-actions">
+        <button id="evaluation-start" type="submit" class="button primary" disabled>开始评测</button>
+        <button id="evaluation-stop" type="button" class="button" hidden>停止评测</button>
+      </div>
+    </form>
+    <p id="evaluation-status" class="bridge-status" role="status"></p>
+    <div id="evaluation-result" class="bridge-result" hidden>
+      <div class="bridge-result-heading"><h3>模型回答</h3><span id="evaluation-meta" class="hint"></span></div>
+      <pre id="evaluation-output" tabindex="0" aria-label="模型回答"></pre>
+      <button type="button" id="evaluation-preview-toggle" class="button" aria-expanded="false" aria-controls="evaluation-preview" hidden>预览动画</button>
+      <iframe id="evaluation-preview" title="模型生成的动画" sandbox="allow-scripts" referrerpolicy="no-referrer" hidden></iframe>
+    </div>
+  </section>
+  <section data-panel="workspaces" class="bridge-panel" aria-labelledby="workspace-title" hidden>
+    <header><h2 id="workspace-title">账号工作区</h2><p class="hint">查看 Team48 记录的团队、角色和席位状态。点团队名称可核对官方成员或管理席位。</p></header>
+    <p id="workspace-status" class="bridge-status" role="status"></p>
+    <ul id="workspace-list" class="bridge-workspaces"></ul>
+    <div class="bridge-actions"><button type="button" id="workspace-refresh" class="button" disabled>重读本地记录</button></div>
+  </section>
+</section>

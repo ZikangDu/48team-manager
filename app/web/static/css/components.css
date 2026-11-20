@@ -828,8 +828,15 @@
 .menu {
   position: fixed;
   z-index: 55;
-  min-width: 180px;
-  padding: 4px;
+  width: max-content;
+  min-width: min(208px,calc(100vw - 16px));
+  max-width: calc(100vw - 16px);
+  max-height: min(560px,calc(100dvh - 16px));
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+  padding: var(--space-xxs);
   background: var(--surface-overlay);
   border: 1px solid var(--border);
   border-radius: 0;
@@ -846,7 +853,10 @@
   background: transparent;
   color: var(--text);
   border-radius: 0;
-  padding: 8px 10px;
+  padding: var(--space-xs) var(--space-sm);
+  min-height: var(--control-h);
+  line-height: 1.4;
+  overflow-wrap: anywhere;
   font: inherit;
   cursor: pointer;
 }
@@ -857,6 +867,22 @@
 .menu [role="menuitem"]:focus {
   background: var(--surface);
   outline: none;
+}
+
+.menu [role="menuitem"]:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.menu [role="menuitem"]:disabled {
+  color: var(--muted);
+  cursor: not-allowed;
+}
+
+@media (pointer: coarse) {
+  .menu [role="menuitem"] {
+    min-height: 44px;
+  }
 }
 
 .sheet-panel {

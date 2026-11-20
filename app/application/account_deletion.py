@@ -7,11 +7,13 @@ from app.persistence.models.identity import Account, ExternalBinding, Workspace,
 from app.persistence.models.oauth import OAuthSession
 from app.persistence.models.codex import CodexBinding
 from app.persistence.models.operations import Operation
+from app.persistence.models.pool import StandbyPoolEntry
 from app.persistence.models.quota import CredentialLease, QuotaProbeState, QuotaSnapshot
 from app.persistence.models.resources import PhoneAttempt
 from app.persistence.models.sub2api import Sub2ApiUsageSnapshot
 
 BATCH_LIMIT = 50
+POOL_DELETION_REASON = "账号仍在备用号池中。请在备用号池查看条目状态，并从那里移出符合条件的账号。"
 
 
 class AccountDeletionError(ValueError):
@@ -22,13 +24,39 @@ class AccountDeletionError(ValueError):
 
 
 def can_delete_local_account(item: dict, *, kind: str | None = None) -> bool:
+    if item.get("local_deletion") is not None:
+        return bool(item["local_deletion"].get("allowed"))
     card_kind = kind or item.get("kind")
     return bool(
         item.get("id")
-        and card_kind == "unassigned"
+        and card_kind in {"unassigned", "history"}
         and item.get("purpose") != "mother"
-        and not item.get("contexts")
+        and item.get("management_role") != "mother"
+        and not any(context.get("membership_state") != "removed" for context in item.get("contexts") or [])
     )
+
+
+def local_deletion_policy(item: dict, *, owner_workspace_ids=(), member_workspace_ids=(), in_pool=False) -> dict:
+    """Explain structural guards using the same local records as the DELETE endpoint.
+
+    This is a read-model hint, not authorization: active tasks and leases are
+    still checked transactionally immediately before deletion.
+    """
+    owned = sorted(set(owner_workspace_ids))
+    linked = sorted(set(member_workspace_ids))
+    if item.get("purpose") == "mother" or owned:
+        reason = ("母号或团队所有者不能单独删除。请在所属团队的团队信息中管理本地团队记录。"
+                  if owned or linked else "此账号的本地用途是母号，受本地删除保护。")
+        return {"allowed": False, "code": "account_is_owner",
+                "reason": reason,
+                "workspace_ids": sorted(set(owned + linked))}
+    if linked:
+        return {"allowed": False, "code": "account_has_workspace",
+                "reason": "账号仍有团队成员或邀请记录。请先在所属团队核对，确认离队或撤销邀请后同步，再删除本地档案。",
+                "workspace_ids": linked}
+    if in_pool:
+        return {"allowed": False, "code": "account_in_pool", "reason": POOL_DELETION_REASON, "workspace_ids": []}
+    return {"allowed": bool(item.get("id")), "code": None, "reason": "", "workspace_ids": []}
 
 
 async def delete_unassigned_account(db, account_id: int):
@@ -52,6 +80,9 @@ async def delete_unassigned_account(db, account_id: int):
     ).limit(1))
     if linked is not None or remote is not None:
         raise AccountDeletionError("account_has_workspace", "账号仍有团队成员或邀请记录，请先在对应团队处理并同步。")
+    in_pool = await db.scalar(select(StandbyPoolEntry.id).where(StandbyPoolEntry.account_id == account_id))
+    if in_pool is not None:
+        raise AccountDeletionError("account_in_pool", POOL_DELETION_REASON)
     now = utcnow()
     busy = await db.scalar(select(Operation.id).where(
         or_(Operation.account_id == account_id, func.lower(Operation.email) == email,

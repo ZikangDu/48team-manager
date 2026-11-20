@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
+from app.integrations.auth_bridge.supervisor import VENDOR_DIR
 from app.web.deps import require_admin
 
 PAGES = {
@@ -19,6 +20,7 @@ PAGES = {
         "path": "/accounts",
         "subtitle": "",
     },
+    "auth_bridge": {"title": "授权工作台", "path": "/tools/auth-bridge", "subtitle": ""},
     "operations": {
         "title": "任务",
         "path": "/operations",
@@ -97,6 +99,17 @@ def build_pages_router(templates: Jinja2Templates, version: str) -> APIRouter:
     @router.get("/accounts", response_class=HTMLResponse)
     async def accounts(request: Request, user: dict = Depends(require_admin)):
         return render(request, "accounts", user)
+
+    @router.get("/tools/auth-bridge", response_class=HTMLResponse)
+    async def auth_bridge_workbench(request: Request, user: dict = Depends(require_admin)):
+        return render(request, "auth_bridge", user)
+
+    @router.get("/tools/auth-bridge/modules/{name}.js", include_in_schema=False)
+    async def evaluation_module(name: str, _: dict = Depends(require_admin)):
+        if name not in {"evaluation-core", "evaluation-stream", "evaluation-preview"}:
+            raise HTTPException(404)
+        return FileResponse(VENDOR_DIR / "docs" / f"{name}.js", media_type="text/javascript",
+                            headers={"Cache-Control": "no-cache"})
 
     @router.get("/operations", response_class=HTMLResponse)
     async def operations(request: Request, user: dict = Depends(require_admin)):

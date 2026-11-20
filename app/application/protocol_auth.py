@@ -200,12 +200,13 @@ async def _run_batch(db, public_id, accounts, proxy, concurrency):
                 item.clear()
         results = []
         imported = 0
+        operation = await operation_store.get_by_public_id(db, public_id)
         for row in rows:
             email = row["email"]
             entry = {"email": email, "login": "ok" if row["ok"] else "failed", "code": row["code"]}
             if row["ok"] and row.get("account"):
                 try:
-                    entry["import"] = await _import_account(db, email, row["account"])
+                    entry["import"] = await _import_account(db, email, row["account"], operation=operation)
                     if entry["import"] == "imported":
                         imported += 1
                 except CredentialImportError as exc:
@@ -227,7 +228,7 @@ async def _run_batch(db, public_id, accounts, proxy, concurrency):
                 "error": "协议批量登录未完成，请核对授权桥与任务记录"}
 
 
-async def _import_account(db, email: str, account: dict) -> str:
+async def _import_account(db, email: str, account: dict, *, operation: Operation | None = None) -> str:
     """Import one account's personal credential; skip accounts owned by a remote refresher."""
     existing = await db.scalar(select(Account).where(func.lower(Account.email) == email))
     if existing is not None and await refresh_owner_kind(db, existing.id) is not None:
@@ -245,6 +246,9 @@ async def _import_account(db, email: str, account: dict) -> str:
         first = workspaces[0]
         content.update(access_token=first.get("accessToken"), refresh_token=first.get("refreshToken"),
                        id_token=first.get("idToken"), account_id=first.get("accountId"))
+    if operation is not None and operation.state in ACTIVE_STATES and operation.current_step != "import":
+        await operation_store.note(db, operation, "import", MESSAGES["import"])
+        await db.commit()
     preview = await credential_import.preview_import(db, content, expected_email=email)
     candidates = [item for item in preview.get("candidates", []) if item.get("allowed") is True]
     if not candidates or preview.get("errors"):

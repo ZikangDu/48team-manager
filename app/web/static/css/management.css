@@ -17,48 +17,79 @@ body[data-page="accounts"] .page {
   overflow: visible;
 }
 
-/* 顶部统计：4 块 tile 磁贴，8px 间隙；告警只给数字上色并加符号 */
+/* 摘要是一条紧凑信息带；异常着色，点击数字可直接筛选。 */
 .management-summary {
   display: grid;
   grid-template-columns: repeat(4,minmax(0,1fr));
-  gap: var(--tile-gap);
-  margin-bottom: var(--space-lg);
+  gap: 0;
+  background: var(--surface);
+  margin-bottom: var(--space-md);
 }
 .management-summary button {
   display: grid;
-  grid-template-columns: auto 1fr;
-  gap: 4px 12px;
+  grid-template-columns: auto minmax(0,1fr);
+  align-items: center;
+  gap: 0 var(--space-sm);
   min-width: 0;
   text-align: left;
-  background: var(--surface);
+  background: transparent;
   border: 0;
   border-radius: 0;
-  padding: var(--tile-pad);
+  padding: var(--space-sm) var(--space-md);
   color: var(--text);
   font: inherit;
   cursor: pointer;
   transition: background-color .15s ease;
 }
+.management-summary button + button {
+  border-left: 1px solid var(--border-subtle);
+}
 .management-summary button:hover {
   background: var(--surface-hover);
 }
-.management-summary button>span {
-  grid-column: 1 / -1;
-  color: var(--muted);
-  font-size: var(--text-meta);
+.management-summary button > span {
+  grid-column: 2;
+  grid-row: 1;
+  color: var(--text-secondary);
+  font-size: var(--text-body);
 }
 .management-summary strong {
+  grid-column: 1;
+  grid-row: 1 / 3;
   font-size: var(--text-figure);
-  line-height: 32px;
+  line-height: 1.3;
   letter-spacing: -0.01em;
   font-weight: 400;
   font-variant-numeric: tabular-nums;
 }
 .management-summary small {
-  align-self: end;
-  padding-bottom: 4px;
+  grid-column: 2;
+  grid-row: 2;
   font-size: var(--text-meta);
   color: var(--muted);
+}
+.accounts-workbench {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: start;
+  justify-content: space-between;
+  gap: var(--space-xs) var(--space-lg);
+  margin-bottom: var(--space-md);
+}
+.account-tools {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-xxs);
+}
+.account-tools .button {
+  padding-inline: var(--space-sm);
+  font-weight: 400;
+}
+.account-tools .button:first-child {
+  padding-left: 0;
+}
+.account-tools .button + .button {
+  border-left: 1px solid var(--border-subtle);
 }
 .management-summary .is-error[data-alert] strong {
   color: var(--danger-text);
@@ -78,24 +109,27 @@ body[data-page="accounts"] .page {
   content: "▲";
 }
 
-/* 视图页签：分段控件，每项一块 tile，选中钱绿实心白字 */
+/* 文本页签分隔视图；绿色实心保留给真正的主操作。 */
 .management-viewbar {
   display: flex;
   align-items: center;
-  gap: 20px;
+  gap: var(--space-lg);
   margin-bottom: var(--space-md);
+  border-bottom: 1px solid var(--border);
 }
 .management-tabs {
   display: flex;
   flex-wrap: wrap;
-  gap: 4px;
+  gap: var(--space-lg);
   flex: 1;
 }
 .management-tabs button {
-  height: var(--control-h);
-  padding: 0 var(--space-md);
-  background: var(--surface);
+  height: var(--control-h-lg);
+  padding: 0 var(--space-xxs);
+  margin-bottom: -1px;
+  background: transparent;
   border: 0;
+  border-bottom: 2px solid transparent;
   border-radius: 0;
   cursor: pointer;
   color: var(--text-secondary);
@@ -106,15 +140,15 @@ body[data-page="accounts"] .page {
   transition: background-color .15s ease, color .15s ease;
 }
 .management-tabs button:hover {
-  background: var(--surface-muted);
   color: var(--text);
+  border-bottom-color: var(--border-strong);
 }
 .management-tabs button[aria-pressed="true"] {
-  background: var(--accent);
-  color: var(--primary-text);
+  color: var(--accent-text);
+  border-bottom-color: var(--accent);
 }
 .management-tabs button[aria-pressed="true"]:hover {
-  background: var(--accent-hover);
+  color: var(--accent-text);
 }
 #probe-runtime {
   font-size: var(--text-meta);
@@ -128,9 +162,10 @@ body[data-page="accounts"] .page {
   min-width: 0;
 }
 .management-content>.toolbar {
+  position: relative;
   min-height: 0;
-  padding: 0 0 var(--space-sm);
-  margin-bottom: var(--space-xs);
+  padding: 0;
+  margin-bottom: var(--space-sm);
   border: 0;
   gap: var(--space-xs);
   background: none;
@@ -154,8 +189,19 @@ body[data-page="accounts"] .page {
   gap: 4px;
   margin: 0 0 var(--space-sm);
 }
+.management-results-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-xxs) var(--space-md);
+  margin-bottom: var(--space-xs);
+}
+.management-results-meta > p {
+  margin: 0;
+}
 #accounts-attention-breakdown {
-  margin: 0 0 var(--space-xs);
+  margin: 0;
 }
 /* 中性标签：tile-2 底、直角、12px 次要色 */
 .management-chip {
@@ -329,7 +375,7 @@ body[data-page="accounts"] .page {
 
 .management-table td {
   padding: 6px 12px;
-  height: 60px;
+  height: var(--table-row-h);
   border-bottom: 1px solid var(--border-subtle);
   vertical-align: middle;
   overflow-wrap: anywhere;
@@ -661,10 +707,6 @@ button.management-badge:hover {
 }
 
 @media (max-width:1280px) {
-  .management-summary small {
-    grid-column: 1/-1;
-    padding: 0;
-  }
   .management-viewbar {
     flex-wrap: wrap;
     gap: 8px;
@@ -679,9 +721,14 @@ button.management-badge:hover {
     grid-template-columns: repeat(2,minmax(0,1fr));
     margin-bottom: var(--space-md);
   }
-  /* 与总览顶部摘要的手机端尺寸一致 */
   .management-summary button {
-    padding: 12px 14px;
+    padding: var(--space-sm);
+  }
+  .management-summary button:nth-child(3) {
+    border-left: 0;
+  }
+  .management-summary button:nth-child(n+3) {
+    border-top: 1px solid var(--border-subtle);
   }
   .management-summary strong {
     font-size: 22px;
@@ -693,11 +740,37 @@ button.management-badge:hover {
   #probe-runtime {
     display: block;
     text-align: left;
-    margin-top: 10px;
+    padding-block: var(--space-xs);
+  }
+  .management-tabs {
+    gap: var(--space-xs);
   }
   .management-tabs button {
     flex: 1 1 auto;
-    padding: 0 var(--space-sm);
+    padding: 0 var(--space-xxs);
+  }
+  .account-tools {
+    width: 100%;
+    display: grid;
+    grid-template-columns: repeat(2,minmax(0,1fr));
+    gap: var(--space-xxs);
+  }
+  .account-tools .button {
+    justify-content: flex-start;
+    min-height: var(--control-h-lg);
+    padding-inline: var(--space-xs);
+    border-left: 0;
+  }
+  .account-tools .button:first-child {
+    padding-left: var(--space-xs);
+  }
+  .accounts-workbench {
+    gap: var(--space-xs);
+  }
+  .accounts-workbench .auto-rotation-disclosure {
+    width: 100%;
+    margin-left: 0;
+    border-top: 1px solid var(--border-subtle);
   }
   .management-group-head {
     flex-wrap: wrap;
@@ -1181,26 +1254,38 @@ button.management-badge:hover {
   padding-bottom: 0;
 }
 
-/* 自动轮转：tile 底、无边框的折叠条 */
+/* 自动轮转归入辅助工具区；关闭时只显示紧凑状态。 */
 .auto-rotation-disclosure {
-  margin-bottom: var(--tile-gap);
-  padding: 0 20px;
-  background: var(--surface);
-  --button-bg: var(--surface-muted);
-  --button-hover-bg: var(--surface-strong);
+  min-width: 0;
+  margin-left: auto;
+  max-width: 100%;
+  background: transparent;
 }
-.auto-rotation-disclosure>summary {
+.auto-rotation-disclosure > summary {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
-  gap: 12px;
+  gap: var(--space-xs);
   cursor: pointer;
-  padding: 10px 0;
-  font-size: var(--text-body);
+  min-height: var(--control-h);
+  padding: var(--space-xs) 0;
+  font-size: var(--text-meta);
+  list-style: none;
 }
-.auto-rotation-disclosure>summary>span:last-child {
-  margin-left: auto;
+.auto-rotation-disclosure > summary::-webkit-details-marker {
+  display: none;
+}
+.auto-rotation-disclosure > summary > strong {
+  color: var(--text-secondary);
+  font-weight: 400;
+}
+.auto-rotation-disclosure > summary > span:last-child {
   color: var(--accent-text);
+}
+.auto-rotation-disclosure[open] {
+  flex-basis: 100%;
+  padding: 0 var(--space-md);
+  background: var(--surface);
 }
 #auto-rotation-summary[data-tone="success"] {
   color: var(--success-text);
@@ -1234,15 +1319,16 @@ button.management-badge:hover {
   justify-self: start;
 }
 .management-service-notice {
-  padding: 10px 0;
+  margin: 0 0 var(--space-sm);
+  padding: 0;
   color: var(--muted);
-  font-size: var(--text-body);
+  font-size: var(--text-meta);
 }
 .management-service-notice a {
   color: var(--accent-text);
 }
 .management-more-filters {
-  position: relative;
+  position: static;
 }
 .management-more-filters>summary {
   cursor: pointer;
@@ -1259,16 +1345,33 @@ button.management-badge:hover {
   width: min(420px,calc(100vw - 32px));
   padding: 16px;
   z-index: 12;
-  display: flex;
-  flex-wrap: wrap;
-  gap: 12px;
+  display: grid;
+  grid-template-columns: repeat(2,minmax(0,1fr));
+  gap: var(--space-sm);
+  max-height: min(480px,calc(100dvh - 24px));
+  overflow-y: auto;
+  overscroll-behavior: contain;
   background: var(--surface-overlay);
   border: 0;
   border-radius: 0;
   box-shadow: var(--shadow-overlay);
 }
 .management-filter-options .filter {
-  flex: 1 1 150px;
+  width: 100%;
+}
+.management-filter-options #management-remote,
+.management-filter-options #management-remote-status {
+  grid-column: 1 / -1;
+}
+.management-filter-options > .button {
+  white-space: normal;
+  height: auto;
+  min-height: var(--control-h);
+  line-height: 1.4;
+}
+.management-more-filters[open] > summary {
+  background: var(--surface-muted);
+  color: var(--accent-text);
 }
 .management-count {
   margin: 0 0 var(--space-xs);
@@ -1319,7 +1422,7 @@ button.management-badge:hover {
   padding: 0;
 }
 .menu-group-label {
-  padding: 9px 12px 4px;
+  padding: var(--space-xs) var(--space-sm) var(--space-xxs);
   color: var(--muted);
   font-size: var(--text-meta);
   border-top: 1px solid var(--border);

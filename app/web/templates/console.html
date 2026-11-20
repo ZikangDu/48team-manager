@@ -13,6 +13,7 @@
   <link rel="stylesheet" href="{{ static_url('css/workspace-purchase.css') }}">
   {% if page == 'accounts' %}<link rel="stylesheet" href="{{ static_url('css/auth-bridge.css') }}"><link rel="stylesheet" href="{{ static_url('css/assisted-login.css') }}">{% endif %}
   {% if page == 'overview' %}<link rel="stylesheet" href="{{ static_url('css/runtime.css') }}">{% endif %}
+  {% if page == 'auth_bridge' %}<link rel="stylesheet" href="{{ static_url('css/bridge-workbench.css') }}">{% endif %}
   {% if page == 'settings' %}<link rel="stylesheet" href="{{ static_url('css/settings.css') }}">{% endif %}
   {% if page == 'pool' %}<link rel="stylesheet" href="{{ static_url('css/pool.css') }}">{% endif %}
   <link rel="icon" href="{{ static_url('logo.svg') }}" type="image/svg+xml">
@@ -30,6 +31,7 @@
       <nav class="nav">
         <a href="/" class="nav-link{% if page == 'overview' %} is-active{% endif %}"{% if page == 'overview' %} aria-current="page"{% endif %}>总览</a>
         <a href="/accounts" class="nav-link{% if page == 'accounts' %} is-active{% endif %}"{% if page == 'accounts' %} aria-current="page"{% endif %}>账号与团队</a>
+        <a href="/tools/auth-bridge" class="nav-link{% if page == 'auth_bridge' %} is-active{% endif %}"{% if page == 'auth_bridge' %} aria-current="page"{% endif %}>授权工作台</a>
         <a href="/operations" class="nav-link{% if page == 'operations' %} is-active{% endif %}"{% if page == 'operations' %} aria-current="page"{% endif %}>任务</a>
         <p class="nav-label">资源</p>
         <a href="/resources/pool" class="nav-link{% if page == 'pool' %} is-active{% endif %}"{% if page == 'pool' %} aria-current="page"{% endif %}>备用号池</a>
@@ -54,9 +56,6 @@
           {% include 'theme-select.html' %}
           <button type="button" class="button" id="task-center-open" aria-haspopup="dialog" aria-controls="task-center">任务</button>
           {% if page == 'accounts' %}
-          <button type="button" class="button" id="check-all-accounts"><span aria-hidden="true">↻</span> 立即检查</button>
-          <button type="button" class="button" id="assisted-login-open" aria-haspopup="dialog" aria-controls="assisted-login-sheet">登录与安全</button>
-          <button type="button" class="button" id="credential-import-open" aria-haspopup="dialog" aria-controls="credential-import-sheet">导入授权凭据</button>
           <button type="button" class="button primary" data-open-register><span aria-hidden="true">＋</span> 登记团队</button>
           {% elif page == 'hme' %}
           <button type="button" class="button primary" data-action-page="hme-reconcile">对账 HME</button>
@@ -88,22 +87,32 @@
           <div id="team-board-root" class="overview-layout"><p class="muted">正在加载团队…</p></div>
           <details class="team-board-resources" id="overview-attention-panel"><summary>资源与任务提醒</summary><div id="overview-resource-attention"></div><div id="overview-attention" hidden></div><div id="overview-health" hidden></div></details>
         </section>
+        {% elif page == 'auth_bridge' %}
+        {% include 'auth-bridge.html' %}
         {% elif page == 'accounts' %}
-        <details class="auto-rotation-disclosure" aria-label="自动轮转">
-          <summary><strong>自动轮转</strong><span id="auto-rotation-summary" class="muted">正在读取状态…</span><span class="muted">设置</span></summary>
-          <div class="auto-rotation-options stack">
-            <button type="button" class="button" id="auto-rotation-toggle" aria-pressed="false" disabled>读取状态…</button>
-            <p class="hint">检查周额度耗尽、确认的 401 或已停用的子号；使用 HME 和已配置的手机号池自动补位、授权并同步到 Sub2API。</p>
-            <p id="auto-rotation-status" class="muted" role="status">正在读取后台状态…</p>
-            <a href="/settings#auto-rotation-scope">选择团队、批量启用或设置全局范围</a>
-          </div>
-        </details>
         <section class="management-summary" aria-label="账号与团队摘要">
           <button type="button" data-management-view="teams"><span>团队</span><strong id="summary-teams">—</strong><small>已登记团队</small></button>
           <button type="button" data-management-view="all"><span>已管理账号</span><strong id="summary-accounts">—</strong><small>跨团队去重</small></button>
           <button type="button" data-management-health="auth" class="is-error"><span>需要授权</span><strong id="summary-needs_auth">—</strong><small>在用账号</small></button>
           <button type="button" data-management-health="retry" class="is-warning"><span>等待重试</span><strong id="summary-retry">—</strong><small>限流或暂时失败</small></button>
         </section>
+        <div class="accounts-workbench">
+          <div class="account-tools" role="group" aria-label="账号工具">
+            <button type="button" class="button ghost" id="check-all-accounts">立即检查</button>
+            <button type="button" class="button ghost" id="assisted-login-open" aria-haspopup="dialog" aria-controls="assisted-login-sheet">登录与安全</button>
+            <button type="button" class="button ghost" id="credential-import-open" aria-haspopup="dialog" aria-controls="credential-import-sheet">导入授权凭据</button>
+            <a class="button ghost" href="/tools/auth-bridge?tool=model-evaluation">测活 / 模型测试</a>
+          </div>
+          <details class="auto-rotation-disclosure" aria-label="自动轮转">
+            <summary><strong>自动轮转</strong><span id="auto-rotation-summary" class="muted">正在读取状态…</span><span class="muted">设置</span></summary>
+            <div class="auto-rotation-options stack">
+              <button type="button" class="button" id="auto-rotation-toggle" aria-pressed="false" disabled>读取状态…</button>
+              <p class="hint">检查周额度耗尽、确认的 401 或已停用的子号；使用 HME 和已配置的手机号池自动补位、授权并同步到 Sub2API。</p>
+              <p id="auto-rotation-status" class="muted" role="status">正在读取后台状态…</p>
+              <a href="/settings#auto-rotation-scope">选择团队、批量启用或设置全局范围</a>
+            </div>
+          </details>
+        </div>
         <div class="management-viewbar">
           <div class="management-tabs" role="group" aria-label="管理视图">
             <button type="button" data-management-view="teams" aria-pressed="true">按团队</button>
@@ -118,7 +127,7 @@
           <div class="toolbar">
             <input class="search" id="accounts-search" aria-label="搜索账号或团队" placeholder="搜邮箱、团队或 Workspace ID" data-entity="account" autocomplete="off">
             <select class="filter" data-filter="purpose" aria-label="本地用途">
-              <option value="all">全部</option>
+              <option value="all">全部用途</option>
               <option value="mother">母号</option>
               <option value="child">子号</option>
               <option value="standby">待命</option>
@@ -133,14 +142,14 @@
               <option value="healthy">检测正常</option><option value="forbidden">访问被拒绝</option>
               <option value="credential_error">本地凭证异常</option><option value="pending">待验证</option>
             </select>
-            <select class="filter" id="management-switches" aria-label="今日切换次数" title="按团队今日切换次数筛选，北京时间 00:00 清零；未分配账号不显示">
-              <option value="all">全部切换次数</option><option value="0">今日切换 0 次</option>
-              <option value="1">今日切换 1 次</option><option value="2">今日切换 2 次</option>
-              <option value="3">今日切换 3 次及以上</option>
-            </select>
             <details class="management-more-filters">
               <summary class="button" id="accounts-more-label">更多筛选</summary>
               <div class="management-filter-options">
+                <select class="filter" id="management-switches" aria-label="今日切换次数" title="按团队今日切换次数筛选，北京时间 00:00 清零；未分配账号不显示">
+                  <option value="all">全部切换次数</option><option value="0">今日切换 0 次</option>
+                  <option value="1">今日切换 1 次</option><option value="2">今日切换 2 次</option>
+                  <option value="3">今日切换 3 次及以上</option>
+                </select>
                 <select class="filter" id="management-workspace" aria-label="团队"><option value="">全部团队</option></select>
                 <select class="filter" id="management-remote" aria-label="Sub2API 远端状态">
                   <option value="all">全部 Sub2API 状态</option>
@@ -156,10 +165,12 @@
             </details>
             <button type="button" class="button ghost" id="accounts-clear-filters" hidden>清除筛选</button>
           </div>
-          <p id="accounts-attention-breakdown" class="hint" hidden></p>
           <div id="accounts-active-filters" class="management-filter-chips" aria-label="当前筛选" hidden></div>
           <p id="management-sync-status" class="management-sync-status" role="status" hidden></p>
-          <p class="muted management-count" id="accounts-count" role="status"></p>
+          <div class="management-results-meta">
+            <p class="muted management-count" id="accounts-count" role="status"></p>
+            <p id="accounts-attention-breakdown" class="hint" hidden></p>
+          </div>
           <div id="accounts-portfolio" class="management-list"></div>
           <nav id="accounts-pagination" class="management-pagination" aria-label="账号分页"></nav>
           <div id="account-selection-bar" class="management-selection" hidden>
@@ -850,5 +861,6 @@
   {% if page == 'overview' %}<script src="{{ static_url('js/team-board.js') }}"></script>{% endif %}
   <script src="{{ static_url('js/app.js') }}"></script>
   {% if page == 'pool' %}<script src="{{ static_url('js/pool.js') }}"></script>{% endif %}
+  {% if page == 'auth_bridge' %}<script type="module" src="{{ static_url('js/bridge-workbench.js') }}"></script>{% endif %}
 </body>
 </html>

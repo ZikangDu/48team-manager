@@ -9,6 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.persistence.models.operations import Operation
 from app.persistence.models.oauth import OAuthSession
+from app.persistence.models.pool import StandbyPoolEntry
 from app.persistence.models.revenue import Sub2ApiRevenueEntry
 
 from app.application.queries.identity import (
@@ -27,7 +28,7 @@ from app.core.time import isoformat
 from app.domain.identity import MEMBERSHIP_STATE_INVITED, MEMBERSHIP_STATE_JOINED, MEMBERSHIP_STATE_REMOVED
 from app.domain.identity.ids import normalize_email
 from app.domain.identity.policy import management_role
-from app.application.account_deletion import can_delete_local_account
+from app.application.account_deletion import can_delete_local_account, local_deletion_policy
 from app.persistence.repositories import identity as identity_repo
 
 
@@ -161,16 +162,36 @@ async def portfolio_query(db: AsyncSession) -> dict[str, Any]:
 
     memberships = await identity_repo.list_memberships(db)
     memberships_by_workspace: dict[int, list] = defaultdict(list)
+    account_contexts = defaultdict(set)
+    owner_workspaces = defaultdict(set)
+    member_workspaces = defaultdict(set)
     for row in memberships:
         memberships_by_workspace[row.workspace_id].append(row)
+        account_contexts[row.account_id].add(row.workspace_id)
+        if row.membership_state != MEMBERSHIP_STATE_REMOVED:
+            member_workspaces[row.account_id].add(row.workspace_id)
     accounts_raw = {row.id: row for row in await identity_repo.list_accounts(db)}
     workspaces_raw = {row.id: row for row in await identity_repo.list_workspaces(db)}
-    account_contexts = defaultdict(set)
-    for row in memberships:
-        account_contexts[row.account_id].add(row.workspace_id)
-    for row in workspaces_raw.values():
-        if row.owner_account_id:
-            account_contexts[row.owner_account_id].add(row.id)
+    for workspace in workspaces_payload["items"]:
+        workspace_id = workspace["id"]
+        owner_id = workspace.get("owner_account_id")
+        if owner_id:
+            owner_workspaces[owner_id].add(workspace_id)
+            account_contexts[owner_id].add(workspace_id)
+        # The same official snapshots used for the member list guard deletion
+        # even if a corresponding local membership is absent or historical.
+        for member in workspace["official_members"]:
+            account = accounts_by_email.get(member["email"])
+            if account and member["state"] in {MEMBERSHIP_STATE_JOINED, MEMBERSHIP_STATE_INVITED}:
+                member_workspaces[account["id"]].add(workspace_id)
+    pool_accounts = set(await db.scalars(select(StandbyPoolEntry.account_id)))
+    for account in accounts_by_id.values():
+        account["local_deletion"] = local_deletion_policy(
+            account,
+            owner_workspace_ids=owner_workspaces[account["id"]],
+            member_workspace_ids=member_workspaces[account["id"]],
+            in_pool=account["id"] in pool_accounts,
+        )
 
     groups = []
     assigned_ids: set[int] = set()

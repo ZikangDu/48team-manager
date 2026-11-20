@@ -43,6 +43,7 @@
     { label: "去总览", href: "/" },
     { label: "去团队", href: "/accounts?view=teams" },
     { label: "去账号", href: "/accounts" },
+    { label: "授权工作台", href: "/tools/auth-bridge" },
     { label: "去备用号池", href: "/resources/pool" },
     { label: "去手机号", href: "/resources/phones" },
     { label: "去 HME", href: "/resources/hme" },
@@ -1828,6 +1829,48 @@ function hmeRow(item) {
     return result;
   }
 
+  function accountDeletionContext(item) {
+    const policy = item.local_deletion || {};
+    const workspaceIds = [...new Set((policy.workspace_ids || [
+      item.workspace_id, ...(item.contexts || []).map(context => context.workspace_id),
+    ]).filter(id => Number.isInteger(id) && id > 0))];
+    const owner = policy.code === "account_is_owner" || item.purpose === "mother";
+    return {
+      workspaceIds,
+      reason: policy.reason || (owner
+        ? "母号或团队所有者不能单独删除。请在所属团队的团队信息中管理本地团队记录。"
+        : "账号仍有团队成员或邀请记录。请先在所属团队核对，确认离队或撤销邀请后同步，再删除本地档案。"),
+    };
+  }
+
+  async function explainAccountDeletion(item, trigger) {
+    const {workspaceIds, reason} = accountDeletionContext(item);
+    const inPool = item.local_deletion?.code === "account_in_pool";
+    const teamLabel = workspaceIds.length > 1 ? "选择所属团队" : "查看所属团队";
+    const proceed = await openConfirm({
+      title: "暂时不能删除本地档案", subtitle: item.email, message: reason,
+      confirmLabel: workspaceIds.length ? teamLabel : inPool ? "查看备用号池" : "查看账号详情", tone: "primary",
+    }, trigger);
+    if (!proceed) return;
+    if (inPool) {
+      window.location.assign("/resources/pool");
+    } else if (workspaceIds.length === 1) {
+      const workspace = await fetchTeamDetails(workspaceIds[0]);
+      openWorkspaceDetails(trigger, workspace);
+    } else {
+      openSheet("account", item, trigger);
+      if (workspaceIds.length > 1) {
+        const rows = workspaceIds.map(id => {
+          const link = document.createElement("a");
+          link.href = `/accounts?view=teams&workspace=${id}`;
+          link.textContent = item.contexts?.find(context => context.workspace_id === id)?.workspace_name || `团队 #${id}`;
+          return [`#${id}`, link];
+        });
+        document.getElementById("sheet-body").prepend(kvSection("选择所属团队", rows));
+      }
+    }
+  }
+
   const entityActions = {
     workspace: [
       { id: "workspace.manage", label: "管理", run: (item, trigger) => openWorkspaceDetails(trigger, item) },
@@ -1906,7 +1949,7 @@ function hmeRow(item) {
       },
       {
         id: "team.member.purge",
-        label: "永久删除本地档案",
+        label: "移出团队并清理账号",
         danger: true,
         // High-risk maintenance; keep out of ordinary official-remove path labels.
         visible: ({ row }) => Boolean(row.email) && Boolean(row.id || row.local_account_id),
@@ -2013,10 +2056,11 @@ function hmeRow(item) {
       },
       {
         id: "account.delete-local",
-        label: "永久删除本地档案",
+        label: (item) => item.can_delete_local ? "永久删除本地档案" : "删除本地档案（查看限制）",
         danger: true,
-        visible: (item) => Boolean(item.can_delete_local),
+        visible: (item) => item.managed !== false && Number.isInteger(item.id) && item.id > 0,
         run: async (item, trigger) => {
+          if (!item.can_delete_local) return explainAccountDeletion(item, trigger);
           const ok = await openConfirm({
             title: "永久删除本地档案",
             subtitle: item.email,
@@ -2208,7 +2252,9 @@ function hmeRow(item) {
   function focusMenuItem(index) {
     const items = menuItems();
     if (!items.length) return;
-    items[(index + items.length) % items.length].focus();
+    const option = items[(index + items.length) % items.length];
+    option.focus({ preventScroll: true });
+    option.scrollIntoView({ block: "nearest" });
   }
   // Keyboard users move into the menu with arrows; mouse clicks keep focus on the trigger.
   function handleMenuKeydown(event) {
@@ -2231,6 +2277,8 @@ function hmeRow(item) {
     menuTrigger = button;
     menuOpenedAt = performance.now();
     menu.replaceChildren();
+    menu.scrollTop = 0;
+    menu.style.maxHeight = "";
     const add = (label, handler, className) => {
       const option = document.createElement("button");
       option.type = "button";
@@ -2268,13 +2316,24 @@ function hmeRow(item) {
     const rect = button.getBoundingClientRect();
     menu.hidden = false;
     button.setAttribute("aria-expanded", "true");
-    const width = Math.max(menu.offsetWidth || 180, 180);
+    const viewport = window.visualViewport;
+    const viewportLeft = viewport?.offsetLeft || 0;
+    const viewportTop = viewport?.offsetTop || 0;
+    const viewportRight = viewportLeft + (viewport?.width || window.innerWidth);
+    const viewportBottom = viewportTop + (viewport?.height || window.innerHeight);
+    const width = menu.offsetWidth || 180;
+    const naturalHeight = menu.offsetHeight || 0;
+    const below = Math.max(0, viewportBottom - rect.bottom - 12);
+    const above = Math.max(0, rect.top - viewportTop - 12);
+    const openAbove = naturalHeight > below && above > below;
+    const availableHeight = openAbove ? above : below;
+    menu.style.maxHeight = `${Math.min(naturalHeight, availableHeight)}px`;
     const height = menu.offsetHeight || 0;
     // Right-aligned triggers open leftwards so the menu never hugs the viewport edge.
-    let left = rect.left + width > window.innerWidth - 8 ? rect.right - width : rect.left;
-    let top = rect.bottom + 4;
-    left = Math.max(8, Math.min(left, window.innerWidth - width - 8));
-    if (top + height > window.innerHeight - 8) top = Math.max(8, rect.top - height - 4);
+    let left = rect.left + width > viewportRight - 8 ? rect.right - width : rect.left;
+    let top = openAbove ? rect.top - height - 4 : rect.bottom + 4;
+    left = Math.max(viewportLeft + 8, Math.min(left, viewportRight - width - 8));
+    top = Math.max(viewportTop + 8, Math.min(top, viewportBottom - height - 8));
     menu.style.left = `${left}px`;
     menu.style.top = `${top}px`;
   }
@@ -3177,10 +3236,11 @@ function hmeRow(item) {
       const kind = presentTeamMember(row).code;
       const confirmCopy = mode === "purge"
         ? {
-          title: "永久删除本地档案",
-          message: `永久删除 ${email} ？此操作不可恢复。`,
-          items: ["移出官方席位", "下架已绑定的 Sub2API 账号", "清理本地档案、凭据与历史"],
-          confirmLabel: "永久删除",
+          title: "移出团队并清理账号",
+          message: `从官方团队移出 ${email}，并永久清理账号？`,
+          items: ["移出官方团队成员或撤销官方邀请", "删除已绑定的 Sub2API 远端账号", "清理本地档案、凭据与关联记录"],
+          hint: "此操作无法撤销。ChatGPT 账号将继续保留。",
+          confirmLabel: "移出并永久清理",
         }
         : mode === "official"
           ? (kind === "invited"
@@ -3214,7 +3274,7 @@ function hmeRow(item) {
         } else {
           result = await postAction(`workspace-remove-${workspace.id}-${accountId}`, `/api/workspaces/${workspace.id}/members/remove`, { email, account_id: accountId });
         }
-        await handleActionResult(result, { successMessage: mode === "purge" ? "已永久删除" : "成员已更新", refresh: false });
+        await handleActionResult(result, { successMessage: mode === "purge" ? "已移出团队并清理账号" : "成员已更新", refresh: false });
         await reloadTeamDetails();
         if (document.body.dataset.page === "accounts") await bootAccounts();
       } catch (error) {
@@ -4879,7 +4939,9 @@ function hmeRow(item) {
 
   // A fixed-position menu would drift away from its trigger; close it instead.
   // Clicking a trigger outside the viewport scrolls it into view first; that scroll must not close the menu it opens.
-  window.addEventListener("scroll", () => {
+  window.addEventListener("scroll", (event) => {
+    // Menu wheel/keyboard scrolling must not trigger the page-scroll dismissal.
+    if (event.target === menu || event.target?.nodeType && menu?.contains(event.target)) return;
     if (menu && !menu.hidden && performance.now() - menuOpenedAt > 150) closeMenu();
   }, { passive: true, capture: true });
   window.addEventListener("resize", () => { if (menu && !menu.hidden) closeMenu(); });

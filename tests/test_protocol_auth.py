@@ -7,7 +7,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
 from sqlalchemy import func, select
@@ -210,6 +210,52 @@ class ImportTests(unittest.IsolatedAsyncioTestCase):
         async with self.factory() as db:
             status = await protocol_auth._import_account(db, EMAIL, {"email": EMAIL, "business_workspace_credentials": []})
         self.assertEqual(status, "no_credential")
+
+    async def test_batch_reports_local_import_once_before_preview_and_only_for_eligible_rows(self):
+        store = protocol_auth.operation_store
+        owned = "remote@example.test"
+        async with self.factory() as db:
+            db.add(Account(email=owned, local_purpose="child"))
+            await db.commit()
+            for eligible in (False, True):
+                with self.subTest(eligible=eligible):
+                    operation = await store.create(db, op_type=protocol_auth.LOGIN_OP)
+                    await store.note(db, operation, "protocol_login", protocol_auth.MESSAGES["protocol_login"])
+                    await db.commit()
+                    rows = [
+                        {"email": "failed@example.test", "ok": False, "code": "bridge_login_failed"},
+                        {"email": "empty@example.test", "ok": True, "code": "ok", "account": {"email": "empty@example.test"}},
+                        {"email": owned, "ok": True, "code": "ok", "account": {"openai_access_token": "fixture-only"}},
+                    ]
+                    if eligible:
+                        for email in ("one@example.test", "two@example.test"):
+                            rows.append({"email": email, "ok": True, "code": "ok", "account": {"openai_access_token": "fixture-only"}})
+                    observed = []
+
+                    async def observe():
+                        async with self.factory() as reader:
+                            observed.append((await protocol_auth.status_protocol(reader, operation.public_id))["stage"])
+
+                    async def bridge_result(*args, **kwargs):
+                        await observe()
+                        return rows
+
+                    async def preview(*args, **kwargs):
+                        await observe()
+                        return {"errors": ["test-conflict"]}
+
+                    with patch.object(protocol_auth, "_bridge") as bridge, \
+                         patch.object(protocol_auth, "refresh_owner_kind", AsyncMock(return_value="remote")), \
+                         patch.object(protocol_auth.credential_import, "preview_import", side_effect=preview):
+                        bridge.return_value.login_batch = AsyncMock(side_effect=bridge_result)
+                        accounts = [{"email": row["email"], "password": "fixture-pw", "totp": ""} for row in rows]
+                        result = await protocol_auth._run_batch(db, operation.public_id, accounts, "", 1)
+                    self.assertEqual(result["status"], "success")
+                    self.assertEqual(observed, ["protocol_login", "import", "import"] if eligible else ["protocol_login"])
+                    notes = [note for note in json.loads(operation.log_json) if note["stage"] == "import"]
+                    self.assertEqual([note["message"] for note in notes], [protocol_auth.MESSAGES["import"]] if eligible else [])
+                    self.assertNotIn("fixture-only", operation.log_json)
+                    self.assertNotIn("fixture-pw", operation.log_json)
 
 
 if __name__ == "__main__":

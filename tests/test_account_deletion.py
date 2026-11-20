@@ -4,16 +4,39 @@ from datetime import timedelta
 from sqlalchemy import event, select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from app.application.account_deletion import AccountDeletionError, delete_unassigned_account, delete_unassigned_accounts
+from app.application.account_deletion import (AccountDeletionError, can_delete_local_account,
+    delete_unassigned_account, delete_unassigned_accounts, local_deletion_policy)
 from app.core.time import utcnow
 from app.persistence.migrations.bootstrap import bootstrap_schema
 from app.persistence.models.identity import Account, ExternalBinding, Workspace, WorkspaceMembership, WorkspaceOfficialMemberSnapshot
 from app.persistence.models.operations import Operation
 from app.persistence.models.oauth import OAuthSession
+from app.persistence.models.pool import StandbyPoolEntry
 from app.persistence.models.sub2api import Sub2ApiUsageSnapshot
 from app.persistence.models.sub2api_status import Sub2ApiAccountStatus
 from app.persistence.models.quota import CredentialLease, QuotaProbeState, QuotaSnapshot
 from app.persistence.models.resources import HmeAliasLease
+
+
+class LocalDeletionPolicyTests(unittest.TestCase):
+    def test_removed_contexts_do_not_hide_local_deletion(self):
+        account = {'id': 1, 'purpose': 'child', 'kind': 'unassigned',
+                   'contexts': [{'workspace_id': 7, 'membership_state': 'removed'}]}
+        self.assertTrue(can_delete_local_account(account))
+        account['contexts'].append({'workspace_id': 8, 'membership_state': 'joined'})
+        self.assertFalse(can_delete_local_account(account))
+
+    def test_policy_explains_owner_and_membership_protection(self):
+        account = {'id': 1, 'purpose': 'child'}
+        owner = local_deletion_policy(account, owner_workspace_ids=[7], member_workspace_ids=[8])
+        self.assertEqual(owner['code'], 'account_is_owner')
+        self.assertEqual(owner['workspace_ids'], [7, 8])
+        linked = local_deletion_policy(account, member_workspace_ids=[8, 8])
+        self.assertEqual(linked['code'], 'account_has_workspace')
+        self.assertEqual(linked['workspace_ids'], [8])
+        self.assertIn('同步', linked['reason'])
+        self.assertFalse(can_delete_local_account({**account, 'kind': 'unassigned', 'local_deletion': linked}))
+        self.assertTrue(local_deletion_policy(account)['allowed'])
 
 
 class AccountDeletionTests(unittest.IsolatedAsyncioTestCase):
@@ -76,6 +99,16 @@ class AccountDeletionTests(unittest.IsolatedAsyncioTestCase):
         await self.db.commit()
         await self.reject('account_is_owner')
 
+    async def test_standby_pool_entry_is_protected_and_explained_in_list(self):
+        from app.application.queries.portfolio import portfolio_query
+        self.db.add(StandbyPoolEntry(account_id=self.account_id, email=self.account.email))
+        await self.db.commit()
+        portfolio = await portfolio_query(self.db)
+        item = next(a for a in portfolio['accounts'] if a['id'] == self.account_id)
+        self.assertFalse(item['can_delete_local'])
+        self.assertEqual(item['local_deletion']['code'], 'account_in_pool')
+        await self.reject('account_in_pool')
+
     async def test_workspace_owner_is_protected_even_with_standby_purpose(self):
         self.db.add(Workspace(owner_account_id=self.account_id))
         await self.db.commit()
@@ -117,6 +150,41 @@ class AccountDeletionTests(unittest.IsolatedAsyncioTestCase):
         await self.db.commit()
         self.assertIsNotNone(await self.db.get(Workspace, workspace.id))
         self.assertEqual(list(await self.db.scalars(select(WorkspaceMembership))), [])
+
+    async def test_portfolio_removed_history_stays_deletable_in_flat_and_unassigned_views(self):
+        from app.application.queries.portfolio import portfolio_query
+        workspace = Workspace(owner_account_id=self.other.id)
+        self.db.add(workspace)
+        await self.db.flush()
+        self.db.add(WorkspaceMembership(workspace_id=workspace.id, account_id=self.account_id,
+                                       membership_state='removed', local_purpose='child'))
+        await self.db.commit()
+        portfolio = await portfolio_query(self.db)
+        for collection in ('accounts', 'unassigned'):
+            account = next(item for item in portfolio[collection] if item['id'] == self.account_id)
+            self.assertTrue(account['can_delete_local'])
+            self.assertTrue(account['local_deletion']['allowed'])
+            self.assertEqual(account['local_deletion']['workspace_ids'], [])
+        history = next(item for item in portfolio['groups'][0]['history'] if item['id'] == self.account_id)
+        self.assertTrue(history['can_delete_local'])
+
+    async def test_portfolio_explains_official_snapshot_and_owner_without_membership(self):
+        from app.application.queries.portfolio import portfolio_query
+        workspace = Workspace(owner_account_id=self.other.id)
+        self.db.add(workspace)
+        await self.db.flush()
+        self.db.add(WorkspaceOfficialMemberSnapshot(workspace_id=workspace.id,
+            normalized_email=self.account.email, remote_state='invited', fetched_at=utcnow()))
+        await self.db.commit()
+        portfolio = await portfolio_query(self.db)
+        account = next(item for item in portfolio['accounts'] if item['id'] == self.account_id)
+        self.assertFalse(account['can_delete_local'])
+        self.assertEqual(account['local_deletion']['code'], 'account_has_workspace')
+        self.assertEqual(account['local_deletion']['workspace_ids'], [workspace.id])
+        owner = next(item for item in portfolio['accounts'] if item['id'] == self.other.id)
+        self.assertFalse(owner['can_delete_local'])
+        self.assertEqual(owner['local_deletion']['code'], 'account_is_owner')
+        self.assertEqual(owner['local_deletion']['workspace_ids'], [workspace.id])
 
     async def test_pending_oauth_blocks_and_expired_session_is_removed(self):
         self.db.add(OAuthSession(public_id='oauth-delete-test', account_id=self.account_id,

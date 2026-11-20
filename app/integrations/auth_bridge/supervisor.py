@@ -18,6 +18,7 @@ import sys
 from pathlib import Path
 
 import httpx
+from app.core.proxy import normalize_proxy_url
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +37,8 @@ class BridgeSupervisor:
     def __init__(self) -> None:
         self._process: subprocess.Popen | None = None
         self._log = None
+        self._proxy_origin = ""
+        self._outbound_proxy = ""
         self.port: int | None = None
         self.state = "stopped"  # stopped | starting | running | external | failed | disabled
         self.reason = ""
@@ -109,6 +112,9 @@ class BridgeSupervisor:
                 env[key[len("TEAM48_BRIDGE_"):]] = value
         if proxy:
             env["OPENAI_PROXY_URL"] = proxy
+        # The workbench can honor a pinned account only on this exact managed exit.
+        self._proxy_origin = f"http://{env['HOST']}:{env['PORT']}"
+        self._outbound_proxy = env.get("OPENAI_PROXY_URL", "")
         self._log = open(runtime_dir / "bridge.log", "ab", buffering=0)
         self.state, self.reason = "starting", ""
         try:
@@ -135,6 +141,7 @@ class BridgeSupervisor:
         return self.state
 
     async def stop(self) -> None:
+        self._proxy_origin = self._outbound_proxy = ""
         process, self._process = self._process, None
         if process is not None and process.poll() is None:
             try:
@@ -158,6 +165,15 @@ class BridgeSupervisor:
     def summary(self) -> dict:
         return {"state": self.state, "port": self.port, "reason": self.reason,
                 "pid": self._process.pid if self._process and self._process.poll() is None else None}
+
+    def uses_fixed_proxy(self, origin: str, proxy: str) -> bool:
+        if (self.state != "running" or self._process is None or self._process.poll() is not None
+                or origin != self._proxy_origin or "://" not in self._outbound_proxy):
+            return False
+        try:
+            return normalize_proxy_url(proxy) == normalize_proxy_url(self._outbound_proxy)
+        except ValueError:
+            return False
 
 
 bridge_supervisor = BridgeSupervisor()

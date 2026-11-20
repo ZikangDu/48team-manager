@@ -43,7 +43,7 @@
     if (bar) bar.hidden = items.length === 0;
     // A disabled delete must say why; the reason stays visible next to the count.
     const blocked = items.filter(account => !canDelete(account)).length;
-    const reason = items.length > 50 ? " · 单次最多 50 个" : blocked ? ` · 其中 ${blocked} 个是母号或仍属于团队，只有未分配的账号能删除` : "";
+    const reason = items.length > 50 ? " · 单次最多 50 个" : blocked ? ` · ${blocked} 个账号暂不能删除，可在行菜单查看原因` : "";
     if (count) count.textContent = `已选 ${items.length} 个（含跨页选择）${reason}`;
     if (del) del.disabled = items.length === 0 || items.length > 50 || items.some(account => !canDelete(account));
     const exportButton = document.getElementById("account-selection-export");
@@ -518,7 +518,7 @@
     const remoteLine = document.getElementById("management-remote-status");
     const remoteSetup = document.getElementById("management-remote-setup");
     if (remoteSetup) remoteSetup.hidden = remoteInfo?.configured !== false || Boolean(data.codex_rs_status?.bindings);
-    const moreCount = ["team", "remote"].filter(key => params.get(key) && params.get(key) !== "all").length;
+    const moreCount = ["team", "remote", "switches"].filter(key => params.get(key) && params.get(key) !== "all").length;
     const moreLabel = document.getElementById("accounts-more-label");
     if (moreLabel) moreLabel.textContent = `更多筛选${moreCount ? `（${moreCount}）` : ""}`;
     if (remoteLine && remoteInfo) remoteLine.textContent = !remoteInfo.configured ? "未配置 Sub2API，暂时无法核对"

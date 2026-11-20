@@ -82,6 +82,14 @@
     reset_not_open: "没有待处理的换绑记录，请重新查询。",
     export_required: "激活结果未知时候选密钥可能已经生效，请先导出候选密钥再放弃记录。",
     candidate_not_found: "这个邮箱没有待核对的候选密钥。", candidate_export_failed: "候选密钥没能导出，请重新查询后再试。",
+    bridge_disabled: "授权桥已停用，请检查 Team48 设置。", bridge_starting: "授权桥正在启动，请稍后重新检查。",
+    bridge_unavailable: "当前无法连接内嵌授权桥，请检查 Team48 服务状态。", bridge_incompatible: "授权桥版本不兼容，请检查 Team48 服务状态。",
+    bridge_busy: "授权桥繁忙，请稍后再试。", bridge_timeout: "授权桥响应超时，请先核对任务记录。",
+    bridge_credentials_rejected: "登录资料未通过验证，请核对密码和 2FA。", bridge_email_verification: "需要邮箱验证，请在浏览器中人工完成。",
+    bridge_account_unavailable: "账号不可用，请人工核对。", bridge_validation_failed: "官方验证未完成，请在浏览器中核对。",
+    bridge_identity_mismatch: "账号身份不符，授权未保存。", bridge_login_failed: "未取得可用授权。",
+    totp_required: "请输入此账号的现有 2FA 密钥。", input_empty: "请至少输入一个账号。", too_many: "每次最多可提交 50 个账号。",
+    line_duplicate: "输入中有重复账号，请每个邮箱只保留一行。", line_invalid: "账号行格式有误，请检查邮箱、分隔符和 2FA 密钥。",
     reset_save_failed: "记录没能关闭，请重新查询。",
   };
   const VERIFICATION = {
@@ -114,7 +122,7 @@
   };
   function clearError() { errorBox.textContent = ""; errorBox.hidden = true; }
   function showError(message) { errorBox.textContent = message; errorBox.hidden = false; }
-  function clearSecrets() { body.querySelectorAll('input[type="password"]').forEach(input => { input.value = ""; }); }
+  function clearSecrets() { body.querySelectorAll('input[type="password"], textarea[name="protocol_accounts"]').forEach(input => { input.value = ""; }); }
   function when(value) {
     const date = new Date(value);
     if (!value || Number.isNaN(date.getTime())) return "";
@@ -208,7 +216,7 @@
     if (registered) return;
     api().registerOverlay("assisted-login", sheet); registered = true;
     new MutationObserver(() => {
-      if (sheet.hidden) { clearSecrets(); stopPolling(); }
+      if (sheet.hidden) { clearSecrets(); stopPolling(); detachProtocolView(); }
     }).observe(sheet, {attributes: true, attributeFilter: ["hidden"]});
   }
   function open(trigger, hint = "", action = "") {
@@ -232,7 +240,9 @@
     if (returnFocus?.isConnected && !returnFocus.closest("[hidden]")) returnFocus.focus();
   }
   function render() {
-    clearSecrets(); clearTimeout(hintTimer); body.replaceChildren(); lastRendered = "";
+    detachProtocolView(); clearSecrets(); clearTimeout(hintTimer); body.replaceChildren(); lastRendered = "";
+    sheet.querySelector(".assisted-header p").textContent = mode === "login" ? "用本机 Chrome 在官方页面登录，再执行所选操作。"
+      : mode === "backup" ? "查询本机保存的 2FA 密钥和换绑记录。" : "通过 Team48 内嵌授权桥登录，授权保存在本机。";
     tabs.querySelectorAll("[data-assist-mode]").forEach(tab => {
       const selected = tab.dataset.assistMode === mode;
       tab.classList.toggle("is-active", selected);
@@ -481,72 +491,258 @@
     const tasks = node("a", "assisted-link", "任务记录"); tasks.href = "/operations"; actions.append(tasks);
     section.append(actions); body.append(section);
   }
-  // Browser-free protocol auth through the local GPTAuthBridge. Minimal on purpose.
-  let protocolOp = null, protocolTimer = null;
-  function renderProtocol() {
-    const section = node("section", "assisted-vault");
-    const status = node("p", "assisted-note", "正在检查授权桥…");
-    section.append(status);
-    request("/api/protocol-auth/capabilities").then(cap => {
-      status.textContent = cap.available ? "授权桥已连接（并发 " + cap.task_concurrency + "）。协议登录不打开浏览器，可批量并行。" : (cap.message || "授权桥不可用");
-    }).catch(error => { status.textContent = error.message; });
-    // batch login
-    const batch = node("form", "assisted-group"); batch.autocomplete = "off";
-    batch.append(node("h3", "", "批量协议登录并导入授权"));
-    const lines = document.createElement("textarea"); lines.rows = 6; lines.spellcheck = false;
-    lines.placeholder = "每行一个：邮箱----密码----2FA密钥（2FA 可省略；也支持 —— 或 |）";
-    const batchBtn = node("button", "button primary", "开始批量登录"); batchBtn.type = "submit";
-    batch.append(lines, batchBtn);
-    // reset
-    const reset = node("form", "assisted-group"); reset.autocomplete = "off";
-    reset.append(node("h3", "", "协议重设 2FA（无浏览器）"));
-    const email = field("邮箱", "p_email", "email", emailHint);
-    const pw = field("密码（留空用已存）", "p_password", "password", "", false);
-    const totp = field("现有 2FA 密钥（留空用已存）", "p_totp", "password", "", false);
-    const ok = node("label", "assisted-confirm"); const ck = document.createElement("input"); ck.type = "checkbox";
-    ok.append(ck, document.createTextNode("我确认更换这个账号的 2FA，旧验证器会立即失效。"));
-    const resetBtn = node("button", "button primary", "协议重设 2FA"); resetBtn.type = "submit";
-    reset.append(email.wrap, pw.wrap, totp.wrap, ok, resetBtn);
-    const out = node("div", "assisted-group"); out.setAttribute("role", "status");
-    section.append(batch, reset, out);
-    body.append(section);
-    const stop = () => { if (protocolTimer) clearTimeout(protocolTimer); protocolTimer = null; };
-    const show = data => {
-      out.replaceChildren();
-      const state = data.state || data.status, result = data.result || {};
-      out.append(node("p", "assisted-result", (data.op_type === "protocol_reset" ? "重设 2FA" : "批量登录") + " · " + state + " · " + (result.message || result.error || data.message || "")));
-      if (Array.isArray(result.results)) result.results.forEach(r => out.append(node("p", "assisted-meta", r.email + "：登录 " + r.login + (r.import ? "，导入 " + r.import : "") + (r.code && r.code !== "ok" ? "（" + r.code + "）" : ""))));
-      if (data.op_type === "protocol_reset" && result.backup_saved === true && data.email) {
-        out.append(button("复制新 2FA 密钥", async () => {
-          try { await copyFetched(() => fetchKey(data.email)); api()?.toast("新 2FA 密钥已复制", "success"); } catch (error) { showError(error.message); }
-        }, "button primary"));
+  let protocolTask = null, protocolView = null, protocolSubmitting = "", protocolError = "";
+
+  function detachProtocolView() {
+    if (protocolView) clearTimeout(protocolView.timer);
+    protocolView = null;
+  }
+  function protocolActive() {
+    return protocolTask && !TERMINAL.has(protocolTask.state || protocolTask.status);
+  }
+
+  const IMPORT_LABELS = {
+    imported: "已导入", skipped_remote_owned: "已跳过导入，刷新权在远端", conflict: "导入信息冲突",
+    no_credential: "缺少可导入的授权", failed: "导入失败",
+  };
+  function protocolRow(row) {
+    if (row.login !== "ok") return [row.code === "bridge_email_verification" ? "warning" : "danger", ERRORS[row.code] || "登录失败"];
+    if (row.import === "imported") return ["success", "已登录，已导入"];
+    const label = IMPORT_LABELS[row.import] || "未确认导入";
+    return [row.import === "failed" ? "danger" : "warning", "已登录，" + label];
+  }
+  function protocolOutcome(data) {
+    const state = data.state || data.status;
+    const result = data.result || {};
+    const reset = data.op_type === "protocol_reset";
+    if (!TERMINAL.has(state)) {
+      if (data.cancel_requested) return ["warning", "正在等待任务停止"];
+      if (state === "pending" || data.stage === "queued") return ["accent", "任务已受理，等待执行"];
+      const resetStage = reset && data.stage?.startsWith("mfa_") && STAGES[data.stage];
+      return ["accent", resetStage || (data.stage === "import" ? "正在导入授权" :
+        reset ? "正在登录账号" : "正在登录账号，等待授权桥返回结果。")];
+    }
+    const labels = {failed: "任务失败", manual_required: "需要人工核对", partial: "部分完成", cancelled: "任务已停止", resolved: "任务已处理"};
+    if (state !== "success" || reset) {
+      const detail = result.message || ERRORS[result.error_code] || result.error;
+      return [state === "success" ? "success" : state === "failed" ? "danger" : "warning",
+        [labels[state] || "2FA 已重设", detail].filter(Boolean).join(" · ")];
+    }
+    const rows = result.results || [];
+    const total = data.count ?? result.total ?? rows.length;
+    const logged = rows.filter(row => row.login === "ok").length;
+    const imported = rows.filter(row => row.login === "ok" && row.import === "imported").length;
+    if (!rows.length) return ["warning", "任务已结束，未返回账号结果。请查看任务记录。"];
+    const counts = "登录成功 " + logged + "/" + total + "，已导入 " + imported + "/" + total;
+    if (logged === 0 && rows.length === total) return ["danger", "全部登录失败 · " + counts];
+    if (imported === total && rows.length === total) return ["success", "已完成 · " + counts];
+    return ["warning", (logged === total && imported === 0 ? "授权未导入" : "部分完成") + " · " + counts];
+  }
+
+  function batchStageResults(data) {
+    const result = data.result || {};
+    const rows = result.results || [];
+    if (!rows.length) {
+      if (data.confirmedPhase >= 2) return [["done", "已收到登录结果"], ["warning", "导入待核对"]];
+      if (result.error_code?.startsWith("bridge_")) return [["danger", "未完成"], ["skipped", "未执行"]];
+      return [["pending", "未确认"], ["pending", "未确认"]];
+    }
+    const total = data.count ?? result.total ?? rows.length;
+    const logged = rows.filter(row => row.login === "ok");
+    const saved = logged.filter(row => row.import === "imported").length;
+    const login = [logged.length === total ? "done" : logged.length ? "warning" : "danger", "成功 " + logged.length + "/" + total];
+    let imported = ["skipped", "未执行"];
+    if (saved) imported = [saved === total ? "done" : "warning", "已导入 " + saved + "/" + total];
+    else if (logged.some(row => ["conflict", "failed"].includes(row.import))) imported = ["danger", "导入失败"];
+    else if (logged.some(row => row.import === "skipped_remote_owned")) imported = ["skipped", "已跳过"];
+    else if (logged.some(row => row.import && row.import !== "no_credential") || rows.length !== total) imported = ["pending", "未确认"];
+    return [login, imported];
+  }
+
+  function protocolProgress() {
+    const panel = node("section", "protocol-progress");
+    const title = node("h3");
+    title.tabIndex = -1;
+    const summary = node("p", "assisted-result");
+    summary.setAttribute("role", "status");
+    summary.setAttribute("aria-atomic", "true");
+    const rail = node("ol", "protocol-rail");
+    rail.setAttribute("aria-label", "任务阶段");
+    const rows = node("ul", "protocol-account-list");
+    rows.setAttribute("aria-label", "逐账号结果");
+    const actions = node("div", "assisted-actions");
+    const record = node("a", "assisted-link", "任务记录");
+    record.href = "/operations";
+    const copy = button("复制新 2FA 密钥", async () => {
+      const email = protocolTask?.email;
+      if (!email) return;
+      try { await copyFetched(() => fetchKey(email)); api()?.toast("新 2FA 密钥已复制", "success"); }
+      catch (error) { if (panel.isConnected && visible()) showError(error.message); }
+    });
+    actions.append(copy, record);
+    panel.append(title, summary, rail, rows, actions);
+    panel.hidden = true;
+    let currentId = "", markers = [], rowsRendered = false;
+    function update(data) {
+      panel.hidden = false;
+      const reset = data.op_type === "protocol_reset";
+      const state = data.state || data.status, finished = TERMINAL.has(state);
+      if (currentId !== data.operation_id) {
+        title.textContent = reset ? "2FA 换绑进度" : "批量登录进度";
+        currentId = data.operation_id;
+        markers = ["受理任务", "协议登录", reset ? "重设 2FA" : "导入授权", "返回结果"].map(label => {
+          const item = node("li"), caption = node("small");
+          item.append(node("span", "", label), caption);
+          return {item, label, caption};
+        });
+        rail.replaceChildren(...markers.map(marker => marker.item));
+        rows.replaceChildren();
+        rowsRendered = false;
       }
-    };
-    const poll = async id => {
-      stop();
+      const [kind, message] = protocolOutcome(data);
+      if (summary.textContent !== message) tone(summary, kind, message);
+      const last = markers.length - 1;
+      const current = finished ? last : data.confirmedPhase;
+      const accountStages = finished && !reset ? batchStageResults(data) : null;
+      markers.forEach(({item, label, caption}, index) => {
+        // A terminal response may arrive between polls. Mark only the work we can confirm.
+        const confirmed = index === 0 || index < data.confirmedPhase || (finished && kind === "success");
+        let stageState = confirmed ? "done" : "pending";
+        if (index === current) stageState = finished ? kind : "current";
+        let word = {done: "已完成", current: "进行中", pending: finished ? "未确认" : "待处理",
+          success: "已完成", warning: "请核对", danger: "失败"}[stageState];
+        if (!reset && !finished && index === 1 && data.confirmedPhase === 2) word = "已收到结果";
+        if (accountStages && (index === 1 || index === 2)) [stageState, word] = accountStages[index - 1];
+        item.dataset.state = stageState;
+        if (index === current && !finished) item.setAttribute("aria-current", "step"); else item.removeAttribute("aria-current");
+        if (caption.textContent !== word) caption.textContent = word;
+        item.setAttribute("aria-label", label + "，" + word);
+      });
+      if (finished && !rowsRendered) {
+        for (const row of data.result?.results || []) {
+          const [rowTone, label] = protocolRow(row), item = node("li"), status = node("span", "assisted-result");
+          tone(status, rowTone, label);
+          item.append(node("span", "assisted-mono", row.email), status);
+          rows.append(item);
+        }
+        rowsRendered = true;
+      }
+      rows.hidden = !rows.childElementCount;
+      copy.hidden = !(reset && data.result?.backup_saved === true && data.email);
+    }
+    return {panel, title, update};
+  }
+
+  function renderProtocol() {
+    const section = node("section", "assisted-vault protocol-pane");
+    const connection = node("div", "protocol-connection");
+    const status = node("p", "assisted-result");
+    const check = button("重新检查", () => void checkConnection());
+    connection.append(status, check);
+    const progress = protocolProgress();
+    const batch = node("form", "assisted-group"); batch.autocomplete = "off";
+    const inputLabel = node("label", "protocol-label", "批量登录并导入授权");
+    const lines = document.createElement("textarea");
+    lines.name = "protocol_accounts"; lines.rows = 4; lines.spellcheck = false; lines.required = true;
+    inputLabel.append(lines);
+    const hint = node("p", "assisted-note", "每行一个账号，填写 邮箱----密码----2FA密钥。2FA 可省略，也可用 —— 或 | 分隔。");
+    hint.id = "protocol-format"; lines.setAttribute("aria-describedby", hint.id);
+    const batchBtn = node("button", "button primary", "开始批量登录"); batchBtn.type = "submit";
+    batch.append(inputLabel, hint, batchBtn);
+
+    const disclosure = node("details", "assisted-manual");
+    const reset = node("form", "assisted-group"); reset.autocomplete = "off";
+    disclosure.append(node("summary", "", "重设单个账号的 2FA"), reset);
+    const email = field("邮箱", "p_email", "email", emailHint);
+    const pw = field("密码（留空使用已存密码）", "p_password", "password", "", false);
+    const totp = field("现有 2FA 密钥（留空使用已存密钥）", "p_totp", "password", "", false);
+    const ok = node("label", "assisted-confirm"); const ck = document.createElement("input");
+    ck.type = "checkbox"; ck.required = true;
+    ok.append(ck, document.createTextNode("我确认更换这个账号的 2FA，旧验证器会失效。"));
+    const resetBtn = node("button", "button", "重设 2FA"); resetBtn.type = "submit";
+    reset.append(email.wrap, pw.wrap, totp.wrap, ok, resetBtn);
+    const refresh = button("刷新任务状态", () => void pollStatus());
+    refresh.hidden = true;
+    progress.panel.append(refresh);
+    section.append(connection, progress.panel, batch, disclosure); body.append(section);
+    let available = false, reading = false;
+    const view = {timer: null, sync};
+    protocolView = view;
+    const attached = () => protocolView === view && visible() && mode === "protocol";
+    function sync() {
+      const locked = Boolean(protocolSubmitting || protocolActive() || !available);
+      batchBtn.disabled = resetBtn.disabled = locked;
+      lines.readOnly = protocolSubmitting === "protocol_login";
+      batchBtn.textContent = protocolSubmitting === "protocol_login" ? "正在提交…" : "开始批量登录";
+      resetBtn.textContent = protocolSubmitting === "protocol_reset" ? "正在提交…" : "重设 2FA";
+      if (protocolTask) progress.update(protocolTask);
+      if (protocolError) showError(protocolError);
+    }
+    async function checkConnection() {
+      check.hidden = true;
+      tone(status, "", "正在检查授权桥…");
+      try {
+        const cap = await request("/api/protocol-auth/capabilities");
+        if (!attached()) return;
+        available = cap.available === true;
+        tone(status, available ? "success" : "warning", available ? "内嵌授权桥已连接" :
+          ERRORS[cap.error_code] || "内嵌授权桥暂不可用。");
+      } catch (error) { if (attached()) tone(status, "warning", error.message); }
+      if (attached()) { check.hidden = available; sync(); }
+    }
+    async function pollStatus() {
+      const id = protocolTask?.operation_id;
+      if (!id || !attached() || reading || !protocolActive()) return;
+      clearTimeout(view.timer); reading = true; refresh.disabled = true;
       try {
         const data = await request("/api/protocol-auth/" + encodeURIComponent(id));
-        show(data);
-        if (!TERMINAL.has(data.state || data.status) && visible() && mode === "protocol") protocolTimer = setTimeout(() => poll(id), 2000);
-      } catch (error) { showError(error.message); }
-    };
-    batch.addEventListener("submit", async event => {
-      event.preventDefault(); clearError();
-      batchBtn.disabled = true;
-      try { const r = await post("/api/protocol-auth/batch-login", {text: lines.value}); lines.value = ""; protocolOp = r.operation_id; poll(r.operation_id); }
-      catch (error) { showError(error.message); } finally { batchBtn.disabled = false; }
+        if (!attached() || id !== protocolTask?.operation_id) return;
+        const phase = data.stage?.startsWith("mfa_") || data.stage === "import" ? 2 : data.stage === "protocol_login" ? 1 : 0;
+        protocolTask = {...protocolTask, ...data, confirmedPhase: Math.max(protocolTask.confirmedPhase, phase)};
+        if (protocolError) { protocolError = ""; clearError(); }
+        refresh.hidden = true;
+        sync();
+        if (protocolActive()) view.timer = setTimeout(pollStatus, 2000);
+      } catch (error) {
+        if (!attached() || id !== protocolTask?.operation_id) return;
+        protocolError = error.message; showError(protocolError); refresh.hidden = false;
+        if (error.code === "not_found") {
+          protocolTask = {...protocolTask, state: "manual_required", result: {message: "任务记录未找到。"}};
+          refresh.hidden = true; sync();
+        }
+      } finally { reading = false; refresh.disabled = false; }
+    }
+    view.poll = pollStatus;
+    async function start(type, path, payload) {
+      if (!available || protocolSubmitting || protocolActive()) return;
+      protocolSubmitting = type; protocolError = ""; clearError(); sync();
+      try {
+        const result = await post(path, payload);
+        if (!/^[A-Za-z0-9_-]{1,100}$/.test(result.operation_id || "")) throw new Error("任务编号未确认，请查看任务记录。");
+        protocolTask = {...result, op_type: type, confirmedPhase: 0};
+        if (type === "protocol_login") lines.value = ""; else ck.checked = false;
+      } catch (error) { protocolError = error.message; }
+      finally { payload = null; protocolSubmitting = ""; }
+      if (!protocolView || !visible()) return;
+      protocolView.sync();
+      if (protocolTask && !protocolError) {
+        if (attached()) progress.title.focus();
+        void protocolView.poll();
+      }
+    }
+    batch.addEventListener("submit", event => {
+      event.preventDefault();
+      if (batchBtn.disabled || !batch.reportValidity()) return;
+      void start("protocol_login", "/api/protocol-auth/batch-login", {text: lines.value});
     });
-    reset.addEventListener("submit", async event => {
-      event.preventDefault(); clearError();
-      if (!ck.checked) { showError("请先勾选确认要更换 2FA。"); return; }
-      if (!email.input.reportValidity()) return;
-      resetBtn.disabled = true;
-      let payload = {email: email.input.value.trim().toLowerCase(), password: pw.input.value, totp_secret: totp.input.value.trim(), confirm_reset: true};
+    reset.addEventListener("submit", event => {
+      event.preventDefault();
+      if (resetBtn.disabled || !reset.reportValidity()) return;
+      const payload = {email: email.input.value.trim().toLowerCase(), password: pw.input.value, totp_secret: totp.input.value.trim(), confirm_reset: true};
       pw.input.value = ""; totp.input.value = "";
-      try { const r = await post("/api/protocol-auth/reset", payload); payload = null; protocolOp = r.operation_id; poll(r.operation_id); }
-      catch (error) { showError(error.message); } finally { payload = null; resetBtn.disabled = false; }
+      void start("protocol_reset", "/api/protocol-auth/reset", payload);
     });
-    if (protocolOp) poll(protocolOp);
+    sync(); void checkConnection(); void pollStatus();
   }
   function renderVault() {
     const section = node("section", "assisted-vault");
@@ -691,6 +887,12 @@
   window.addEventListener("keydown", event => {
     if (event.key === "Escape" && visible() && api()?.getActiveOverlay() === "assisted-login") { event.preventDefault(); event.stopImmediatePropagation(); close(); }
   }, true);
-  window.addEventListener("pagehide", () => { clearSecrets(); stopPolling(); });
+  window.addEventListener("pagehide", () => { clearSecrets(); stopPolling(); detachProtocolView(); });
+  window.addEventListener("pageshow", event => { if (event.persisted && visible() && mode === "protocol") render(); });
+  if (new URLSearchParams(location.search).get("assist") === "protocol") {
+    const openProtocol = () => { mode = "protocol"; open(opener); };
+    if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", openProtocol, {once: true});
+    else openProtocol();
+  }
   window.Team48AssistedLogin = {open, splitAccountLine};
 })();
