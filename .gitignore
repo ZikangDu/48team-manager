@@ -93,3 +93,6 @@ vendor/auth-bridge/runtime/
 /vendor/auth-bridge/login-service/lib/*
 !/vendor/auth-bridge/login-service/lib/*.js
 !/vendor/auth-bridge/login-service/lib/*.mjs
+!/vendor/auth-bridge/login-service/src/lib/
+/vendor/auth-bridge/login-service/src/lib/*
+!/vendor/auth-bridge/login-service/src/lib/*.js
