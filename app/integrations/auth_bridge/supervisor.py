@@ -64,7 +64,17 @@ class BridgeSupervisor:
         except Exception:
             return False
 
-    async def start(self, *, port: int, runtime_dir: Path, python: str, proxy: str = "") -> str:
+    async def start(
+        self,
+        *,
+        port: int,
+        runtime_dir: Path,
+        python: str,
+        proxy: str = "",
+        yescaptcha_api_key: str = "",
+        yescaptcha_api_base_url: str = "https://api.yescaptcha.com",
+        turnstile_sitekey: str = "",
+    ) -> str:
         """Start the bundled Bridge (or adopt a compatible one already on the port)."""
         self.port = port
         if await self._healthy(port):
@@ -110,6 +120,12 @@ class BridgeSupervisor:
         for key, value in os.environ.items():
             if key.startswith("TEAM48_BRIDGE_") and len(key) > len("TEAM48_BRIDGE_"):
                 env[key[len("TEAM48_BRIDGE_"):]] = value
+        if yescaptcha_api_key:
+            env["YESCAPTCHA_API_KEY"] = yescaptcha_api_key
+        if yescaptcha_api_base_url:
+            env["YESCAPTCHA_API_BASE_URL"] = yescaptcha_api_base_url
+        if turnstile_sitekey:
+            env["OPENAI_TURNSTILE_SITEKEY"] = turnstile_sitekey
         if proxy:
             env["OPENAI_PROXY_URL"] = proxy
         # The workbench can honor a pinned account only on this exact managed exit.

@@ -71,6 +71,9 @@ class Settings(BaseSettings):
     # Proxy the Bridge uses to reach OpenAI when an account has no fixed proxy of its own.
     auth_bridge_proxy: str = ""
     auth_bridge_concurrency: int = 5
+    auth_bridge_yescaptcha_api_key: str = ""
+    auth_bridge_yescaptcha_api_base_url: str = "https://api.yescaptcha.com"
+    auth_bridge_turnstile_sitekey: str = ""
 
     model_config = SettingsConfigDict(
         env_file=BASE_DIR / ".env",

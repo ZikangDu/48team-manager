@@ -121,7 +121,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     db_path = sqlite_path_from_url(settings.database_url)
                     runtime_dir = (db_path.parent if db_path else Path("data")) / "auth-bridge"
                     state = await bridge_supervisor.start(port=bridge_port, runtime_dir=runtime_dir,
-                                                          python=team48_python(), proxy=settings.auth_bridge_proxy)
+                                                          python=team48_python(), proxy=settings.auth_bridge_proxy,
+                                                          yescaptcha_api_key=settings.auth_bridge_yescaptcha_api_key,
+                                                          yescaptcha_api_base_url=settings.auth_bridge_yescaptcha_api_base_url,
+                                                          turnstile_sitekey=settings.auth_bridge_turnstile_sitekey)
                     if state not in {"running", "external"}:
                         logger.warning("auth bridge not available: %s", bridge_supervisor.reason)
                 except Exception:

@@ -12,6 +12,8 @@
 
 本机运行 `./scripts/local-service.sh start` 即可启动 Team48 和其托管的内核。工作台加密浏览器存储使用独立命名空间，原独立 Bridge 的浏览器数据可通过原导入方式迁移。
 
+YesCaptcha 的 `clientKey` 配置为 `AUTH_BRIDGE_YESCAPTCHA_API_KEY`。Team48 会把它仅传给受管 Bridge 子进程。Turnstile 任务还需要当前 OpenAI 登录页对应的 `AUTH_BRIDGE_TURNSTILE_SITEKEY`，两项均不会进入页面或健康接口。
+
 ## 2026-11-20 官方浏览器登录补充
 
 「账号与团队 → 登录与安全」现已接入普通 Chrome 的邮箱、密码和现有 TOTP 辅助登录、OAuth 回调保存、任务取消及重启恢复。「重设 2FA」在登录后的官方页面会话内自动换绑并加密保存新密钥，中断可恢复；安全设置／退出会话仍由官方窗口中的使用者确认，手动换绑后的新密钥可本地加密备份。操作与当前边界见 [账号登录与安全](assisted-login.md)。下文较早的手动导入交付范围只描述当时版本。

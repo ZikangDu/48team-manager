@@ -285,8 +285,14 @@ class WorkbenchTests(unittest.TestCase):
                 patch("app.web.routes.bridge_workbench.bridge_supervisor",runtime):
             popen.return_value.poll.return_value = None
             async def start():
-                return await runtime.start(port=4174,runtime_dir=Path(temp),python="test-python")
+                return await runtime.start(port=4174, runtime_dir=Path(temp), python="test-python",
+                    yescaptcha_api_key="fixture-client-key", yescaptcha_api_base_url="https://solver.invalid",
+                    turnstile_sitekey="fixture-sitekey")
             self.assertEqual(self.client.portal.call(start), "running")
+            child_env = popen.call_args.kwargs["env"]
+            self.assertEqual(child_env["YESCAPTCHA_API_KEY"], "fixture-client-key")
+            self.assertEqual(child_env["YESCAPTCHA_API_BASE_URL"], "https://solver.invalid")
+            self.assertEqual(child_env["OPENAI_TURNSTILE_SITEKEY"], "fixture-sitekey")
             self.addCleanup(runtime._log.close)
             self.assertTrue(self.client.get(BASE).json()["accounts"][0]["proxy_compatible"])
             self.assertEqual(self.client.post(self.path + "/health", json={}).status_code, 200)
