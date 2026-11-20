@@ -2,6 +2,7 @@ __pycache__/
 *.py[cod]
 *$py.class
 .venv/
+node_modules/
 venv/
 ENV/
 env/
@@ -9,6 +10,8 @@ env/
 .env.*
 .git/
 .github/
+.codex/
+.claude/
 .vscode/
 .idea/
 *.db
@@ -16,8 +19,12 @@ env/
 *.md
 VPS.local.md
 data/
-docs/
+/docs/
 tests/
 deploy/
 dist/
 extensions/chatgpt-signup/private-config.mjs
+vendor/auth-bridge/runtime/
+vendor/auth-bridge/runtime-*/
+!vendor/auth-bridge/docs/
+!vendor/auth-bridge/docs/**

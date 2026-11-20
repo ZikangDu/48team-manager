@@ -1,5 +1,15 @@
 # 运维手册
 
+## 独立服务器首次安装
+
+2026-11-21 指定的部署目标为 `198.37.117.54`。新服务器使用 `deploy/docker-compose.standalone.yml`，只创建 Team48 自身的网络与 `127.0.0.1:8018` 监听。下方旧环境表保留历史部署信息。
+
+Docker 镜像包含 Node、Bridge 生产依赖及其独立 Python 环境。构建时传入 `TEAM48_RELEASE_REVISION` 完整提交号，可在镜像和容器的 `org.opencontainers.image.revision` 标签核对。启动使用 `docker compose -p team48 -f deploy/docker-compose.standalone.yml up -d --no-deps team48`。首次创建服务器专用 `.env`；已有部署更新时先备份并保留原配置及数据。
+
+独立配置的健康检查同时核对 Team48 与内嵌 Bridge 状态。公开访问使用本项目独立的域名反代，或通过 SSH 隧道访问回环端口。
+
+此独立部署关闭自动人机验证求解，相关第三方求解凭据留空。账号遇到官方验证要求时通过正常人工验证继续。
+
 ## 环境一览
 
 | 环境 | 地址 | 服务器上的目录 | 访问方式 | 凭据在哪 |

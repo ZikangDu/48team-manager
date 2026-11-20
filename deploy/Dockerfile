@@ -1,4 +1,13 @@
+FROM node:24-bookworm-slim AS bridge-dependencies
+
+WORKDIR /build/bridge
+COPY vendor/auth-bridge/package.json vendor/auth-bridge/package-lock.json ./
+RUN npm ci --omit=dev
+
 FROM python:3.11-slim-bookworm
+
+ARG TEAM48_RELEASE_REVISION=development
+LABEL org.opencontainers.image.revision=$TEAM48_RELEASE_REVISION
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -6,6 +15,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 
 WORKDIR /app
+
+COPY --from=bridge-dependencies /usr/local/bin/node /usr/local/bin/node
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
@@ -35,6 +46,11 @@ COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt \
     && python -m playwright install --with-deps chromium
 
+COPY vendor/auth-bridge/requirements.txt /tmp/bridge-requirements.txt
+RUN python -m venv /app/vendor/auth-bridge/.venv \
+    && /app/vendor/auth-bridge/.venv/bin/pip install --no-cache-dir -r /tmp/bridge-requirements.txt \
+    && /app/vendor/auth-bridge/.venv/bin/python -m playwright install --with-deps chromium
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
         xvfb \
         fonts-dejavu-core \
@@ -43,6 +59,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY app /app/app
+COPY vendor/auth-bridge /app/vendor/auth-bridge
+COPY --from=bridge-dependencies /build/bridge/node_modules /app/vendor/auth-bridge/node_modules
 # The whole extension: the runner copies it per run. .dockerignore keeps out the personal private-config.mjs.
 COPY extensions/chatgpt-signup /app/extensions/chatgpt-signup
 

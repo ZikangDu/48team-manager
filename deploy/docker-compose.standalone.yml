@@ -1,0 +1,53 @@
+# First installation without pre-existing Sub2API or HME Docker networks.
+name: team48
+
+services:
+  team48:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        TEAM48_RELEASE_REVISION: "${TEAM48_RELEASE_REVISION:-development}"
+    image: "${TEAM48_IMAGE:-team48-manager:local}"
+    container_name: team48-manager
+    restart: unless-stopped
+    init: true
+    ports:
+      - "127.0.0.1:8018:8008"
+    env_file:
+      - ../.env
+    environment:
+      APP_HOST: "0.0.0.0"
+      APP_PORT: "8008"
+      DATABASE_URL: "sqlite+aiosqlite:////app/data/team48.db"
+      BROWSER_HEADLESS: "false"
+      BROWSER_CHANNEL: ""
+      DISPLAY: ":99"
+      TZ: "Asia/Shanghai"
+      AUTO_REAUTH_ENABLED: "false"
+      AUTO_ROTATE_ENABLED: "false"
+      FORCE_REFILL: "false"
+      TEAM48_BRIDGE_TURNSTILE_BROWSER_FALLBACK: "false"
+    volumes:
+      - ../data:/app/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    labels:
+      org.opencontainers.image.revision: "${TEAM48_RELEASE_REVISION:-development}"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import json, os, urllib.request; h=json.load(urllib.request.urlopen('http://127.0.0.1:8008/health',timeout=4)); assert h.get('status') == 'healthy'; assert os.environ.get('AUTH_BRIDGE_ENABLED','true').lower() in ('false','0','off') or h.get('auth_bridge',{}).get('state') in ('running','external')"
+      interval: 20s
+      timeout: 5s
+      retries: 6
+      start_period: 60s
+    networks:
+      - team48_net
+
+networks:
+  team48_net:
+    name: team48_net
+    driver: bridge
