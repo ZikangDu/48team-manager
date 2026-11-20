@@ -75,3 +75,19 @@
   .bridge-context > a:last-child { margin-inline-start: 0; }
   .bridge-tabs { gap: var(--space-md); }
 }
+
+.evaluation-questions { min-width: 0; border: 0; margin: 0; padding: 0; }
+.evaluation-questions legend { margin-bottom: var(--space-xs); padding: 0; color: var(--text); font-weight: 600; }
+.evaluation-question-options { display: grid; gap: var(--tile-gap); grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.evaluation-question-options label { display: flex; align-items: flex-start; gap: var(--space-sm); padding: var(--tile-pad); background: var(--surface); cursor: pointer; }
+.evaluation-question-options label:has(input:checked) { background: var(--surface-muted); }
+.evaluation-question-options label:has(input:checked) strong { color: var(--accent-text); }
+.evaluation-question-options input { margin: 3px 0 0; flex: 0 0 auto; }
+.evaluation-question-options strong, .evaluation-question-options small { display: block; }
+.evaluation-question-options strong { font-size: var(--text-body); }
+.evaluation-question-options small { margin-top: var(--space-xxs); font-size: var(--text-meta); color: var(--text-secondary); line-height: 1.5; }
+.evaluation-model-fields { grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr); }
+.evaluation-question-result { display: grid; min-width: 0; gap: var(--space-xs); padding-block: var(--space-md); border-top: 1px solid var(--border); }
+@media (max-width: 720px) {
+  .evaluation-question-options, .evaluation-model-fields { grid-template-columns: minmax(0, 1fr); }
+}

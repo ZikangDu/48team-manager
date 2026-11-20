@@ -87,3 +87,9 @@ node_modules/
 .codex/
 VPS.md
 vendor/auth-bridge/runtime/
+
+# Vendored Bridge runtime source is required to rebuild the embedded service.
+!/vendor/auth-bridge/login-service/lib/
+/vendor/auth-bridge/login-service/lib/*
+!/vendor/auth-bridge/login-service/lib/*.js
+!/vendor/auth-bridge/login-service/lib/*.mjs

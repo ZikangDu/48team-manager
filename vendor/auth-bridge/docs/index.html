@@ -152,7 +152,7 @@
                   </label>
                   <small id="evaluation-reasoning-hint">可用档位取决于模型。Codex 的 ultra 需要自动委派任务，账号测试仅发送单次请求。</small>
                 </div>
-                <div class="evaluation-question-summary"><span>本轮测试</span><strong>糖果题 <small>默认必测 / 答案 21</small></strong><label class="evaluation-optional-question"><input id="evaluation-include-pelican" type="checkbox" data-private="true" />同时测试鹈鹕题 <small>SVG / 动画</small></label><small id="evaluation-concurrency">并发按服务端配置</small></div>
+                <div class="evaluation-question-summary"><span>选择测试题</span><label class="evaluation-optional-question"><input id="evaluation-include-candy" type="checkbox" checked />糖果题 <small>答案 21</small></label><label class="evaluation-optional-question"><input id="evaluation-include-pelican" type="checkbox" data-private="true" />鹈鹕骑自行车 <small>SVG / 动画</small></label><small id="evaluation-concurrency">并发按服务端配置</small></div>
                 <button class="button button-primary" type="submit" data-evaluation-start disabled>开始测试</button>
               </fieldset>
               <button class="button button-secondary evaluation-stop" type="button" data-evaluation-stop disabled>停止测试</button>
@@ -297,7 +297,7 @@
           <div id="login-push-slot">
             <div class="push-controls" id="push-controls" aria-label="远程推送" aria-describedby="push-hint">
               <label class="button button-secondary converter-free-filter" id="login-non-personal-filter" title="仅选择非个人工作区；未获取到时重新登录，最多尝试三次">
-                <input id="login-require-non-personal" type="checkbox" />必须获取非个人工作区
+                <input id="login-require-non-personal" type="checkbox" />跳过个人空间，只获取工作区授权
               </label>
               <div class="monitor-controls">
                 <span class="push-label" aria-hidden="true">测活</span>
@@ -405,6 +405,7 @@
                 </label>
                 <label id="login-proxy-custom-wrap" class="hidden">代理池地址
                   <textarea id="login-proxy-pool" rows="3" spellcheck="false" placeholder="每行一个代理，支持 host:port:user:pass、user:pass@host:port 或 socks5://user:pass@host:port"></textarea>
+                  <small>未填写协议的地址按 HTTP 解析。SOCKS5 代理请写完整的 socks5:// 或 socks5h:// 地址。</small>
                 </label>
               </div>
               <div class="status-line" id="login-proxy-status" role="status" aria-live="polite">使用服务器默认出口：已配置代理时走代理，未配置时直连。</div>

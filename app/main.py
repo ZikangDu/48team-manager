@@ -27,6 +27,8 @@ from app.web.routes.credential_import import build_credential_import_router
 from app.web.routes.assisted_login import build_assisted_login_router
 from app.web.routes.protocol_auth import build_protocol_auth_router
 from app.web.routes.bridge_workbench import build_bridge_workbench_router
+from app.web.routes.bridge_embed import build_bridge_embed_router
+from app.web.routes.bridge_exchange import build_bridge_exchange_router
 from app.web.routes.api import build_api_router
 from app.web.routes.extension import build_extension_router
 from app.web.routes.pages import build_pages_router
@@ -182,7 +184,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def protect_import_responses(request: Request, call_next):
         response = await call_next(request)
         if any(request.url.path == prefix or request.url.path.startswith(prefix + "/")
-               for prefix in ("/api/credential-import", "/api/assisted-login", "/api/protocol-auth", "/api/bridge-workbench")):
+               for prefix in ("/api/credential-import", "/api/assisted-login", "/api/protocol-auth", "/api/bridge-workbench", "/auth-bridge")):
             response.headers["Cache-Control"] = "no-store"
             response.headers["Pragma"] = "no-cache"
         return response
@@ -215,6 +217,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(build_assisted_login_router(get_db))
     app.include_router(build_protocol_auth_router(get_db))
     app.include_router(build_bridge_workbench_router(get_db))
+    app.include_router(build_bridge_exchange_router(get_db))
+    app.include_router(build_bridge_embed_router())
     app.include_router(build_api_router(get_db))
     app.include_router(build_pool_router(get_db))
     app.include_router(build_extension_router(get_db, settings))

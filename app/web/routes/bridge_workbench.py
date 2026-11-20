@@ -18,6 +18,7 @@ from sqlalchemy.orm import aliased
 
 from app.core.crypto import token_cipher
 from app.core.time import utcnow
+from app.domain.identity.ids import workspace_official_id
 from app.domain.workspaces.names import resolve_display_name
 from app.integrations.auth_bridge.credentials import parse_credentials
 from app.integrations.auth_bridge.login_client import BridgeError, normalize_bridge_url
@@ -163,6 +164,60 @@ def _reset_time(usage, key):
     return datetime.fromtimestamp(stamp, tz=timezone.utc).isoformat()
 
 
+def _login_time(value):
+    # The embedded Bridge emits Unix milliseconds. Recognize older seconds or zoned ISO values.
+    if isinstance(value, str):
+        value = value.strip()
+        if len(value) > 48:
+            return None
+        if re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", value):
+            value = float(value)
+        else:
+            try:
+                stamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                return stamp.astimezone(timezone.utc) if stamp.tzinfo is not None else None
+            except (ValueError, OverflowError):
+                return None
+    if type(value) not in (int, float) or not 0 < value <= MAX_TIMESTAMP * 1000:
+        return None
+    seconds = value / 1000 if value >= 10**10 else value
+    return datetime.fromtimestamp(seconds, tz=timezone.utc)
+
+
+def _device_summary(row, status):
+    probe = row.get("devicesStatus") if status == 200 else None
+    probe = probe if type(probe) is int and 100 <= probe <= 599 else None
+    result = {"devices_status": probe, "device_count": None, "app_session_count": None,
+              "first_login_at": None, "last_login_at": None}
+    if probe != 200:
+        return result
+    count, devices = row.get("deviceCount"), row.get("devices")
+    if devices is not None:
+        if not isinstance(devices, list) or not all(isinstance(device, dict) for device in devices):
+            return result
+        if count is None:
+            count = len(devices)
+        elif count != len(devices):
+            return result
+    if type(count) is not int or count < 0:
+        return result
+    result["device_count"] = count
+    sessions = row.get("appSessionCount")
+    if type(sessions) is int and sessions >= 0 and (count or sessions == 0):
+        result["app_session_count"] = sessions
+    if count:
+        for key, field, device_field, aggregate in (
+            ("first_login_at", "firstLoginAt", "createdAt", min),
+            ("last_login_at", "lastLoginAt", "lastLoginAt", max),
+        ):
+            stamp = _login_time(row.get(field))
+            if stamp is None and devices:
+                times = (_login_time(device.get(device_field)) for device in devices)
+                stamp = aggregate((item for item in times if item is not None), default=None)
+            result[key] = stamp.isoformat() if stamp is not None else None
+    return result
+
+
 async def _health_summary(response):
     malformed = _error(502, "bridge_response_invalid", "授权内核返回了无法识别的测活结果。")
     raw = bytearray()
@@ -183,15 +238,14 @@ async def _health_summary(response):
             (type(status) is not int or not 100 <= status <= 599)):
         raise malformed
     usage = row.get("usage") if status == 200 and isinstance(row.get("usage"), dict) else {}
-    devices = row.get("deviceCount") if status == 200 and row.get("devicesStatus") == 200 else None
-    device_count = devices if type(devices) is int and devices >= 0 else None
+    devices = _device_summary(row, status)
     five_hour, seven_day = _percent(usage, "fiveHour"), _percent(usage, "sevenDay")
-    healthy = status == 200 and (five_hour is not None or seven_day is not None or device_count is not None)
+    healthy = status == 200 and (five_hour is not None or seven_day is not None or devices["device_count"] is not None)
     message = {200: "会话可用。" if healthy else "官方返回 HTTP 200，但缺少可核对的额度或设备信息。",
                401: "授权已失效，请重新授权。", 403: "访问受限。",
                429: "请求频率受限，请稍后重试。", None: "未能连接官方服务。"}.get(status, "本次测活未通过。")
     return {"ok": True, "healthy": healthy, "status": status, "message": message, "checked_at": utcnow().isoformat(),
-            "device_count": device_count,
+            **devices,
             "quota": {"five_hour_used_percent": five_hour, "seven_day_used_percent": seven_day,
                      "five_hour_resets_at": _reset_time(usage, "fiveHour"),
                      "seven_day_resets_at": _reset_time(usage, "sevenDay")}}
@@ -296,18 +350,46 @@ def build_bridge_workbench_router(get_db):
                 "proxy_compatible": _proxy_compatible(row.fixed_proxy, request.app.state.settings)} for row in rows]}
 
     @router.get("/{account_id}/workspaces")
-    async def workspaces(account_id: int, db: AsyncSession = Depends(get_db)):
-        await _account(db, account_id)
+    async def workspaces(account_id: int, skip_personal: bool = False, db: AsyncSession = Depends(get_db)):
+        account_query = _accounts_query().add_columns(Account.official_account_id).where(Account.id == account_id)
+        account = (await db.execute(account_query)).one_or_none()
+        if account is None:
+            raise _error(404, "account_not_found", "账号不存在或已停用。")
+        credential_id = workspace_official_id(account.official_account_id) if account.has_access_token else None
         query = (select(Workspace, WorkspaceMembership.official_role, WorkspaceMembership.membership_state)
                  .outerjoin(WorkspaceMembership, and_(WorkspaceMembership.workspace_id == Workspace.id,
                                                        WorkspaceMembership.account_id == account_id))
-                 .where(or_(Workspace.owner_account_id == account_id, WorkspaceMembership.account_id == account_id))
+                 .where(or_(Workspace.owner_account_id == account_id, WorkspaceMembership.account_id == account_id,
+                            func.lower(Workspace.official_workspace_id) == credential_id if credential_id else False))
                  .order_by(Workspace.id))
         results = []
+        credential_is_registered_team = False
+        credential_has_membership_record = False
         for workspace, role, state in await db.execute(query):
             owner = workspace.owner_account_id == account_id
+            official_id = workspace_official_id(workspace.official_workspace_id)
+            matches_credential = bool(credential_id and official_id == credential_id)
+            if matches_credential:
+                credential_is_registered_team = True
+                if owner or state in {"joined", "invited", "removed"}:
+                    credential_has_membership_record = True
+            if not owner and state not in {"joined", "invited"}:
+                continue
             results.append({"id": workspace.id, "name": resolve_display_name(workspace)["name"],
+                            "kind": "team", "source": "registration", "official_workspace_id": official_id,
                             "role": "owner" if owner else role, "state": workspace.status if owner else state})
+        # Imports retain a single selected grant. Its UUID and exact official plan
+        # describe that record only. It has no local team, role or seat to link to.
+        if credential_id and not credential_has_membership_record:
+            if credential_is_registered_team or account.plan in {"team", "business"}:
+                kind, name = "team", "团队工作区"
+            elif account.plan in {"free", "plus", "pro"}:
+                kind, name = "personal", "个人空间"
+            else:
+                kind, name = "unknown", "已保存授权的工作区"
+            if not skip_personal or kind != "personal":
+                results.append({"id": None, "name": name, "kind": kind, "source": "authorization",
+                                "official_workspace_id": credential_id, "role": None, "state": "saved"})
         return {"ok": True, "workspaces": results}
 
     @router.post("/{account_id}/health")

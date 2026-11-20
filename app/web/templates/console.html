@@ -13,7 +13,7 @@
   <link rel="stylesheet" href="{{ static_url('css/workspace-purchase.css') }}">
   {% if page == 'accounts' %}<link rel="stylesheet" href="{{ static_url('css/auth-bridge.css') }}"><link rel="stylesheet" href="{{ static_url('css/assisted-login.css') }}">{% endif %}
   {% if page == 'overview' %}<link rel="stylesheet" href="{{ static_url('css/runtime.css') }}">{% endif %}
-  {% if page == 'auth_bridge' %}<link rel="stylesheet" href="{{ static_url('css/bridge-workbench.css') }}">{% endif %}
+  {% if page == 'auth_bridge' %}<link rel="stylesheet" href="{{ static_url('css/bridge-shell.css') }}">{% if request.query_params.get('view') == 'compact' %}<link rel="stylesheet" href="{{ static_url('css/bridge-workbench.css') }}">{% endif %}{% endif %}
   {% if page == 'settings' %}<link rel="stylesheet" href="{{ static_url('css/settings.css') }}">{% endif %}
   {% if page == 'pool' %}<link rel="stylesheet" href="{{ static_url('css/pool.css') }}">{% endif %}
   <link rel="icon" href="{{ static_url('logo.svg') }}" type="image/svg+xml">
@@ -861,6 +861,6 @@
   {% if page == 'overview' %}<script src="{{ static_url('js/team-board.js') }}"></script>{% endif %}
   <script src="{{ static_url('js/app.js') }}"></script>
   {% if page == 'pool' %}<script src="{{ static_url('js/pool.js') }}"></script>{% endif %}
-  {% if page == 'auth_bridge' %}<script type="module" src="{{ static_url('js/bridge-workbench.js') }}"></script>{% endif %}
+  {% if page == 'auth_bridge' %}{% if request.query_params.get('view') == 'compact' %}<script type="module" src="{{ static_url('js/bridge-workbench.js') }}"></script>{% else %}<script src="{{ static_url('js/bridge-shell.js') }}"></script>{% endif %}{% endif %}
 </body>
 </html>

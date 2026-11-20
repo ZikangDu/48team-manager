@@ -29,7 +29,8 @@ export async function checkSessionHealth(account, { includeUsage = false, includ
   const trial = includeTrial && health.status === 200 ? await probePlusTrial(account, options) : null;
   return { ...health, trial, usage: usage?.usage || null, usageStatus: usage?.status ?? null, usageError: usage?.error || '',
     devices: devices?.devices ?? null, firstLoginAt: devices?.firstLoginAt ?? null, lastLoginAt: devices?.lastLoginAt ?? null,
-    deviceCount: devices?.deviceCount ?? null, devicesStatus: devices?.status ?? null, devicesError: devices?.error || '' };
+    deviceCount: devices?.deviceCount ?? null, appSessionCount: devices?.appSessionCount ?? null,
+    devicesStatus: devices?.status ?? null, devicesError: devices?.error || '' };
 }
 
 const PROBE_URL = "https://chatgpt.com/backend-api/me";
@@ -177,9 +178,22 @@ export async function probeDevices(account, { fetchImpl, signal } = {}) {
     const response = await fetchImpl(SESSIONS_URL, { headers, signal: AbortSignal.any([controller.signal, signal].filter(Boolean)) });
     const payload = await response.json().catch(() => null);
     if (!response.ok) return { status: response.status, deviceCount: null, error: `HTTP ${response.status}` };
-    if (!Array.isArray(payload?.devices)) return { status: response.status, deviceCount: null, error: '设备列表响应无效' };
+    const isRecord = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+    if (!Array.isArray(payload?.devices) || !payload.devices.every(isRecord)) {
+      return { status: response.status, deviceCount: null, error: '设备列表响应无效' };
+    }
+    // Only count records actually returned for every device. Client names can repeat or be absent.
+    const hasSessionData = entry => isRecord(entry) && Object.values(entry).some(value =>
+      (typeof value === 'string' && value.trim().length > 0) || Number.isFinite(value) || typeof value === 'boolean');
+    const allSessionsAvailable = payload.devices.every(device =>
+      Array.isArray(device.app_sessions) && device.app_sessions.every(hasSessionData));
+    const appSessionCount = allSessionsAvailable
+      ? payload.devices.reduce((count, device) => count + device.app_sessions.length, 0) : null;
     const text = value => typeof value === 'string' ? value : '';
-    const timestamp = value => typeof value === 'number' && value > 0 && Number.isFinite(value) && !Number.isNaN(new Date(value * 1000).getTime()) ? value * 1000 : null;
+    function timestamp(value) {
+      const seconds = typeof value === 'string' && /^\d+(?:\.\d+)?$/.test(value) ? Number(value) : value;
+      return Number.isFinite(seconds) && seconds > 0 && Number.isFinite(new Date(seconds * 1000).getTime()) ? seconds * 1000 : null;
+    }
     const devices = payload.devices.map(device => ({
       name: text(device?.display_name) || text(device?.device_model),
       description: text(device?.human_readable_description),
@@ -192,7 +206,7 @@ export async function probeDevices(account, { fetchImpl, signal } = {}) {
     }));
     const firstTimes = devices.map(device => device.createdAt).filter(value => value != null);
     const lastTimes = devices.map(device => device.lastLoginAt).filter(value => value != null);
-    return { status: response.status, deviceCount: devices.length, devices,
+    return { status: response.status, deviceCount: devices.length, appSessionCount, devices,
       firstLoginAt: firstTimes.length ? firstTimes.reduce((a, b) => Math.min(a, b)) : null,
       lastLoginAt: lastTimes.length ? lastTimes.reduce((a, b) => Math.max(a, b)) : null, error: '' };
   } catch (error) {

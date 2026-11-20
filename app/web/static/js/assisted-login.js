@@ -635,6 +635,9 @@
 
   function renderProtocol() {
     const section = node("section", "assisted-vault protocol-pane");
+    const fullWorkbench = node("a", "button", "完整协议工作台 · 代理、并发 2FA 与工作区");
+    fullWorkbench.href = "/tools/auth-bridge?tool=protocol-login";
+    section.append(fullWorkbench);
     const connection = node("div", "protocol-connection");
     const status = node("p", "assisted-result");
     const check = button("重新检查", () => void checkConnection());

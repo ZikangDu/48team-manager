@@ -1,0 +1,30 @@
+.page-auth_bridge { gap: var(--space-sm); }
+.bridge-shell { min-width: 0; }
+.bridge-shell-toolbar, .bridge-shell-actions { display: flex; align-items: center; flex-wrap: wrap; gap: var(--space-xs); }
+.bridge-shell-toolbar { justify-content: space-between; margin-bottom: var(--space-sm); }
+#bridge-kernel-status { color: var(--muted); font-size: var(--text-meta); }
+.bridge-shell-feedback { margin-block: var(--space-sm); overflow-wrap: anywhere; }
+.bridge-shell-feedback[data-tone="danger"], #bridge-exchange-error { color: var(--danger-text); }
+.bridge-shell-loading { padding-block: var(--space-lg); color: var(--muted); }
+#bridge-frame { display: block; width: 100%; min-height: 80vh; border: 0; background: var(--bg); }
+.bridge-exchange { width: min(680px, calc(100% - 32px)); max-height: calc(100dvh - 32px); overflow: auto; margin: auto;
+  padding: var(--space-lg); background: var(--bg); color: var(--text); border: 1px solid var(--border); }
+.bridge-exchange::backdrop { background: var(--overlay); }
+.bridge-exchange header, .bridge-exchange footer { display: flex; gap: var(--space-sm); align-items: center; justify-content: space-between; }
+.bridge-exchange h2 { margin: 0; }
+.bridge-exchange > p { margin-block: var(--space-sm); }
+.bridge-exchange form { display: grid; gap: var(--space-md); }
+.bridge-exchange-items { display: grid; gap: var(--space-xs); }
+.bridge-exchange-items fieldset { margin: 0; padding: 0; border: 0; }
+.bridge-exchange-items legend { font-family: var(--font-mono); overflow-wrap: anywhere; margin-bottom: var(--space-xs); }
+.bridge-exchange-items label, .bridge-exchange-confirm { display: flex; gap: var(--space-xs); align-items: flex-start; color: var(--text); font-size: var(--text-body); }
+.bridge-exchange-items label { padding-block: var(--space-xs); border-top: 1px solid var(--border); }
+.bridge-exchange-items input, .bridge-exchange-confirm input { margin-top: var(--space-xxs); flex: 0 0 auto; }
+.bridge-exchange-items label span { min-width: 0; overflow-wrap: anywhere; }
+.bridge-exchange-items small { display: block; font-size: var(--text-meta); color: var(--muted); }
+@media (max-width: 720px) {
+  .bridge-shell-toolbar { align-items: flex-start; }
+  .bridge-shell-actions { width: 100%; }
+  .bridge-shell-actions .button { flex: 1 1 auto; }
+  .bridge-exchange { padding: var(--space-md); }
+}

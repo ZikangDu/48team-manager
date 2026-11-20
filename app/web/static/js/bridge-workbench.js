@@ -12,6 +12,7 @@ const accounts = new Map();
 const tabs = [...document.querySelectorAll(".bridge-tabs a")];
 let tool = "health";
 let previewSource = "";
+let evaluationRun = 0;
 let workspacesLoaded = false;
 
 function say(id, message = "", tone = "") {
@@ -26,12 +27,19 @@ function resetPreview() {
   previewToggle.setAttribute("aria-expanded", "false");
 }
 function resetEvaluation() {
+  evaluationRun++;
   resetPreview();
   previewSource = "";
   previewToggle.hidden = true;
   byId("evaluation-result").hidden = true;
-  byId("evaluation-output").textContent = "";
-  byId("evaluation-meta").textContent = "";
+  for (const question of ["candy", "pelican"]) {
+    byId("evaluation-result-" + question).hidden = true;
+    byId("evaluation-output-" + question).replaceChildren();
+    byId("evaluation-output-" + question).hidden = true;
+    byId("evaluation-meta-" + question).hidden = true;
+    byId("evaluation-stop-" + question).hidden = true;
+    say("evaluation-status-" + question);
+  }
   say("evaluation-status");
 }
 function syncControls() {
@@ -48,7 +56,9 @@ function syncControls() {
   byId("evaluation-api").hidden = !apiMode;
   byId("evaluation-api").disabled = !apiMode || testing;
   byId("bridge-check").disabled = !ready || liveRequests.has("health");
-  byId("evaluation-start").disabled = testing || (!apiMode && (!ready || account?.plan?.toLowerCase() === "free"));
+  const selected = form.querySelectorAll('[name="question"]:checked').length;
+  byId("evaluation-selection").textContent = selected ? "已选 " + selected + " 题 · " + selected + " 次模型请求" : "请选择至少一道题";
+  byId("evaluation-start").disabled = testing || !selected || (!apiMode && (!ready || account?.plan?.toLowerCase() === "free"));
   form.querySelectorAll("input,select").forEach(el => { el.disabled = testing; });
   byId("evaluation-stop").hidden = !testing;
   byId("workspace-refresh").disabled = !account || liveRequests.has("workspaces");
@@ -212,64 +222,100 @@ byId("workspace-refresh").addEventListener("click", loadWorkspaces);
 
 const phases = {queued: "评测已排队", connecting: "正在连接模型…", waiting: "已发送题目，等待模型回答…"};
 const grades = {passed: "答案正确", wrong_answer: "答案有误", invalid_format: "输出格式不符", manual_review: "动画已生成，请预览核对"};
+async function evaluateQuestion(question, {run, url, options, signal, multiple}) {
+  const controller = new AbortController();
+  const jobSignal = AbortSignal.any([signal, controller.signal]);
+  const statusId = "evaluation-status-" + question;
+  const output = byId("evaluation-output-" + question);
+  const answer = document.createTextNode("");
+  output.replaceChildren(answer);
+  byId("evaluation-result-" + question).hidden = false;
+  const stop = byId("evaluation-stop-" + question);
+  stop.hidden = !multiple;
+  stop.onclick = () => controller.abort();
+  let outcome = "";
+  say(statusId, "评测已排队");
+  function receive(packet) {
+    if (jobSignal.aborted || evaluationRun !== run || outcome) return;
+    if (packet.type === "phase" && phases[packet.phase]) say(statusId, phases[packet.phase]);
+    if (packet.type === "error") throw new Error(packet.error || "评测中断，未取得完整结果。");
+    if (packet.type === "delta" && typeof packet.delta === "string") {
+      say(statusId, "正在接收模型回答…");
+      answer.appendData(packet.delta);
+      output.hidden = false;
+    }
+    if (packet.type !== "complete") return;
+    if (!Object.hasOwn(grades, packet.status)) throw new Error("模型返回了无法识别的评测结果。");
+    outcome = "complete";
+    stop.hidden = true;
+    answer.data = packet.output ?? answer.data;
+    output.hidden = !answer.length;
+    say(statusId, grades[packet.status], packet.status === "passed" ? "success" : "warning");
+    const sec = n => (n / 1000).toFixed(1) + " 秒";
+    const meta = byId("evaluation-meta-" + question);
+    meta.textContent = [Number.isFinite(packet.firstTokenMs) && "首个词元 " + sec(packet.firstTokenMs),
+      Number.isFinite(packet.durationMs) && "总耗时 " + sec(packet.durationMs),
+      Number.isFinite(packet.outputTokens) && packet.outputTokens + " 个输出词元"].filter(Boolean).join(" · ");
+    meta.hidden = !meta.textContent;
+    if (question === "pelican" && packet.status === "manual_review") {
+      previewSource = packet.html || answer.data;
+      previewToggle.hidden = !previewSource;
+    }
+  }
+  try {
+    if (url) {
+      const response = await post(url, {...options, question}, jobSignal);
+      await readEvaluationEvents(response.body, receive);
+    } else {
+      const {runApiEvaluation} = await import("./bridge-api-evaluation.js");
+      await runApiEvaluation({...options, question}, jobSignal, receive);
+    }
+    if (!outcome) throw new Error("连接已结束，未收到完整的评测结果。");
+  } catch (error) {
+    if (!outcome) {
+      outcome = jobSignal.aborted ? "cancelled" : "failed";
+      if (evaluationRun === run) say(statusId, jobSignal.aborted ? "此题已停止。" :
+        error instanceof TypeError ? "连接中断，请检查服务后重试。" : error.message,
+        jobSignal.aborted ? "warning" : "danger");
+    }
+  } finally {
+    if (evaluationRun === run) { stop.hidden = true; stop.onclick = null; }
+  }
+  return outcome;
+}
+
+form.addEventListener("change", event => { if (event.target.name === "question") syncControls(); });
 form.addEventListener("submit", event => {
   event.preventDefault();
   if (byId("evaluation-start").disabled) return;
   const apiMode = source.value === "api";
-  const payload = Object.fromEntries(new FormData(form));
+  const fields = new FormData(form);
+  const questions = fields.getAll("question");
+  const options = {model: fields.get("model"), reasoning_effort: fields.get("reasoning_effort")};
+  if (apiMode) Object.assign(options, {baseUrl: fields.get("baseUrl"), protocol: fields.get("protocol"), key: fields.get("key")});
   form.elements.key.value = "";
   resetEvaluation();
+  const run = evaluationRun;
   runAction("evaluation", async (url, signal) => {
-    say("evaluation-status", "正在提交评测…");
-    const output = byId("evaluation-output");
-    output.dataset.source = payload.question === "pelican" ? "svg" : "text";
-    const answer = document.createTextNode("");
-    output.replaceChildren(answer);
-    let finished = false;
-    const showEvent = packet => {
-      if (signal.aborted || finished) return;
-      if (packet.type === "phase" && phases[packet.phase]) say("evaluation-status", phases[packet.phase]);
-      if (packet.type === "error") {
-        finished = true;
-        say("evaluation-status", packet.error || "评测中断，未取得完整结果。", "danger");
-      }
-      if (packet.type === "delta" && typeof packet.delta === "string") {
-        say("evaluation-status", "正在接收模型回答…");
-        answer.appendData(packet.delta);
-        byId("evaluation-result").hidden = false;
-      }
-      if (packet.type === "complete") {
-        finished = true;
-        answer.data = packet.output ?? answer.data;
-        say("evaluation-status", grades[packet.status] || "评测结束", packet.status === "passed" ? "success" : "warning");
-        const sec = n => (n / 1000).toFixed(1) + " 秒";
-        byId("evaluation-meta").textContent = [
-          Number.isFinite(packet.firstTokenMs) && "首个词元 " + sec(packet.firstTokenMs),
-          Number.isFinite(packet.durationMs) && "总耗时 " + sec(packet.durationMs),
-          Number.isFinite(packet.outputTokens) && packet.outputTokens + " 个输出词元"
-        ].filter(Boolean).join(" · ");
-        byId("evaluation-result").hidden = false;
-        if (payload.question === "pelican" && packet.status === "manual_review") {
-          previewSource = packet.html || answer.data;
-          previewToggle.hidden = !previewSource;
-        }
-      }
-    };
-    if (apiMode) {
-      const {runApiEvaluation} = await import("./bridge-api-evaluation.js");
-      try { await runApiEvaluation(payload, signal, showEvent); }
-      finally { delete payload.key; }
-    } else {
-      const response = await post(url, payload, signal);
-      await readEvaluationEvents(response.body, showEvent);
-    }
-    if (!finished && !signal.aborted) throw new Error("连接已结束，未收到完整的评测结果。");
+    byId("evaluation-result").hidden = false;
+    const results = [];
+    const total = questions.length;
+    say("evaluation-status", "正在评测 " + total + " 题…");
+    try {
+      await Promise.all(questions.map(async question => {
+        results.push(await evaluateQuestion(question, {run, url, options, signal, multiple: total > 1}));
+        if (run !== evaluationRun) return;
+        const count = value => results.filter(result => result === value).length;
+        const summary = ["已返回结果 " + count("complete") + "/" + total + " 题"];
+        if (count("failed")) summary.push(count("failed") + " 题请求失败");
+        if (count("cancelled")) summary.push(count("cancelled") + " 题已停止");
+        if (results.length < total) summary.push((total - results.length) + " 题进行中");
+        say("evaluation-status", summary.join(" · "), count("failed") || count("cancelled") ? "warning" : "");
+      }));
+    } finally { delete options.key; }
   }, !apiMode);
 });
-byId("evaluation-stop").addEventListener("click", () => {
-  liveRequests.get("evaluation")?.abort();
-  say("evaluation-status", "评测已停止。");
-});
+byId("evaluation-stop").addEventListener("click", () => liveRequests.get("evaluation")?.abort());
 previewToggle.addEventListener("click", () => {
   if (!preview.hidden) { resetPreview(); return; }
   preview.srcdoc = evaluationPreviewDocument(previewSource);

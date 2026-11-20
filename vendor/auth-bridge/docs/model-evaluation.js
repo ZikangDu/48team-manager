@@ -24,6 +24,10 @@ export function initializeModelEvaluation({ request, getEligibility, getHeaders,
   let paused = false, rawOutput = false, importing = false, loggingOut = false;
   let copying = false;
   const logoutAccounts = () => mode() === 'accounts' ? evaluationLogoutAccounts(jobs, getAccounts()) : [];
+  const selectedQuestions = () => [
+    (find('include-candy')?.checked ?? true) && 'candy',
+    find('include-pelican').checked && 'pelican',
+  ].filter(Boolean);
   const markdown = window.markdownit({ html: false, breaks: true, linkify: false });
   markdown.disable('image');
   const importDialog = find('import-dialog');
@@ -67,7 +71,7 @@ export function initializeModelEvaluation({ request, getEligibility, getHeaders,
     }
     find('accounts-source').hidden = apiMode;
     find('api-source').hidden = !apiMode;
-    start.disabled = Boolean(controller) || loggingOut || isPushBusy() || unavailableEffort || (!apiMode && !eligibility.accounts.length);
+    start.disabled = Boolean(controller) || loggingOut || isPushBusy() || unavailableEffort || !selectedQuestions().length || (!apiMode && !eligibility.accounts.length);
     fields.disabled = Boolean(controller) || loggingOut;
     stop.disabled = !controller;
     const concurrency = getConcurrency();
@@ -237,6 +241,7 @@ export function initializeModelEvaluation({ request, getEligibility, getHeaders,
   for (const target of [frame, largeFrame]) target.addEventListener('load', syncPause);
   panel.querySelectorAll('input[name="evaluation-source"]').forEach(input => input.addEventListener('change', () => { clearCopyStatus(); refresh(); }));
   reasoning.addEventListener('change', refresh);
+  for (const name of ['include-candy', 'include-pelican']) find(name)?.addEventListener('change', refresh);
   for (const name of ['preview', 'output']) {
     find(`${name}-tab`).addEventListener('click', () => chooseView(name));
     find(`${name}-tab`).addEventListener('keydown', event => {
@@ -314,7 +319,8 @@ export function initializeModelEvaluation({ request, getEligibility, getHeaders,
     event.preventDefault(); if (controller || loggingOut || isPushBusy()) return;
     const concurrency = getConcurrency();
     if (!Number.isInteger(concurrency) || concurrency < 1) { status.textContent = '服务端并发配置尚未加载，请刷新页面后重试。'; return; }
-    const questions = find('include-pelican').checked ? ['candy', 'pelican'] : ['candy'];
+    const questions = selectedQuestions();
+    if (!questions.length) { status.textContent = '请至少选择一道测试题。'; return; }
     const chosenModel = model.value.trim();
     const reasoningEffort = reasoning.value;
     const reasoningLabel = reasoning.selectedOptions[0]?.textContent || '模型默认';
@@ -352,7 +358,7 @@ export function initializeModelEvaluation({ request, getEligibility, getHeaders,
       job.option = document.createElement('option'); job.option.value = String(index); find('task-select').append(job.option);
     });
     find('queue-count').textContent = `${jobs.length} 项`;
-    selectJob(questions.includes('pelican') ? 1 : 0); jobs.forEach(updateJob); refresh();
+    selectJob(questions.indexOf('pelican') === -1 ? 0 : questions.indexOf('pelican')); jobs.forEach(updateJob); refresh();
     status.textContent = `正在测试 ${accounts.length} 个${apiMode ? 'API 接入' : '测活通过的账号'}，服务端配置并发 ${concurrency}。`;
     timer = setInterval(renderMetrics, 500);
     let cursor = 0;
