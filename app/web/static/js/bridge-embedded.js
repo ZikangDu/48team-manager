@@ -5,6 +5,7 @@
   const channel = "team48-auth-bridge";
   const storagePrefix = "team48.auth-bridge.";
   const origin = window.location.origin;
+  document.documentElement.dataset.team48Embedded = "true";
   const NativeRequest = window.Request;
   const nativeFetch = window.fetch.bind(window);
   let initialized = false;

@@ -2406,11 +2406,15 @@ import { OPERATION_SCHEMA_VERSION, validatePushResults, validateOperationEvent }
       if (!node) {
         const article = document.createElement('article');
         article.innerHTML = '<div class="login-account-progress-head"><div class="login-account-email"></div><div class="login-account-stage"></div></div>'
-          + '<div class="login-progress-track"><div class="login-progress-bar"></div></div><pre class="login-account-log"></pre>'
+          + '<div class="login-progress-track"><div class="login-progress-bar"></div></div>'
+          + '<div class="login-manual-auth" hidden><p>在「账号与团队」找到这个账号，再选择「手动授权」。新账号需先登记。</p>'
+          + '<a class="button button-secondary" href="/accounts?view=all" target="_blank" rel="noopener">打开账号与团队</a></div>'
+          + '<pre class="login-account-log"></pre>'
           + '<details class="login-account-timing"><summary>阶段耗时</summary><div></div></details>';
         node = { article, email: article.querySelector('.login-account-email'), stage: article.querySelector('.login-account-stage'),
           track: article.querySelector('.login-progress-track'), bar: article.querySelector('.login-progress-bar'),
-          log: article.querySelector('.login-account-log'), timing: article.querySelector('.login-account-timing'),
+          manualAuth: article.querySelector('.login-manual-auth'), log: article.querySelector('.login-account-log'),
+          timing: article.querySelector('.login-account-timing'),
           durations: article.querySelector('.login-account-timing div') };
         node.timing.title = '单个阶段可能包含其他子阶段；各项耗时不可直接相加。账号执行不含排队。';
         loginProgressNodes.set(key, node);
@@ -2428,6 +2432,8 @@ import { OPERATION_SCHEMA_VERSION, validatePushResults, validateOperationEvent }
       node.email.textContent = record.email;
       node.email.title = record.email;
       node.stage.textContent = label;
+      node.manualAuth.hidden = document.documentElement.dataset.team48Embedded !== 'true'
+        || record.status !== 'error' || record.validationFailure?.code !== 'VALIDATION_CONFIG_MISSING';
       node.track.setAttribute('aria-label', `${record.email} ${progress}%`);
       node.bar.style.width = `${progress}%`;
       node.log.dataset.account = record.email;

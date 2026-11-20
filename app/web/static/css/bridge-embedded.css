@@ -73,6 +73,9 @@ textarea, #session-input, #login-accounts, #output { font-family: var(--font-mon
 .issues, .status-line.is-error { color: var(--danger-text); }
 .login-reset-output { background: var(--surface); }
 .login-account-progress, .login-progress-empty { background: var(--surface); border-color: var(--border); }
+.login-account-log { color: var(--text-secondary); }
+.login-manual-auth { display: grid; justify-items: start; gap: var(--space-xs); margin-block: var(--space-sm); }
+.login-manual-auth p { margin: 0; color: var(--text-secondary); }
 .login-proxy-switch span { background: var(--border-strong); }
 .login-proxy-switch span::before { background: var(--text); }
 .login-reset-output pre, .login-reset-output small { color: var(--text-secondary); }

@@ -9,7 +9,7 @@ export const VALIDATION_FAILURES = Object.freeze({
   BROWSER_CLEANUP_FAILED: '浏览器资源回收失败，相关执行槽位已隔离',
   VALIDATION_TIMEOUT: '辅助验证超时，已停止后续验证操作',
   VALIDATION_CANCELLED: '辅助验证已取消',
-  VALIDATION_CONFIG_MISSING: '没有可用的验证通道，请检查浏览器或备用通道配置',
+  VALIDATION_CONFIG_MISSING: '官方要求额外验证，请在官方登录页面手动完成授权',
   VALIDATION_PROVIDER_FAILED: '备用验证通道失败，请检查配置或服务状态',
   VALIDATION_CHALLENGE_FAILED: '辅助验证未完成，请稍后重试或人工处理',
   VALIDATION_CONTEXT_MISMATCH: '验证结果与当前登录上下文不一致，已拒绝继续提交',
@@ -67,6 +67,7 @@ export function validationFailureHint(input) {
 export function validationFailureLabel(input) {
   const failure = validationFailureFields(input).validationFailure;
   if (!failure) return '';
+  if (failure.code === 'VALIDATION_CONFIG_MISSING') return '需要人工验证';
   if (isValidationAccessBlocked(failure)) return failure.httpStatus === 429 ? '上游请求限流' : '上游访问受限';
   if (failure.code === 'EMAIL_VERIFICATION_REQUIRED') return '需要邮箱验证';
   if (failure.code === 'AUTH_CONTINUATION_FAILED') return '登录授权未完成';

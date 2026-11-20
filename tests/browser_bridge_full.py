@@ -41,6 +41,7 @@ def main():
         saved_backups = []
         records = []
         activation_attempted = False
+        validation_blocked = False
 
         def account(index):
             email = EMAILS[index]
@@ -83,10 +84,15 @@ def main():
                     assert body["proxyMode"] == "pool" and len(body["proxyPool"].splitlines()) == 3
                     results = [{"id": row["id"], "email": row["email"], "ok": True, "sessionOk": True,
                         "personalOk": False, "businessSuccess": 1} for row in records]
+                    if validation_blocked:
+                        for result in results:
+                            result.update(ok=False, sessionOk=False, businessSuccess=0,
+                                validationFailure={"code": "VALIDATION_CONFIG_MISSING", "stage": "sentinel"})
                     events = [("account_start", {**op, "id": row["id"], "email": row["email"]}) for row in records]
                     events += [("browser_state", {**op, "accounts": records, "settings": {}})]
                     events += [("account_done", {**op, **result}) for result in results]
-                    events += [("summary", {**op, "ok": True, "concurrency": 3, "success": 3, "failed": 0,
+                    events += [("summary", {**op, "ok": True, "concurrency": 3,
+                        "success": 0 if validation_blocked else 3, "failed": 3 if validation_blocked else 0,
                         "accounts": records, "results": results})]
                     return route.fulfill(content_type="text/event-stream", body=stream(events))
                 if relative == "api/v2/accounts/export-sessions":
@@ -176,6 +182,7 @@ def main():
         bridge.locator("#login-accounts").fill("\n".join(email + "----fixture-password----" + OLD_KEY for email in EMAILS))
         bridge.locator("#start-protocol-login").click()
         expect(bridge.locator("#login-status")).to_contain_text("全部流程完成：成功 3")
+        expect(bridge.get_by_role("link", name="打开账号与团队")).to_have_count(0)
         expect(bridge.locator("#export-login-sessions")).to_be_enabled()
         expect(bridge.locator("#export-login-business")).to_be_enabled()
         expect(bridge.locator("#export-login-personal")).to_be_disabled()
@@ -211,6 +218,13 @@ def main():
         expect(page.locator("#bridge-exchange")).not_to_be_visible()
         assert sorted(saved_backups) == sorted(EMAILS)
         expect(page.locator("#bridge-feedback")).to_contain_text("已保存 1 个账号")
+        validation_blocked = True
+        bridge.locator("#start-protocol-login").click()
+        expect(bridge.locator(".login-account-stage", has_text="需要人工验证")).to_have_count(3)
+        action = bridge.get_by_role("link", name="打开账号与团队").first
+        expect(action).to_be_visible()
+        expect(action).to_have_attribute("href", "/accounts?view=all")
+        expect(bridge.locator(".login-account-log").first).to_contain_text("请在官方登录页面手动完成授权")
         for width, theme in [(1280, "light"), (390, "dark")]:
             page.set_viewport_size({"width": width, "height": 900})
             page.get_by_label("外观模式").select_option(theme)
