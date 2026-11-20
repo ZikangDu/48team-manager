@@ -12,12 +12,7 @@ PAGES = {
     "overview": {
         "title": "总览",
         "path": "/",
-        "subtitle": "优先查看异常。工作区资产在左，待处理在右；没有异常时不占大卡片。",
-    },
-    "workspaces": {
-        "title": "团队",
-        "path": "/workspaces",
-        "subtitle": "登记已有 ChatGPT Team 母号，查看席位、健康和最近同步。",
+        "subtitle": "先处理异常，再看团队资产。",
     },
     "accounts": {
         "title": "账号与团队",
@@ -28,6 +23,11 @@ PAGES = {
         "title": "任务",
         "path": "/operations",
         "subtitle": "查看持久化任务的当前步骤、结果和人工处理项。",
+    },
+    "pool": {
+        "title": "备用号池",
+        "path": "/resources/pool",
+        "subtitle": "导入本地注册好的账号，一键拉入团队。",
     },
     "phones": {
         "title": "手机号",
@@ -50,15 +50,6 @@ PAGES = {
         "subtitle": "管理外部服务、自动化开关和资源策略。检测使用当前输入值，不会自动保存。",
     },
 }
-NAV = (
-    ("overview", "总览"),
-    ("accounts", "账号与团队"),
-    ("operations", "任务"),
-    ("phones", "手机号"),
-    ("hme", "HME"),
-    ("proxies", "代理"),
-    ("settings", "设置"),
-)
 
 
 def build_pages_router(templates: Jinja2Templates, version: str) -> APIRouter:
@@ -76,7 +67,6 @@ def build_pages_router(templates: Jinja2Templates, version: str) -> APIRouter:
                 "subtitle": meta["subtitle"],
                 "user": user,
                 "app_version": version,
-                "pages": NAV,
             },
         )
 
@@ -94,6 +84,7 @@ def build_pages_router(templates: Jinja2Templates, version: str) -> APIRouter:
     async def overview(request: Request, user: dict = Depends(require_admin)):
         return render(request, "overview", user)
 
+    # Old bookmarks: the team list now lives in the accounts page's team view.
     @router.get("/workspaces", response_class=HTMLResponse)
     async def workspaces(request: Request, user: dict = Depends(require_admin)):
         from urllib.parse import urlencode
@@ -110,6 +101,10 @@ def build_pages_router(templates: Jinja2Templates, version: str) -> APIRouter:
     @router.get("/operations", response_class=HTMLResponse)
     async def operations(request: Request, user: dict = Depends(require_admin)):
         return render(request, "operations", user)
+
+    @router.get("/resources/pool", response_class=HTMLResponse)
+    async def pool(request: Request, user: dict = Depends(require_admin)):
+        return render(request, "pool", user)
 
     @router.get("/resources/phones", response_class=HTMLResponse)
     async def phones(request: Request, user: dict = Depends(require_admin)):

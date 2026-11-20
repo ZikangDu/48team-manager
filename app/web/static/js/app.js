@@ -21,6 +21,7 @@
     ["phone-import", document.getElementById("phone-import-sheet")],
     ["proxy-edit", document.getElementById("proxy-edit-sheet")],
     ["confirm", document.getElementById("confirm-sheet")],
+    ["tasks", document.getElementById("task-center")],
   ]);
   const sheet = overlayRegistry.get("entity");
   const menu = document.getElementById("action-menu");
@@ -35,12 +36,14 @@
   let proxySelectRequestId = 0;
   let settingsBaseline = "";
   let settingsDirty = false;
-  let searchTimer = null;
 
   const destinations = [
+    { label: "任务", href: "/operations" },
+    { label: "进行中的任务", href: "/operations?state=running,queued,waiting" },
     { label: "去总览", href: "/" },
-    { label: "去团队", href: "/workspaces" },
+    { label: "去团队", href: "/accounts?view=teams" },
     { label: "去账号", href: "/accounts" },
+    { label: "去备用号池", href: "/resources/pool" },
     { label: "去手机号", href: "/resources/phones" },
     { label: "去 HME", href: "/resources/hme" },
     { label: "去代理", href: "/resources/proxies" },
@@ -68,6 +71,7 @@
     cancelled: "已取消",
     manual_required: "需人工",
     partial: "部分完成",
+    resolved: "已人工结束",
     pending: "待确认",
     verified: "已验证",
     missing: "缺失",
@@ -95,7 +99,7 @@
     quota_probe: "额度刷新",
     reauth: "重新授权",
     onboard: "拉人",
-    replenish: "补充 Team",
+    replenish: "补充团队",
     rotate: "轮转",
     workspace_sync: "同步官方成员",
     kick_member: "踢出成员",
@@ -119,6 +123,7 @@
     verification_failed: "核对失败",
     proxy_check: "代理检测",
     free_register: "空闲号注册",
+    runner_selfcheck: "浏览器环境自检",
     reregister: "重注册",
   };
   const roleLabels = {
@@ -153,10 +158,13 @@
     already_linked: "该成员已接入本地，无需重复接入。",
     membership_not_found: "未找到该成员的本地关系，请刷新后重试。",
     operation_in_progress: "相同操作正在进行，请等待当前操作完成。",
-    operation_conflict: "相同操作正在进行，请等待当前操作完成。",
+    operation_conflict: "该团队已有任务正在进行，请到任务页查看进度，完成后再重试。",
+    remote_catalog_unavailable: "无法读取 Sub2API 分组或代理目录，请到设置页检测连接后重试。",
+    proxy_unresolvable: "所选代理无法解析，请刷新代理目录并重新选择。",
+    vacancy_not_safe_to_refill: "移出回执显示空出的席位可能收费，暂不补位。请核对账单后继续轮转。"
   };
   const ACTIVE_OPERATION_STATES = new Set(["pending", "queued", "running", "waiting"]);
-  const TERMINAL_OPERATION_STATES = new Set(["success", "failed", "manual_required", "cancelled", "partial"]);
+  const TERMINAL_OPERATION_STATES = new Set(["success", "failed", "manual_required", "cancelled", "partial", "resolved"]);
 
   function abortEntity(key) {
     const previous = readControllers.get(key);
@@ -273,14 +281,41 @@
     return text;
   }
 
+  function requestActionLabel(key) {
+    const actions = [
+      ["settings-probe", "检测服务连接"], ["settings-save", "保存设置"], ["settings", "读取设置"],
+      ["password-save", "修改后台密码"], ["overview", "读取总览"],
+      ["sub2api-push-options", "读取 Sub2API 分组和代理"], ["sub2api", "核对 Sub2API"],
+      ["operation-cancel", "取消任务"], ["operation-retry", "重试任务"],
+      ["operation-archive", "归档任务"], ["operation-restore", "恢复任务记录"],
+      ["operations-bulk-archive", "批量归档任务"], ["operation", "读取任务"],
+      ["workspace-replenish", "补充团队成员"], ["workspace-invite", "邀请团队成员"],
+      ["workspace-sync", "同步团队成员"], ["workspace-delete", "移除本地团队记录"],
+      ["workspace-expiry", "修改团队到期日期"], ["workspace-role", "修改成员角色"],
+      ["workspace-list", "读取团队列表"], ["workspace", "更新团队成员"], ["rotate", "执行受控轮转"],
+      ["account-codex-rs", "导入 codex-rs"], ["codex-rs-options", "读取 codex-rs 分组和代理"],
+      ["account-reauth", "重新授权账号"], ["account-refresh", "刷新账号凭据"],
+      ["account-quota", "检测官方额度"], ["account-auth", "检测账号授权"],
+      ["account-sub2api", "同步 Sub2API"], ["account-delete-local", "删除本地账号档案"],
+      ["account-proxy", "设置账号代理"], ["account", "处理账号"],
+      ["phone-import", "导入手机号"], ["phone-status", "更新手机号状态"],
+      ["phone-reset", "重置手机号冷却"], ["phone", "读取手机号池"],
+      ["hme", "核对 HME 邮箱"], ["proxy", "读取或检测代理"],
+      ["register-oauth", "登记团队授权"], ["register-account", "登记账号"],
+      ["runner-selfcheck", "浏览器环境自检"],
+    ];
+    return actions.find(([prefix]) => String(key || "").startsWith(prefix))?.[1] || "提交请求";
+  }
+
   async function parseJsonResponse(response, key) {
     const payload = await response.json().catch(() => ({}));
     if (response.ok) return payload;
     const detail = payload.detail;
     const errorCode = typeof detail === "object" && detail ? detail.error_code : payload.error_code;
+    const fallback = `操作没有完成（${requestActionLabel(key)}），请重试。HTTP ${response.status}`;
     const message = typeof detail === "object" && detail
-      ? (detail.message || payload.message || payload.error || `请求失败: ${key}`)
-      : (typeof detail === "string" ? detail : (payload.message || payload.error || `请求失败: ${key}`));
+      ? (detail.message || payload.message || payload.error || fallback)
+      : (typeof detail === "string" && detail ? detail : (payload.message || payload.error || fallback));
     throw new RequestError(message, { status: response.status, payload, errorCode });
   }
 
@@ -363,6 +398,16 @@
     return text;
   }
 
+  // 详情里的时间：相对时间，悬停显示完整北京时间。
+  function timeValue(value) {
+    if (!value || Number.isNaN(new Date(value).getTime())) return value || "—";
+    const node = document.createElement("time");
+    node.dateTime = value;
+    node.textContent = relativeTime(value);
+    node.title = `${new Date(value).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false })}（北京时间）`;
+    return node;
+  }
+
   function countdownLabel(resetAt, usedPercent) {
     if (usedPercent === 0 && !resetAt) return "现在";
     if (!resetAt) return "—";
@@ -375,13 +420,6 @@
     if (hours >= 48) return `${Math.floor(hours / 24)}d ${hours % 24}h`;
     if (hours >= 1) return `${hours}h ${minutes}m`;
     return `${Math.max(1, minutes)}m`;
-  }
-
-  function meterTone(percent) {
-    if (percent == null) return "";
-    if (percent >= 90) return "danger";
-    if (percent >= 75) return "warning";
-    return "";
   }
 
   function timeNode(value) {
@@ -469,20 +507,54 @@
       const textNode = document.createElement("span");
       textNode.textContent = message;
       item.append(textNode);
+      let timer = null;
+      let hovered = false, focused = false;
+      const hold = () => {
+        if (timer == null) return;
+        window.clearTimeout(timer);
+        timer = null;
+      };
+      const dismiss = () => {
+        hold();
+        item.remove();
+      };
+      // 失败和警告由人工关闭，避免批量结果被后续提示冲掉。
+      const sticky = tone === "error" || tone === "warning";
+      const schedule = () => {
+        if (sticky || hovered || focused || timer != null) return;
+        timer = window.setTimeout(dismiss, 6500);
+      };
       if (action && action.label && action.onClick) {
         const button = document.createElement("button");
         button.type = "button";
         button.className = "button ghost";
         button.textContent = action.label;
         button.addEventListener("click", () => {
-          item.remove();
+          dismiss();
           action.onClick();
         });
         item.append(button);
       }
-      while (region.children.length >= 3) region.firstElementChild.remove();
+      const close = document.createElement("button");
+      close.type = "button";
+      close.className = "toast-close";
+      close.setAttribute("aria-label", "关闭提示");
+      close.textContent = "✕";
+      close.addEventListener("click", dismiss);
+      item.append(close);
+      item.dismissToast = dismiss;
+      item.addEventListener("mouseenter", () => { hovered = true; hold(); });
+      item.addEventListener("mouseleave", () => { hovered = false; schedule(); });
+      item.addEventListener("focusin", () => { focused = true; hold(); });
+      item.addEventListener("focusout", (event) => {
+        focused = item.contains(event.relatedTarget);
+        schedule();
+      });
+      item.dataset.sticky = String(sticky);
+      const transient = Array.from(region.children).filter(node => node.dataset.sticky !== "true");
+      if (!sticky) while (transient.length >= 3) transient.shift().dismissToast();
       region.append(item);
-      window.setTimeout(() => item.remove(), 6500);
+      schedule();
     }
 
   function operationTone(result) {
@@ -498,7 +570,7 @@
       const started = startCurrentOperation(stableKey, result, context);
       if (started) return result;
       const failed = !(result?.ok || result?.success) || result?.partial || ["partial", "failed", "manual_required"].includes(result?.status);
-      const rawMessage = result?.message || (failed ? (result?.error || "操作失败") : (successMessage || "已完成"));
+      const rawMessage = window.Team48TaskProgress?.summarizeOperationResult(result?.task_kind || result?.operation, result) || result?.message || (failed ? (result?.error || "操作失败") : (successMessage || "已完成"));
       const message = failed ? friendlyError(rawMessage) : rawMessage;
       const retryable = failed && Boolean(context?.retry);
       const action = retryable
@@ -509,8 +581,10 @@
       return result;
     }
 
-  function confirmDanger(message) {
-    return window.confirm(message);
+  // 统一走应用内确认弹窗，不再使用阻塞的系统 window.confirm。
+  function confirmDanger(message, options = {}, trigger) {
+    const { title = "确认操作", subtitle = "", hint = "", items = [], confirmLabel = "确认", tone = "danger" } = options;
+    return openConfirm({ title, subtitle, message, hint, items, confirmLabel, tone }, trigger);
   }
 
   let confirmResolver = null;
@@ -521,7 +595,9 @@
     else closeOverlay();
     resolve?.(Boolean(ok));
   }
-  function openConfirm({ title, subtitle = "", message = "", hint = "", items = [], confirmLabel = "确认删除" } = {}, trigger) {
+  function openConfirm({ title, subtitle = "", message = "", hint = "", items = [], confirmLabel = "确认删除", tone = "danger" } = {}, trigger) {
+    // 后到的请求不能覆盖正在等待用户回答的确认。
+    if (confirmResolver) return Promise.resolve(false);
     return new Promise((resolve) => {
       confirmResolver = resolve;
       const titleEl = document.getElementById("confirm-title");
@@ -533,17 +609,28 @@
       if (titleEl) titleEl.textContent = title || "确认操作";
       if (subtitleEl) subtitleEl.textContent = subtitle;
       if (messageEl) messageEl.textContent = message;
-      if (hintEl) { hintEl.hidden = !hint; hintEl.textContent = hint || ""; }
+      // 危险确认里"会改动什么 / 不会改什么"只做外观区分：会改动的用危险色 + ▲，不改官方 / 只改本地的用 ● 次要色。
+      const impactClass = (text) => {
+        const value = String(text || "");
+        if (/^(不|保留|只|仅)/.test(value) || /不影响官方|官方团队不会改变|不会改官方/.test(value)) return "is-safe";
+        return tone === "danger" ? "is-impact" : "";
+      };
+      if (hintEl) { hintEl.hidden = !hint; hintEl.textContent = hint || ""; hintEl.className = `hint ${hint ? impactClass(hint) : ""}`.trim(); }
       if (listEl) {
         listEl.replaceChildren();
         listEl.hidden = !items.length;
         items.forEach((text) => {
           const li = document.createElement("li");
           li.textContent = text;
+          const cls = impactClass(text);
+          if (cls) li.className = cls;
           listEl.append(li);
         });
       }
-      if (submit) submit.textContent = confirmLabel;
+      if (submit) {
+        submit.textContent = confirmLabel;
+        submit.className = `button ${tone === "danger" ? "danger" : "primary"}`;
+      }
       const options = { returnFocus: trigger, context: { kind: "confirm" }, initialFocus: "[data-close-confirm]" };
       if (getActiveOverlay() && getActiveOverlay() !== "confirm") replaceOverlay("confirm", options);
       else openOverlay("confirm", options);
@@ -729,6 +816,19 @@
       options.headers["Content-Type"] = "application/json";
       options.body = JSON.stringify(body);
     }
+    const match = url.match(/^\/api\/workspaces\/([^/]+)\/(onboard|replenish|rotate|kick)$/);
+    if (match && window.Team48Runtime) {
+      const kind = match[2] === "kick" ? "kick_member" : match[2];
+      const result = await window.Team48Runtime.track(match[1], kind, async () => ({...await fetchEntity(key, url, options), task_kind: kind}));
+      if (!result?.accepted || typeof result.operation_id !== "string") return result;
+      // The server returned at once; callers keep their "finished" semantics by awaiting the detail.
+      const detail = await window.Team48Runtime.waitFor(result.operation_id);
+      const state = String(detail.state || detail.status || "").toLowerCase();
+      return {...(detail.result && typeof detail.result === "object" ? detail.result : {}),
+        status: state, ok: state === "success", success: state === "success",
+        operation_id: result.operation_id, task_kind: kind,
+        ...(state === "success" ? {} : {error: detail.result?.error || detail.error || "", error_code: detail.result?.error_code || detail.error_code || ""})};
+    }
     return fetchEntity(key, url, options);
   }
 
@@ -810,32 +910,6 @@
     });
   }
 
-  function createAutoReauthButton(item) {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "button ghost compact account-auto-reauth-button";
-    button.dataset.autoReauthAccount = String(item.id);
-    button.addEventListener("click", async (event) => {
-      event.stopPropagation();
-      const active = currentAutoReauth(item.id);
-      if (active) {
-        await openOperationById(active.operationId);
-        return;
-      }
-      applyAutoReauthButtonState(button, { state: "waiting" });
-      button.textContent = "检查条件";
-      try {
-        await queueAutoReauth(item);
-      } catch (error) {
-        toast(friendlyError(error), "error");
-      } finally {
-        syncAutoReauthButtons(item.id);
-      }
-    });
-    applyAutoReauthButtonState(button, currentAutoReauth(item.id));
-    return button;
-  }
-
   function startCurrentOperation(stableKey, response, context = {}) {
     const operationId = response?.operation_id || response?.id;
     const state = String(response?.status || response?.state || "").toLowerCase();
@@ -872,7 +946,7 @@
     const state = String(result?.state || result?.status || "").toLowerCase();
     result = { ...(result?.result || {}), ...result, success: state === "success", operation_id: entry.operationId };
     const failed = !result.success || result.partial || ["partial", "failed", "manual_required"].includes(state);
-    const rawMessage = result?.message || (failed ? (result?.error || "操作失败") : (entry?.successMessage || "已完成"));
+    const rawMessage = window.Team48TaskProgress?.summarizeOperationResult(result?.operation || result?.kind, result) || result?.message || (failed ? (result?.error || "操作失败") : (entry?.successMessage || "已完成"));
     const message = failed ? friendlyError(rawMessage) : rawMessage;
     if (!entry.restored) toast(
       message,
@@ -948,11 +1022,12 @@
     persistCurrentOperations();
   }
 
-  async function openOperationById(operationId) {
+  async function openOperationById(operationId, trigger) {
     if (!operationId) return;
     try {
       const detail = await fetchEntity(`operation-${operationId}`, `/api/operations/${encodeURIComponent(operationId)}`);
-      openSheet("operation", detail);
+      if (overlayState.active && overlayState.active !== "entity") closeOverlay({restoreFocus: false});
+      openSheet("operation", detail, trigger);
     } catch (error) {
       toast(friendlyError(error), "error");
     }
@@ -972,6 +1047,61 @@
       return;
     }
     items.forEach((item) => body.append(renderItem(item)));
+  }
+
+  // 表头点击排序：仅用于一次性读入全量数据的资源表。
+  const tableSort = new Map();
+  const tableSnapshots = new Map();
+  const sortText = (value) => String(value ?? "").toLowerCase();
+  const sortTime = (value) => (value ? Date.parse(value) || 0 : 0);
+  const sortNumber = (value) => {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : -1;
+  };
+
+  function renderSortableRows(bodyId, items, columns, renderItem, empty, sorters) {
+    tableSnapshots.set(bodyId, [bodyId, items, columns, renderItem, empty, sorters]);
+    const body = document.getElementById(bodyId);
+    const table = body?.closest("table");
+    const state = tableSort.get(bodyId) || { key: "", descending: false };
+    if (table && !table.dataset.sortBound) {
+      table.dataset.sortBound = "1";
+      table.querySelectorAll("th[data-sort]").forEach((th) => {
+        const key = th.dataset.sort;
+        if (!sorters[key]) return;
+        const trigger = document.createElement("button");
+        trigger.type = "button";
+        trigger.className = "table-sort";
+        trigger.textContent = th.textContent.trim();
+        trigger.title = "点击切换排序";
+        trigger.addEventListener("click", () => {
+          const current = tableSort.get(bodyId) || { key: "", descending: false };
+          const next = current.key !== key
+            ? { key, descending: false }
+            : current.descending ? { key: "", descending: false } : { key, descending: true };
+          tableSort.set(bodyId, next);
+          renderSortableRows(...tableSnapshots.get(bodyId));
+        });
+        th.replaceChildren(trigger);
+      });
+    }
+    table?.querySelectorAll("th[data-sort]").forEach((th) => {
+      const active = state.key === th.dataset.sort;
+      th.setAttribute("aria-sort", active ? (state.descending ? "descending" : "ascending") : "none");
+      const trigger = th.querySelector(".table-sort");
+      if (trigger) trigger.dataset.direction = active ? (state.descending ? "desc" : "asc") : "";
+    });
+    const read = sorters[state.key];
+    let ordered = items;
+    if (read) {
+      ordered = [...items].sort((left, right) => {
+        const a = read(left), b = read(right);
+        if (typeof a === "number" && typeof b === "number") return a - b;
+        return String(a).localeCompare(String(b), "zh-CN");
+      });
+      if (state.descending) ordered.reverse();
+    }
+    renderRows(bodyId, ordered, columns, renderItem, empty);
   }
 
   function menuButton(kind, item) {
@@ -1004,36 +1134,6 @@
         if (event.target === row && event.key === "Enter") open();
       });
     }
-
-  function shortId(value) {
-    const text = String(value || "");
-    if (text.length <= 12) return text;
-    return `${text.slice(0, 8)}…`;
-  }
-
-
-  function workspaceOfficialSummary(item) {
-    const official = item.official || {};
-    if ((official.sync_state || item.last_sync == null) === "never" || (item.last_sync == null && official.joined_people_total == null && item.members == null)) {
-      return { main: "尚未同步", sub: "本地 " + String(item.managed?.count ?? item.managed_count ?? 0) };
-    }
-    if (official.sync_state === "failed" || item.health === "sync_failed") {
-      return { main: "同步失败", sub: "数据可能过期" };
-    }
-    const people = official.joined_people_total ?? item.members;
-    const children = official.joined_member_count;
-    let main = people == null ? "—" : `${people} 人`;
-    const owners = official.official_owner_count ?? official.owner_count;
-    if (owners != null) main += ` · Owner ${owners}`;
-    if (children != null) main += ` · Member ${children}`;
-    if (official.occupied_seats != null && official.seat_limit != null) {
-      main += ` · 席位 ${official.occupied_seats}/${official.seat_limit}`;
-    }
-    const managed = item.managed?.count ?? item.managed_count ?? 0;
-    const pending = item.reconciliation?.actionable_count ?? item.reconciliation?.remote_only ?? 0;
-    const sub = pending ? `本地 ${managed} · ${pending} 位待接入` : `本地 ${managed}`;
-    return { main, sub };
-  }
 
   function workspacePrimaryAction(workspace) {
     if (workspace.owner_auth_reason === "owner_account_missing" || workspace.owner_auth_state === "owner_account_missing") {
@@ -1073,219 +1173,6 @@
     return openWorkspaceDetails(trigger, workspace);
   }
 
-  function workspaceRow(item) {
-    const row = document.createElement("tr");
-    bindRow(row, "workspace", item);
-    const summary = workspaceOfficialSummary(item);
-    const ownerStatus = authStatus({
-      needs_auth: item.owner_needs_auth,
-      auth_state: item.owner_auth_state,
-      auth_action: item.owner_auth_action,
-      auth_reason: item.owner_auth_reason,
-    });
-    const healthCode = ownerStatus.reason === "owner_account_missing"
-      ? "owner_account_missing"
-      : (ownerStatus.needsAuth ? "needs_auth" : (item.health || item.status));
-    const healthLabel = ownerStatus.reason === "owner_account_missing"
-      ? "母号本地档案缺失"
-      : (ownerStatus.needsAuth ? "母号要授权" : labelOf(statusLabels, item.health || item.status));
-    cell(row, twoLine(item.display_name || item.name, shortId(item.official_workspace_id)));
-    cell(row, item.owner_email);
-    cell(row, twoLine(summary.main, summary.sub), "num");
-    cell(row, statusNode(healthCode, healthLabel));
-    cell(row, timeNode(item.last_sync));
-    const lastSync = cell(row, "", "management-action-cell");
-    const actions = document.createElement("div");
-    actions.className = "management-actions";
-    const primary = workspacePrimaryAction(item);
-    const primaryButton = document.createElement("button");
-    primaryButton.type = "button";
-    primaryButton.className = primary.id === "owner-auth" ? "button danger compact" : "button compact";
-    primaryButton.dataset.action = primary.id === "manage" ? "workspace.manage" : `workspace.${primary.id}`;
-    primaryButton.textContent = primary.label;
-    primaryButton.addEventListener("click", (event) => {
-      event.stopPropagation();
-      runWorkspacePrimaryAction(item, primaryButton);
-    });
-    actions.append(primaryButton, menuButton("workspace", item));
-    lastSync.append(actions);
-    return row;
-  }
-
-  function quotaMeter(label, percent, resetAt) {
-    const row = document.createElement("div");
-    const tone = meterTone(percent);
-    row.className = tone ? `quota-meter is-${tone}` : "quota-meter";
-    const tag = document.createElement("span");
-    tag.className = "meter-window";
-    tag.textContent = label;
-    const bar = document.createElement("div");
-    bar.className = "quota-bar";
-    bar.setAttribute("role", "meter");
-    bar.setAttribute("aria-label", `${label} 使用率`);
-    if (percent != null) {
-      bar.setAttribute("aria-valuenow", String(percent));
-      bar.setAttribute("aria-valuemin", "0");
-      bar.setAttribute("aria-valuemax", "100");
-      const fill = document.createElement("span");
-      fill.style.width = `${Math.max(0, Math.min(100, Number(percent) || 0))}%`;
-      bar.append(fill);
-    }
-    const pct = document.createElement("span");
-    pct.className = "meter-pct tabular";
-    pct.textContent = percent == null ? "—" : `${percent}%`;
-    const eta = document.createElement("span");
-    eta.className = "meter-ttl cell-sub tabular";
-    eta.textContent = countdownLabel(resetAt, percent);
-    row.append(tag, bar, pct, eta);
-    return row;
-  }
-
-  function compactMetric(value) {
-    const number = Number(value);
-    if (!Number.isFinite(number)) return "—";
-    return new Intl.NumberFormat("zh-CN", { notation: "compact", maximumFractionDigits: 1 }).format(number);
-  }
-
-  function formatCost(value) {
-      return window.Team48Format.formatCost(value);
-    }
-
-  function usageWindowLine(label, windowData) {
-    const line = document.createElement("div");
-    line.className = "usage-window tabular";
-    const tag = document.createElement("span");
-    tag.className = "meter-window";
-    tag.textContent = label;
-    const values = document.createElement("span");
-    values.className = "usage-window-values";
-    if (!windowData || windowData.last_success_at == null) {
-      values.textContent = "—";
-    } else {
-      values.textContent = [
-        windowData.requests == null ? null : `${compactMetric(windowData.requests)} req`,
-        windowData.tokens == null ? null : `${compactMetric(windowData.tokens)} tok`,
-      ].filter(Boolean).join(" · ") || "—";
-      line.title = [
-        windowData.user_cost == null ? null : `用户计费 U $${windowData.user_cost}`,
-        windowData.account_cost == null ? null : `账号成本 A $${windowData.account_cost}`,
-        windowData.standard_cost == null ? null : `标准计费 S $${windowData.standard_cost}`,
-        windowData.billing_margin == null ? null : `计费毛差 Δ $${windowData.billing_margin}`,
-        windowData.last_success_at ? `同步 ${relativeTime(windowData.last_success_at)}` : null,
-        windowData.sync_status === "failed" ? (windowData.error || "最近同步失败，当前为旧数据") : null,
-      ].filter(Boolean).join("；");
-    }
-    const state = document.createElement("span");
-    state.className = "usage-window-state";
-    state.textContent = windowData?.sync_status === "failed" ? "失败" : (windowData?.stale ? "旧" : "");
-    line.append(tag, values, state);
-    return line;
-  }
-
-  function workspaceUsageSummary(usage) {
-      const entry = window.Team48Format.usageWindow(usage);
-      if (!entry) return null;
-      const node = document.createElement("span");
-      node.className = "workspace-usage-summary tabular";
-      node.textContent = `${entry.label} · 用户计费 ${formatCost(entry.user_cost)} · 成本 ${formatCost(entry.account_cost)}`;
-      if (entry.coverage) node.textContent += ` · 覆盖 ${entry.coverage.synced}/${entry.coverage.total}`;
-      if (entry.stale) node.textContent += " · 含旧快照";
-      return node;
-    }
-
-  function quotaCell(item) {
-    const wrap = document.createElement("div");
-    wrap.className = "quota-cell";
-    const quota = item.quota || {};
-    const usage = item.usage || {};
-    const windows = usage.windows || {};
-    const totals = usage.totals || {};
-    const primaryWindow = windows.five_hour || windows.today;
-
-    const userCostVal = usage.user_cost ?? totals.user_cost ?? primaryWindow?.user_cost ?? null;
-    const accountCostVal = usage.account_cost ?? totals.account_cost ?? primaryWindow?.account_cost ?? null;
-    const standardCostVal = usage.standard_cost ?? totals.standard_cost ?? primaryWindow?.standard_cost ?? null;
-    const billingMarginVal = usage.billing_margin ?? totals.billing_margin ?? primaryWindow?.billing_margin ?? null;
-
-    const billingSummary = document.createElement("div");
-    billingSummary.className = "quota-billing-summary tabular";
-
-    const userCol = document.createElement("div");
-    userCol.className = "quota-billing-item";
-    const userLabel = document.createElement("span");
-    userLabel.className = "quota-billing-label";
-    userLabel.textContent = "用户计费";
-    const userValue = document.createElement("span");
-    userValue.className = "quota-billing-value";
-    userValue.textContent = formatCost(userCostVal);
-    userCol.append(userLabel, userValue);
-
-    const accountCol = document.createElement("div");
-    accountCol.className = "quota-billing-item";
-    const accountLabel = document.createElement("span");
-    accountLabel.className = "quota-billing-label";
-    accountLabel.textContent = "账号成本";
-    const accountValue = document.createElement("span");
-    accountValue.className = "quota-billing-value";
-    accountValue.textContent = formatCost(accountCostVal);
-    accountCol.append(accountLabel, accountValue);
-
-    billingSummary.append(userCol, accountCol);
-
-    const tooltipDetails = [
-      standardCostVal == null ? null : `标准计费 $${standardCostVal}`,
-      billingMarginVal == null ? null : `计费毛差 $${billingMarginVal}`,
-    ].filter(Boolean);
-    if (tooltipDetails.length > 0) {
-      billingSummary.title = tooltipDetails.join("；");
-    }
-
-    wrap.append(billingSummary);
-
-    if (primaryWindow || windows.seven_day) {
-      const usageBlock = document.createElement("div");
-      usageBlock.className = "usage-window-list";
-      usageBlock.append(
-        usageWindowLine(primaryWindow === windows.today ? "今日" : "5h", primaryWindow),
-        usageWindowLine("7d", windows.seven_day),
-      );
-      wrap.append(usageBlock);
-    }
-    wrap.append(
-      quotaMeter("5h", quota.five_hour_used_percent, quota.five_hour_reset_at),
-      quotaMeter("7d", quota.seven_day_used_percent, quota.seven_day_reset_at),
-    );
-    const footer = document.createElement("div");
-    footer.className = "quota-footer";
-    const source = document.createElement("span");
-    source.className = "cell-sub";
-    const freshness = quota.queried_at ? relativeTime(quota.queried_at) : "无快照";
-    source.textContent = (quota.source === "official" ? "官方" : (quota.source || "官方")) + " · " + freshness;
-    if (quota.queried_at) source.title = quota.queried_at;
-    footer.append(source);
-    wrap.append(footer);
-    return wrap;
-  }
-
-  function accountRow(item) {
-    const row = document.createElement("tr");
-    bindRow(row, "account", item);
-    const plan = [roleLabel(item.official_role), item.official_plan].filter(Boolean).join(" · ");
-    cell(row, twoLine(item.email, plan || null));
-    cell(row, item.workspace);
-    cell(row, labelOf(purposeLabels, item.purpose));
-    cell(row, statusNode(item.auth, labelOf(statusLabels, item.auth)));
-    cell(row, quotaCell(item));
-    cell(row, statusNode(item.sub2api, labelOf(statusLabels, item.sub2api)));
-    const state = cell(row, statusNode(item.state, labelOf(stateLabels, item.state)), "row-action-host");
-    const actions = document.createElement("div");
-    actions.className = "row-actions row-actions-contextual";
-    if (item.purpose === "child") state.append(createAutoReauthButton(item));
-    actions.append(menuButton("account", item));
-    state.append(actions);
-    return row;
-  }
-
   function operationRow(item) {
     const row = document.createElement("tr");
     bindRow(row, "operation", item);
@@ -1294,7 +1181,7 @@
     check.type = "checkbox";
     check.className = "operation-select";
     check.dataset.publicId = item.id;
-    check.disabled = !["success", "partial", "failed", "cancelled", "manual_required"].includes(item.state || item.status) || Boolean(item.archived);
+    check.disabled = !["success", "partial", "failed", "cancelled", "manual_required", "resolved"].includes(item.state || item.status) || Boolean(item.archived);
     check.addEventListener("click", (event) => event.stopPropagation());
     check.addEventListener("change", updateOperationsBulkButton);
     checkWrap.append(check);
@@ -1328,7 +1215,7 @@
     toggle.textContent = enable ? "启用" : "停用";
     toggle.addEventListener("click", async (event) => {
       event.stopPropagation();
-      if (!confirmDanger(`${enable ? "启用" : "停用"}手机号 ${item.number}？`)) return;
+      if (!await confirmDanger(`${enable ? "启用" : "停用"}手机号 ${item.number}？`, { title: enable ? "启用手机号" : "停用手机号", confirmLabel: enable ? "启用" : "停用", tone: "primary" })) return;
       toggle.disabled = true;
       try {
         const result = await patchAction(`phone-status-${item.id}`, `/api/resources/phones/${item.id}`, {
@@ -1343,14 +1230,10 @@
       }
     });
     actions.append(toggle);
-    const menuBtn = document.createElement("button");
-    menuBtn.type = "button";
+    const menuBtn = menuButton("phone", item);
     menuBtn.className = "button ghost";
     menuBtn.textContent = "更多";
-    menuBtn.addEventListener("click", (event) => {
-      event.stopPropagation();
-      openMenu(menuBtn, "phone", item);
-    });
+    menuBtn.setAttribute("aria-label", "更多操作");
     actions.append(menuBtn);
     cell(row, actions, "actions");
     return row;
@@ -1363,7 +1246,7 @@ function hmeRow(item) {
     cell(row, item.email);
     cell(row, item.state);
     cell(row, item.label || "—");
-    cell(row, item.pending ? "待同步" : "已同步");
+    cell(row, statusNode(item.pending ? "pending" : "success", item.pending ? "待同步" : "已同步"));
     cell(row, item.job_id || "—");
     cell(row, timeNode(item.expires_at));
     const actions = document.createElement("div");
@@ -1428,12 +1311,6 @@ function hmeRow(item) {
     return row;
   }
 
-  function matchesQuery(item, query, fields) {
-    if (!query) return true;
-    const hay = fields.map((key) => String(item[key] || "")).join(" ").toLowerCase();
-    return hay.includes(query);
-  }
-
   function currentQuery() {
     return new URLSearchParams(window.location.search);
   }
@@ -1444,41 +1321,127 @@ function hmeRow(item) {
     window.history.replaceState({}, "", url);
   }
 
-  function filterItems(kind, items) {
-    const params = currentQuery();
-    const q = (params.get("q") || "").trim().toLowerCase();
-    if (kind === "workspace") {
-      return items.filter((item) =>
-        matchesQuery(item, q, ["name", "owner_email", "official_workspace_id", "id"])
-      );
-    }
-    if (kind === "account") {
-      return items.filter((item) =>
-        matchesQuery(item, q, ["email", "workspace", "official_user_id", "official_account_id"])
-      );
-    }
-    return items;
-  }
-
   function setCount(id, shown, total) {
     const el = document.getElementById(id);
     if (!el) return;
     el.textContent = shown === total ? `共 ${total} 个` : `${shown} / ${total}`;
   }
 
+  function attentionReason(item) {
+    const message = String(item.message || "").trim();
+    const email = String(item.email || "").trim();
+    if (!email) return message;
+    // Older overview payloads include the email in the reason as well as the title.
+    return message.split(email).join("").replace(/^[\s·:：;；,，—-]+|[\s·:：;；,，—-]+$/g, "") || "请查看账号详情";
+  }
+
+  // 总览收入格：今日 / 近 7 天 / 本月入账 / 团队收入（已入账 ＋ 在跑）。没数时显示"—"，不显示 $0.00。
+  function renderOverviewRevenue(summary) {
+    const fmt = window.Team48Format;
+    const coverageNotes = (data, prefix = "") => {
+      if (!data || typeof data !== "object") return [];
+      const notes = [];
+      const synced = Number(data.synced) || 0, total = Number(data.total) || 0;
+      if (total > 0 && synced < total) notes.push(`${prefix}${synced}/${total} 个号已同步，部分号未同步`);
+      if (data.stale) notes.push(`${prefix}旧快照`);
+      if (data.note) notes.push(String(data.note));
+      return notes;
+    };
+    const hintText = (data) => {
+      if (!data || typeof data !== "object") return "";
+      if (data.stale) return "旧快照";
+      const synced = Number(data.synced) || 0, total = Number(data.total) || 0;
+      return total > 0 && synced < total ? "部分" : "";
+    };
+    const cell = (key, value, notes, hint = "") => {
+      const node = document.querySelector(`[data-summary="${key}"]`);
+      if (!node) return;
+      node.textContent = value;
+      const item = node.closest(".summary-item");
+      if (!item) return;
+      item.title = notes.filter(Boolean).join("；");
+      item.classList.toggle("is-partial", Boolean(hint));
+      const marker = item.querySelector(".summary-hint");
+      if (marker) { marker.textContent = hint; marker.hidden = !hint; }
+    };
+    const today = summary.revenue_today, sevenDay = summary.revenue_seven_day, running = summary.revenue_running;
+    cell("revenue_today", fmt.formatCost(today?.user_cost),
+      ["北京时间 0 点起，所有团队的用户扣费（U），含今天已换掉的号", ...coverageNotes(today)], hintText(today));
+    cell("revenue_seven_day", fmt.formatCost(sevenDay?.user_cost),
+      ["今天及前 6 天，含期间已换掉的号", ...coverageNotes(sevenDay)], hintText(sevenDay));
+    cell("revenue_month", fmt.formatCost(summary.revenue_month), ["本月离队号入账之和，不含在跑"]);
+    const zero = (value) => value == null || Number(value) === 0;
+    const runningCost = running && typeof running === "object" ? running.user_cost : null;
+    const runningNotes = runningCost == null ? ["在跑：尚无全程用量快照"] : [];
+    const teamText = zero(summary.revenue_total) && zero(runningCost) ? "—"
+      : `已入账 ${fmt.formatCost(summary.revenue_total ?? "0")} ＋ 在跑 ${fmt.formatCost(runningCost)}`;
+    cell("revenue_total", teamText,
+      ["已入账 = 所有离队号全程 U 之和（含已删团队）；在跑 = 当前在席成员（含母号）全程 U 之和", ...coverageNotes(running, "在跑："), ...runningNotes], hintText(running));
+  }
+
+  // 总览 "codex-rs 可用" 格子：能干活 / 目标；异常写在格子下方小字，符号 + 文字，悬停看原因。
+  function renderOverviewCodexRs(data) {
+    const node = document.querySelector('[data-summary="codex_rs_refill"]');
+    const item = node?.closest(".summary-item");
+    if (!node || !item) return;
+    const note = document.getElementById("overview-codex-rs-note");
+    const info = data && typeof data === "object" ? data : {};
+    const marks = [], reasons = [];
+    if (!info.enabled) {
+      node.textContent = info.working == null ? "—" : `${info.working} 个`;
+      reasons.push("自动补号未开启");
+    } else {
+      node.textContent = `${info.working ?? "—"} / ${info.target ?? "—"}`;
+      if (info.paused) { marks.push("■ 已暂停"); reasons.push(`已暂停：${info.pause_reason || "原因未记录"}`); }
+      const pool = Number(info.pool_available) || 0;
+      if (pool < 2) { marks.push(`▲ 号池剩 ${pool}`); reasons.push(`备用号池只剩 ${pool} 个可拉入`); }
+      if (info.error || info.stale) {
+        marks.push(info.error ? "▲ 读取失败" : "▲ 检查过期");
+        reasons.push(info.error ? `codex-rs 读取失败：${info.error}` : "超过 15 分钟没有检查 codex-rs");
+      }
+      if (info.blocked_reason) reasons.push(`本轮未补号：${info.blocked_reason}`);
+    }
+    if (note) {
+      note.textContent = marks.join(" · ");
+      note.hidden = !marks.length;
+      note.className = marks.length ? "hint text-warn" : "hint";
+    }
+    item.title = reasons.join("；") || "能干活的号数 / 目标数，点击去设置";
+    item.setAttribute("aria-label", `codex-rs 可用 ${node.textContent}${marks.length ? `，${marks.join("，")}` : ""}${reasons.length ? `：${reasons.join("；")}` : ""}`);
+  }
+
   function renderOverview(payload) {
+    const breakdown = document.getElementById("overview-attention-breakdown");
+    if (breakdown) breakdown.textContent = Object.entries(payload.attention_breakdown || {}).filter(([,n])=>n).map(([key,n])=>`${({auth:"授权",onboarding:"入组中断",quota:"额度",check:"检测",remote:"远端",identity:"身份",sync:"同步"})[key]} ${n}`).join(" · ");
+    const resources = document.getElementById("overview-resource-attention");
+    if (resources) {
+      resources.replaceChildren();
+      for (const item of payload.resource_attention || []) {
+        const link = document.createElement("a"); link.className="list-row"; link.href=item.href || "/operations"; link.textContent = [item.email,attentionReason(item)].filter(Boolean).join(" · "); resources.append(link);
+      }
+      if (!resources.children.length) resources.textContent="暂无资源与任务提醒";
+    }
     const summary = payload.summary || {};
     const set = (key, value, alert) => {
       const node = document.querySelector(`[data-summary="${key}"]`);
       if (!node) return;
       node.textContent = value ?? 0;
-      node.parentElement.classList.toggle("is-alert", Boolean(alert && value));
+      const item = node.parentElement;
+      const alerting = Boolean(alert && value);
+      item.classList.toggle("is-alert", alerting);
+      // 告警符号是 CSS 伪元素，读屏读不到；告警时在可访问名称里补上"需处理"。
+      const label = item.querySelector(".summary-label")?.textContent || "";
+      const detail = item.querySelector("#overview-attention-breakdown")?.textContent || "";
+      if (alerting && label) item.setAttribute("aria-label", [`${label} ${value}，需处理`, detail].filter(Boolean).join("："));
+      else item.removeAttribute("aria-label");
     };
     const attention = (payload.attention || []).filter((item) => item.kind !== "operation");
     set("workspaces", summary.workspaces ?? payload.workspaces);
     set("accounts", summary.accounts ?? payload.accounts);
     set("attention", attention.length, true);
     set("conflicts", summary.identity_conflicts, true);
+    renderOverviewRevenue(summary);
+    renderOverviewCodexRs(summary.codex_rs_refill);
 
     const attentionRoot = document.getElementById("overview-attention");
     const attentionPanel = document.getElementById("overview-attention-panel");
@@ -1500,8 +1463,10 @@ function hmeRow(item) {
         const row = document.createElement("div");
         row.className = "list-row";
         const left = document.createElement("div");
-        left.append(twoLine(item.email || item.message, item.message));
-        if (item.workspace) {
+        const title = item.email || item.workspace || "待处理事项";
+        const reason = attentionReason(item);
+        left.append(twoLine(title, reason === title ? null : reason));
+        if (item.workspace && item.workspace !== title) {
           const extra = document.createElement("div");
           extra.className = "cell-sub";
           extra.textContent = item.workspace;
@@ -1521,7 +1486,7 @@ function hmeRow(item) {
             return;
           }
           if (item.workspace_id) {
-            window.location.href = `/workspaces?workspace=${encodeURIComponent(item.workspace_id)}`;
+            window.location.href = `/accounts?view=teams&workspace=${encodeURIComponent(item.workspace_id)}`;
             return;
           }
           window.location.href = "/accounts?purpose=conflict";
@@ -1536,14 +1501,14 @@ function hmeRow(item) {
     healthRoot.replaceChildren();
     const health = payload.workspace_health || [];
     if (!health.length) {
-      healthRoot.append(emptyState("还没有工作区", "点右上角「登记团队」，用母号 OAuth 授权。", true));
+      healthRoot.append(emptyState("还没有团队", "点右上角「登记团队」，用母号 OAuth 授权。", true));
     } else {
       const list = document.createElement("div");
       list.className = "health-list";
       health.forEach((item) => {
         const row = document.createElement("div");
         row.className = "list-row";
-        const seats = item.joined_people_total != null ? `${item.joined_people_total} 人 · Owner ${item.official_owner_count ?? item.owner_count ?? 0} / Member ${item.official_member_count ?? item.joined_member_count ?? item.members ?? 0}` : (item.sync_state === "never" ? "尚未同步" : (item.members == null ? "尚未同步" : `${item.members} 子成员`));
+        const seats = item.joined_people_total != null ? `${item.joined_people_total} 人 · 所有者 ${item.official_owner_count ?? item.owner_count ?? 0} / 成员 ${item.official_member_count ?? item.joined_member_count ?? item.members ?? 0}` : (item.sync_state === "never" ? "尚未同步" : (item.members == null ? "尚未同步" : `${item.members} 子成员`));
         const sub = [item.owner_email, seats, item.last_sync ? relativeTime(item.last_sync) : null].filter(Boolean).join(" · ");
         row.append(twoLine(item.display_name || item.name, sub), statusNode(item.health, labelOf(statusLabels, item.health)));
         list.append(row);
@@ -1558,18 +1523,22 @@ function hmeRow(item) {
   function kvSection(title, rows) {
     const section = document.createElement("section");
     section.className = "sheet-section";
-    const heading = document.createElement("h3");
-    heading.textContent = title;
     const dl = document.createElement("dl");
     dl.className = "kv";
     rows.forEach(([label, value]) => {
       const dt = document.createElement("dt");
       dt.textContent = label;
       const dd = document.createElement("dd");
-      dd.textContent = value == null || value === "" ? "—" : String(value);
+      if (value instanceof Node) dd.append(value);
+      else dd.textContent = value == null || value === "" ? "—" : String(value);
       dl.append(dt, dd);
     });
-    section.append(heading, dl);
+    if (title) {
+      const heading = document.createElement("h3");
+      heading.textContent = title;
+      section.append(heading);
+    }
+    section.append(dl);
     return section;
   }
 
@@ -1582,20 +1551,22 @@ function hmeRow(item) {
     if (kind === "account") {
       title.textContent = item.email;
       subtitle.textContent = [labelOf(purposeLabels, item.purpose), item.workspace].filter(Boolean).join(" · ");
+      // 账号页会把下面这些分段收进「排查信息」：授权看顶部徽章、额度看额度条，所以这两项不再重复。
+      const slim = document.body.dataset.page === "accounts";
       body.append(
         kvSection("运行摘要", [
-          ["授权", labelOf(statusLabels, item.auth)],
+          ...(slim ? [] : [["授权", labelOf(statusLabels, item.auth)]]),
           ["运行状态", labelOf(stateLabels, item.state)],
           ["官方计划", item.official_plan],
           ["官方角色", roleLabel(item.official_role)],
-          ["Membership", item.membership_state],
+          ["成员状态", labelOf(statusLabels, item.membership_state)],
         ]),
-        kvSection("官方额度", [
+        ...(slim ? [] : [kvSection("官方额度", [
           ["5h", item.quota?.five_hour_used_percent == null ? "—" : `${item.quota.five_hour_used_percent}%`],
           ["7d", item.quota?.seven_day_used_percent == null ? "—" : `${item.quota.seven_day_used_percent}%`],
-          ["查询时间", item.quota?.queried_at || "—"],
-        ]),
-        kvSection("Binding", [
+          ["查询时间", timeValue(item.quota?.queried_at)],
+        ])]),
+        kvSection("Sub2API 绑定", [
           ["状态", labelOf(statusLabels, item.sub2api)],
           ["远端 ID", item.binding?.remote_id],
           ["核对邮箱", item.binding?.verified_email],
@@ -1605,13 +1576,13 @@ function hmeRow(item) {
           ["账号许可", item.auto_reauth_opt_in ? "已允许" : "未允许"],
           ["邮箱", `${item.mailbox?.provider || "未绑定"} · ${item.mailbox?.read_state || "未验证"}`],
           ["读信方式", item.mailbox?.method],
-          ["邮箱检测", item.mailbox?.checked_at],
+          ["邮箱检测", timeValue(item.mailbox?.checked_at)],
           ["代理来源", item.proxy_source],
           ["凭证版本", item.credential_revision],
         ]),
         kvSection("技术信息", [
-          ["Official user ID", item.official_user_id],
-          ["Official account ID", item.official_account_id],
+          ["官方用户 ID", item.official_user_id],
+          ["官方账号 ID", item.official_account_id],
           ["AT", item.has_access_token ? "已保存" : "未设置"],
           ["RT", item.has_refresh_token ? "已保存" : "未设置"],
           ["代理", item.proxy_url || labelOf(statusLabels, item.proxy)],
@@ -1620,6 +1591,7 @@ function hmeRow(item) {
         ])
       );
     } else if (kind === "operation") {
+      teamDetailState = null;
       title.textContent = labelOf(statusLabels, item.operation);
       subtitle.textContent = item.target || item.email || item.id;
       const result = item.result || {};
@@ -1647,12 +1619,21 @@ function hmeRow(item) {
           ])
         );
       }
-      if (steps.length) {
-        body.append(kvSection("步骤", steps.map((step) => [step.step_name, `${labelOf(statusLabels, step.state)}${step.error_message ? " · " + step.error_message : ""}`])));
-      }
+      const progress = document.createElement("section");
+      body.append(progress);
+      window.Team48Runtime?.put(item);
+      window.Team48TaskProgress?.mount(progress, {id: item.id, item, density: "standard"});
       if (logs.length) {
-        body.append(kvSection("日志", logs.slice(-8).map((row) => [row.ts || "", row.message || row.stage || ""])));
+        const logDetails = document.createElement("details");
+        const logSummary = document.createElement("summary"); logSummary.textContent = "最近日志";
+        logDetails.append(logSummary, kvSection("日志", logs.slice(-8).map((row) => [row.ts || "", row.message || row.stage || ""])));
+        body.append(logDetails);
       }
+      const technical = document.createElement("details");
+      const technicalTitle = document.createElement("summary"); technicalTitle.textContent = "技术详情";
+      const raw = document.createElement("pre"); raw.className = "task-technical";
+      raw.textContent = JSON.stringify({error_code: item.error_code, result}, (key, value) => /token|password|secret|callback|cookie/i.test(key) ? "[已隐藏]" : value, 2);
+      technical.append(technicalTitle, raw); body.append(technical);
     } else if (kind === "phone") {
       title.textContent = item.number;
       body.append(
@@ -1693,7 +1674,8 @@ function hmeRow(item) {
     }
     if (kind === "account" && document.body.dataset.page === "accounts") window.Team48Accounts.decorateDetails(item, body, trigger);
     openOverlay("entity", { returnFocus: trigger, context: { kind, item }, initialFocus: "[data-close-sheet]" });
-    if (kind === "account") window.Team48Sub2ApiState?.mount(body, item, {get: fetchEntity, post: postAction, kvSection});
+    // Sub2API 远端状态面板在账号页放进「排查信息」折叠里，其他页面仍接在详情末尾。
+    if (kind === "account") window.Team48Sub2ApiState?.mount(body.querySelector(":scope > .management-advanced") || body, item, {get: fetchEntity, post: postAction, kvSection, confirm: confirmDanger});
   }
 
   function closeSheet() {
@@ -1722,6 +1704,51 @@ function hmeRow(item) {
     await handleActionResult(result, {
       successMessage: result.message || (preview.action === "create" ? "Sub2API 推送完成" : "Sub2API 更新完成"),
     });
+  }
+
+  // A codex-rs binding means codex-rs owns the refresh token; Sub2API pushes are refused for it.
+  const codexRsImported = (item) => Boolean(item?.codex_rs);
+  const CODEX_RS_IMPORT_MESSAGE = "会把该号的访问令牌和刷新令牌发到 codex-rs，之后由 codex-rs 续期，Team48 不再自己刷新。不修改官方 Team，不写 Sub2API。";
+
+  // Imports 1–50 accounts; partial failure still returns HTTP 200, so read ok/results per account.
+  async function importCodexRsAccounts(items, trigger) {
+    const rows = (items || []).filter((item) => Number.isInteger(item?.id) && item.id > 0);
+    if (!rows.length) return null;
+    if (rows.length > 50) {
+      toast("一次最多导入 50 个账号", "warning");
+      return null;
+    }
+    const single = rows.length === 1;
+    const resync = single && rows[0].codex_rs?.state === "synced";
+    const ok = await confirmDanger(CODEX_RS_IMPORT_MESSAGE, {
+      title: resync ? "重新导入 codex-rs" : "导入 codex-rs",
+      subtitle: single ? rows[0].email || "" : `已选 ${rows.length} 个账号`,
+      hint: "逐个导入，允许部分成功；结果不明时可以安全重试。",
+      items: rows.map((item) => item.email || `账号 #${item.id}`),
+      confirmLabel: single ? (resync ? "重新导入" : "导入") : `导入 ${rows.length} 个`,
+      tone: "primary",
+    }, trigger);
+    if (!ok) return null;
+    const result = await postAction(
+      single ? `account-codex-rs-import-${rows[0].id}` : "account-codex-rs-import-batch",
+      "/api/accounts/codex-rs/import",
+      { confirm: true, account_ids: rows.map((item) => item.id) },
+    );
+    const results = Array.isArray(result?.results) ? result.results : [];
+    const emailOf = (id) => rows.find((item) => item.id === id)?.email || `账号 #${id}`;
+    const reason = (entry) => entry?.message || entry?.error_code || "导入失败";
+    const failed = results.filter((entry) => !entry.ok);
+    const synced = results.filter((entry) => entry.ok).length;
+    if (single) {
+      const entry = results[0];
+      if (entry?.ok) toast(entry.message || "已导入 codex-rs", "success");
+      else toast(`导入 codex-rs 失败：${reason(entry || result)}`, "error");
+    } else {
+      toast(`codex-rs 已导入 ${synced}/${rows.length}`, failed.length ? "warning" : "success");
+      if (failed.length) toast(failed.map((entry) => `${emailOf(entry.account_id)}：${reason(entry)}`).join("；"), "error");
+    }
+    await bootPage();
+    return result;
   }
 
   const autoReauthBlockedLabels = {
@@ -1825,12 +1852,12 @@ function hmeRow(item) {
     team: [
       {
         id: "team.replenish",
-        label: "补充 Team",
+        label: "补充团队",
         run: ({ workspace, values }, trigger) => replenishTeam(workspace, trigger, values),
       },
       {
         id: "team.member.invite",
-        label: "邀请加入 Team",
+        label: "邀请加入团队",
         run: ({ workspace, values }, trigger) => inviteTeamMember(workspace, values, trigger),
       },
       {
@@ -1853,7 +1880,7 @@ function hmeRow(item) {
       },
       {
         id: "team.member.role",
-        label: ({ row }) => String(row.role || row.official_role || "").toLowerCase() === "owner" ? "改成 Member" : "改成 Owner",
+        label: ({ row }) => String(row.role || row.official_role || "").toLowerCase() === "owner" ? "改成成员" : "改成所有者",
         visible: ({ row }) => teamMemberIsJoined(row) && Boolean(row.email),
         run: ({ workspace, row }, trigger) => changeTeamMemberRole(workspace, row, trigger, String(row.role || row.official_role || "").toLowerCase() === "owner" ? "member" : "owner"),
       },
@@ -1931,7 +1958,7 @@ function hmeRow(item) {
         run: async (item) => {
           if (item.contexts?.length > 1 && !item.workspace_id) {
             openSheet("account", item, document.activeElement);
-            toast("请选择要检查的工作区", "warning");
+            toast("请选择要检查的团队", "warning");
             return;
           }
           const query = item.workspace_id ? `?workspace_id=${encodeURIComponent(item.workspace_id)}` : "";
@@ -1950,14 +1977,20 @@ function hmeRow(item) {
       {
         id: "account.sub2api.push",
         label: "推送到 Sub2API",
-        visible: (item) => (item.sub2api_publish?.eligible !== false) && ["missing", "unbound", "none", "pending"].includes(item.sub2api),
+        visible: (item) => !codexRsImported(item) && (item.sub2api_publish?.eligible !== false) && ["missing", "unbound", "none", "pending"].includes(item.sub2api),
         run: (item) => pushSub2ApiAccount(item),
       },
       {
         id: "account.sub2api.update",
         label: "更新 Sub2API",
-        visible: (item) => (item.sub2api_publish?.eligible !== false) && item.sub2api === "verified",
+        visible: (item) => !codexRsImported(item) && (item.sub2api_publish?.eligible !== false) && item.sub2api === "verified",
         run: (item) => pushSub2ApiAccount(item),
+      },
+      {
+        id: "account.codex-rs.import",
+        label: (item) => item.codex_rs?.state === "synced" ? "重新导入 codex-rs" : "导入 codex-rs",
+        visible: (item) => item.purpose !== "mother" && ["unbound", "missing", "orphaned"].includes(item.sub2api),
+        run: (item, trigger) => importCodexRsAccounts([item], trigger),
       },
       {
         id: "account.sub2api.reconcile",
@@ -2003,6 +2036,12 @@ function hmeRow(item) {
         },
       },
       {
+        id: "account.assisted-login",
+        label: "登录与安全",
+        visible: (item) => Boolean(item.email) && Boolean(window.Team48AssistedLogin),
+        run: (item, trigger) => window.Team48AssistedLogin.open(trigger, item.email),
+      },
+      {
         id: "account.copy",
         label: "复制邮箱",
         visible: (item) => Boolean(item.email),
@@ -2025,10 +2064,47 @@ function hmeRow(item) {
         id: "operation.cancel",
         label: "请求取消",
         visible: (item) => Boolean(item.can_cancel),
-        run: async (item) => {
-          const result = await postAction(`operation-cancel-${item.id}`, `/api/operations/${encodeURIComponent(item.id)}/cancel`);
-          toast(result.ok ? "已请求取消" : (result.error || "取消失败"), result.ok ? "success" : "error");
-          await openOperationById(item.id);
+        run: (item, trigger) => cancelTrackedOperation(item, trigger),
+      },
+      {
+        id: "operation.continue_rotation",
+        label: "继续轮转",
+        visible: (item) => Boolean(item.can_continue_rotation),
+        run: async (item, trigger) => {
+          const vacancy = item.error_code === "vacancy_not_safe_to_refill";
+          if (!await confirmDanger(`继续轮转任务 ${item.id}？`, {title:"继续轮转", items: vacancy
+            ? ["会按同一新邮箱继续补位", "已核对账单，确认空出的席位可以补位"]
+            : ["只执行尚未确认完成的步骤", "不会重复踢人、换邮箱或重复计数"], confirmLabel:"继续"}, trigger)) return;
+          const result = await postAction(`operation-continue-${item.id}`, `/api/operations/${encodeURIComponent(item.id)}/continue-rotation`, {confirm_vacancy: vacancy});
+          await handleActionResult(result, { successMessage: "已继续轮转" });
+        },
+      },
+      {
+        id: "operation.resolve_rotation",
+        label: "结束轮转",
+        visible: (item) => Boolean(item.can_continue_rotation),
+        run: async (item, trigger) => {
+          setButtonBusy(trigger, true, "核对中");
+          let check;
+          try {
+            check = await fetchEntity(`operation-resolve-check-${item.id}`, `/api/operations/${encodeURIComponent(item.id)}/resolve-rotation`);
+          } catch (error) { toast(friendlyError(error), "error"); return; }
+          finally { setButtonBusy(trigger, false); }
+          const failed = (check.checks || []).filter((row) => !row.ok);
+          const items = [
+            ...(check.checks || []).map((row) => `${row.ok ? "通过" : "未通过"}：${row.label}`),
+            check.count_label,
+            "不会改官方团队，不会推送或删除 Sub2API；结束后团队解除轮转锁定",
+          ];
+          if (!await confirmDanger(`结束轮转 ${check.old_email} → ${check.replacement_email}？`, {
+            title: "结束轮转",
+            items,
+            hint: failed.length ? `注意：有 ${failed.length} 项核对未通过。确认已在别处处理好再结束；结束后不会再自动补齐这些步骤。` : "核对全部通过。",
+            confirmLabel: failed.length ? "仍然结束" : "结束轮转",
+            tone: failed.length ? "danger" : "primary",
+          }, trigger)) return;
+          const result = await postAction(`operation-resolve-${item.id}`, `/api/operations/${encodeURIComponent(item.id)}/resolve-rotation`);
+          toast(result.message || "已人工结束轮转", "success");
           await bootPage();
         },
       },
@@ -2044,9 +2120,9 @@ function hmeRow(item) {
       {
         id: "operation.archive",
         label: "清除记录",
-        visible: (item) => !item.archived && ["success", "partial", "failed", "cancelled", "manual_required"].includes(item.state || item.status),
+        visible: (item) => !item.archived && ["success", "partial", "failed", "cancelled", "manual_required", "resolved"].includes(item.state || item.status),
         run: async (item) => {
-          if (!confirmDanger(`确认清除任务 ${item.id}？记录会软归档，可在“已清除”恢复。`)) return;
+          if (!await confirmDanger(`确认清除任务 ${item.id}？`, { title: "清除任务记录", hint: "记录会软归档，可在“已清除”里恢复。", confirmLabel: "清除记录", tone: "primary" })) return;
           const result = await patchAction(`operation-archive-${item.id}`, `/api/operations/${encodeURIComponent(item.id)}/archive`, { reason: "manual_clear" });
           toast(result.ok ? "已清除记录" : (result.error || "清除失败"), result.ok ? "success" : "error");
           await bootPage();
@@ -2079,7 +2155,7 @@ function hmeRow(item) {
         label: "启用/停用",
         run: async (item) => {
           const enable = item.status !== "active";
-          if (!confirmDanger(`${enable ? "启用" : "停用"}手机号 ${item.number}？`)) return;
+          if (!await confirmDanger(`${enable ? "启用" : "停用"}手机号 ${item.number}？`, { title: enable ? "启用手机号" : "停用手机号", confirmLabel: enable ? "启用" : "停用", tone: "primary" })) return;
           const result = await patchAction(`phone-status-${item.id}`, `/api/resources/phones/${item.id}`, {
             status: enable ? "active" : "disabled",
           });
@@ -2091,7 +2167,7 @@ function hmeRow(item) {
         id: "phone.reset-cooldown",
         label: "重置冷却",
         run: async (item) => {
-          if (!confirmDanger(`确认重置 ${item.number} 的冷却时间？`)) return;
+          if (!await confirmDanger(`确认重置 ${item.number} 的冷却时间？`, { title: "重置冷却", hint: "重置后该号码会立刻回到可分配状态。", confirmLabel: "重置", tone: "primary" })) return;
           const result = await postAction(`phone-reset-${item.id}`, `/api/resources/phones/${item.id}/reset-cooldown`);
           toast(result.ok ? "冷却已重置" : (result.error || "重置失败"), result.ok ? "success" : "error");
           await bootPage();
@@ -2115,7 +2191,7 @@ function hmeRow(item) {
         label: "安全释放",
         visible: (item) => item.state === "reserved" && !item.pending,
         run: async (item) => {
-          if (!window.confirm(`确认安全释放 ${item.email}？仅 reserved 且未进入注册的租约可释放。`)) return;
+          if (!await confirmDanger(`确认安全释放 ${item.email}？`, { title: "安全释放 HME 别名", hint: "仅 reserved 且未进入注册的租约可释放。", confirmLabel: "释放" })) return;
           const result = await postAction(`hme-release-${item.id}`, `/api/resources/hme/${item.id}/release`);
           toast(result.ok ? "已释放" : (result.error || "释放失败"), result.ok ? "success" : "error");
           await bootPage();
@@ -2125,8 +2201,35 @@ function hmeRow(item) {
     proxy: [],
   };
 
+  let menuTrigger = null;
+  function menuItems() {
+    return Array.from(menu?.querySelectorAll('[role="menuitem"]:not([disabled])') || []);
+  }
+  function focusMenuItem(index) {
+    const items = menuItems();
+    if (!items.length) return;
+    items[(index + items.length) % items.length].focus();
+  }
+  // Keyboard users move into the menu with arrows; mouse clicks keep focus on the trigger.
+  function handleMenuKeydown(event) {
+    if (!menu || menu.hidden) return false;
+    const items = menuItems();
+    const current = items.indexOf(document.activeElement);
+    if (event.key === "ArrowDown") focusMenuItem(current + 1);
+    else if (event.key === "ArrowUp") focusMenuItem(current < 0 ? -1 : current - 1);
+    else if (event.key === "Home") focusMenuItem(0);
+    else if (event.key === "End") focusMenuItem(-1);
+    else if (event.key === "Tab") { closeMenu(); return false; }
+    else return false;
+    event.preventDefault();
+    return true;
+  }
+
+  let menuOpenedAt = 0;
   function openMenu(button, kind, item) {
     if (!menu) return;
+    menuTrigger = button;
+    menuOpenedAt = performance.now();
     menu.replaceChildren();
     const add = (label, handler, className) => {
       const option = document.createElement("button");
@@ -2143,9 +2246,21 @@ function hmeRow(item) {
         }
       });
       menu.append(option);
+      return option;
     };
     const actions = (entityActions[kind] || []).filter((action) => !action.visible || action.visible(item));
-    actions.forEach((action) => add(action.label, () => action.run(item, button), action.danger ? "menu-danger" : ""));
+    const category = action => action.danger ? 2 : /refresh|quota|probe|sub2api|codex-rs|sync/.test(action.id) ? 1 : 0;
+    let previousGroup = -1;
+    actions.sort((a,b) => category(a)-category(b)).forEach(action => {
+      const group = category(action);
+      if (kind === "account" && group !== previousGroup || previousGroup >= 0 && group === 2 && previousGroup !== 2) {
+        const label = document.createElement("div"); label.className="menu-group-label"; label.setAttribute("role","presentation"); label.textContent=["常用","同步与检查","危险操作"][group]; menu.append(label);
+      }
+      previousGroup = group;
+      const option = add(typeof action.label === "function" ? action.label(item) : action.label, () => action.run(item,button), action.danger ? "menu-danger" : "");
+      option.disabled = Boolean(action.disabled?.(item));
+      if (action.id === "workspace.sync") {option.dataset.workspaceSync=String(item.id); option.setAttribute("aria-busy",String(Boolean(item.sync_operation)));}
+    });
     if (!menu.childElementCount) {
       button.hidden = true;
       return;
@@ -2155,18 +2270,23 @@ function hmeRow(item) {
     button.setAttribute("aria-expanded", "true");
     const width = Math.max(menu.offsetWidth || 180, 180);
     const height = menu.offsetHeight || 0;
-    let left = rect.left;
+    // Right-aligned triggers open leftwards so the menu never hugs the viewport edge.
+    let left = rect.left + width > window.innerWidth - 8 ? rect.right - width : rect.left;
     let top = rect.bottom + 4;
-    if (left + width > window.innerWidth - 8) left = Math.max(8, window.innerWidth - width - 8);
+    left = Math.max(8, Math.min(left, window.innerWidth - width - 8));
     if (top + height > window.innerHeight - 8) top = Math.max(8, rect.top - height - 4);
     menu.style.left = `${left}px`;
     menu.style.top = `${top}px`;
   }
 
-  function closeMenu() {
+  function closeMenu({ restoreFocus = false } = {}) {
     if (!menu) return;
+    const hadFocus = menu.contains(document.activeElement);
     menu.hidden = true;
     document.querySelectorAll('[data-menu-trigger][aria-expanded="true"]').forEach((node) => node.setAttribute("aria-expanded", "false"));
+    menuTrigger?.setAttribute("aria-expanded", "false");
+    if ((restoreFocus || hadFocus) && menuTrigger?.isConnected) menuTrigger.focus();
+    menuTrigger = null;
   }
 
   function setRegisterStatus(text, tone) {
@@ -2217,7 +2337,11 @@ function hmeRow(item) {
   }
 
   function closeReauth() {
-    closeOverlay();
+    const trigger = overlayState.returnFocus;
+    if (overlayState.previousContext) {
+      restoreOverlayContext();
+      if (trigger?.isConnected) trigger.focus();
+    } else closeOverlay();
   }
 
   async function openReauth(item, trigger) {
@@ -2234,7 +2358,8 @@ function hmeRow(item) {
     if (authorize) authorize.value = "";
     if (openLink) openLink.href = "#";
     setReauthStatus("正在生成授权链接…", "muted");
-    openOverlay("reauth", {
+    const show = getActiveOverlay() && getActiveOverlay() !== "reauth" ? replaceOverlay : openOverlay;
+    show("reauth", {
       returnFocus: trigger,
       context: { kind: "reauth", account: item },
       initialFocus: "[name='callback_url']",
@@ -2263,7 +2388,7 @@ function hmeRow(item) {
     const ticket = String(form.ticket.value || "").trim();
     const callbackUrl = String(form.callback_url.value || "").trim();
     if (!accountId || !ticket) {
-      setReauthStatus("还没有授权会话，请关掉后重新点重新授权。", "error");
+      setReauthStatus("还没有授权会话，请关闭后重新点「重新授权」。", "error");
       return;
     }
     if (!callbackUrl) {
@@ -2280,6 +2405,10 @@ function hmeRow(item) {
       });
       closeReauth();
       await handleActionResult(result, { successMessage: result.message || "授权已更新" });
+      if (result.rotation_continue) {
+        toast(result.rotation_continue.message, result.rotation_continue.ok ? "success" : "error");
+        void window.Team48Runtime?.refresh();
+      }
       void window.Team48Accounts?.refreshRemote(true).catch(() => {});
     } catch (error) {
       setReauthStatus(friendlyError(error), "error");
@@ -2426,7 +2555,12 @@ function hmeRow(item) {
         item.dataset.memberEmail = email;
         const identity = document.createElement("div");
         identity.className = "team-member-identity";
-        identity.append(twoLine(row.email || row.name || "—", roleLabel(row.role || row.official_role) || null));
+        const account = window.Team48Accounts?.memberAccount(workspace, row);
+        if (account?.managed && account.id) {
+          const emailButton = document.createElement("button"); emailButton.type="button"; emailButton.className="management-email"; emailButton.textContent=row.email;
+          emailButton.addEventListener("click",()=>openSheet("account",account,emailButton)); identity.append(emailButton);
+          const role = document.createElement("small"); role.className="muted"; role.textContent = row.purpose === "mother" ? "母号 · 所有者" : roleLabel(row.role || row.official_role); identity.append(role);
+        } else identity.append(twoLine(row.email || row.name || "—", roleLabel(row.role || row.official_role) || null));
         const stateWrap = document.createElement("div");
         stateWrap.className = "team-member-state";
         stateWrap.append(statusNode(presented.code, presented.label));
@@ -2437,16 +2571,40 @@ function hmeRow(item) {
         if (primary && (!primary.visible || primary.visible(context))) {
           const button = document.createElement("button");
           button.type = "button";
-          button.className = presented.primaryId === "team.member.reauth" ? "button danger compact" : "button primary compact";
+          button.className = "button primary compact";
           button.textContent = typeof primary.label === "function" ? primary.label(context) : primary.label;
           button.addEventListener("click", () => primary.run(context, button));
           actions.append(button);
         }
         const secondary = teamMemberMenu(workspace, row);
         if (secondary) actions.append(secondary);
-        item.append(identity, stateWrap, actions);
+        const quota = document.createElement("div"); quota.className="team-member-quota";
+        if (window.Team48Accounts) quota.append(window.Team48Accounts.quota(account || row,true));
+        item.append(identity, stateWrap, quota, actions);
         return item;
       }
+
+  function inviteRoleControl(value = "owner") {
+    const label = document.createElement("label"); label.textContent = "官方角色";
+    const select = document.createElement("select"); select.name = "role"; select.required = true;
+    if (!value) select.append(new Option("请选择要补充的官方角色", ""));
+    select.append(new Option("所有者（Owner）", "owner"), new Option("成员（Member）", "member"));
+    select.value = value; label.append(select); return label;
+  }
+
+  function setTeamFormOpen(form, toggle, open) {
+    const container = form.closest("[data-team-action-forms]");
+    if (open && container) {
+      for (const sibling of container.children) {
+        sibling.hidden = sibling !== form;
+        if (sibling._toggle) sibling._toggle.setAttribute("aria-expanded", String(sibling === form));
+      }
+    }
+    form.hidden = !open; form._toggle = toggle;
+    toggle.setAttribute("aria-expanded", String(open));
+    if (open) form.querySelector("textarea, select, input")?.focus();
+    else toggle.focus();
+  }
 
   function renderTeamInviteControls(workspace) {
     const wrapper = document.createElement("div");
@@ -2466,17 +2624,7 @@ function hmeRow(item) {
     emailLine.rows = 2;
     emailLine.placeholder = "留空则自动领取 HME";
     emailLabel.append(emailLine);
-    const roleLabelEl = document.createElement("label");
-    roleLabelEl.textContent = "官方角色";
-    const role = document.createElement("select");
-    role.name = "role";
-    [["owner", "Owner"], ["member", "Member"]].forEach(([value, label]) => {
-      const option = document.createElement("option");
-      option.value = value;
-      option.textContent = label;
-      role.append(option);
-    });
-    roleLabelEl.append(role);
+    const roleLabelEl = inviteRoleControl();
     const seatControl = inviteSeatControl();
     const more = document.createElement("details");
     more.className = "team-detail-disclosure";
@@ -2497,20 +2645,12 @@ function hmeRow(item) {
     proxy.dataset.proxySelect = "";
     proxy.append(new Option("正在读取代理目录…", ""));
     proxyLabel.append(proxy);
-    void loadProxySelect(proxy);
-    const forceLabel = document.createElement("label");
-    forceLabel.className = "check";
-    const force = document.createElement("input");
-    force.type = "checkbox";
-    force.name = "force";
-    forceLabel.append(force, document.createTextNode(" 强制跳过部分门禁"));
-    const skipLabel = document.createElement("label");
-    skipLabel.className = "check";
-    const skip = document.createElement("input");
-    skip.type = "checkbox";
-    skip.name = "skip_invite";
-    skipLabel.append(skip, document.createTextNode(" 跳过官方邀请"));
-    moreBody.append(phoneLabel, proxyLabel);
+    let proxyLoaded = false;
+    more.addEventListener("toggle", () => { if (more.open && !proxyLoaded) { proxyLoaded = true; void loadProxySelect(proxy); } });
+    const phoneHint = document.createElement("p"); phoneHint.className = "hint";
+    phoneHint.textContent = "留空使用已配置的号池；手填用四个连字符分隔号码和接码链接。";
+    phone.placeholder = "+1 号码----接码链接";
+    moreBody.append(phoneLabel, phoneHint, proxyLabel);
     more.append(moreSummary, moreBody);
     const status = document.createElement("p");
     status.className = "muted";
@@ -2527,20 +2667,14 @@ function hmeRow(item) {
     submit.textContent = "发送邀请";
     actions.append(cancel, submit);
     form.append(emailLabel, roleLabelEl, seatControl, more, status, actions);
-    const setOpen = (open) => {
-      form.hidden = !open;
-      toggle.setAttribute("aria-expanded", open ? "true" : "false");
-      toggle.textContent = open ? "收起邀请" : "邀请成员";
-      if (open) emailLine.focus();
-    };
+    form._toggle = toggle;
+    const setOpen = open => setTeamFormOpen(form, toggle, open);
     toggle.addEventListener("click", () => setOpen(form.hidden));
     cancel.addEventListener("click", () => setOpen(false));
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
       const action = (entityActions.team || []).find((candidate) => candidate.id === "team.member.invite");
       const values = Object.fromEntries(new FormData(form).entries());
-      values.force = force.checked;
-      values.skip_invite = skip.checked;
       status.hidden = false;
       status.className = "muted";
       status.setAttribute("role", "status");
@@ -2563,91 +2697,61 @@ function hmeRow(item) {
     label.textContent = "邀请席位";
     const select = document.createElement("select");
     select.name = "seat_intent";
-    select.append(new Option("工作区默认", "workspace_default"), new Option("Standard", "standard"), new Option("Premium", "premium"));
+    select.append(new Option("团队默认", "workspace_default"), new Option("Standard", "standard"), new Option("Premium", "premium"));
     select.value = "workspace_default";
     label.append(select);
     return label;
   }
 
   function renderTeamReplenishControls(workspace) {
-    const wrapper = document.createElement("div");
-    wrapper.className = "team-invite-controls";
-    const toggle = document.createElement("button");
-    toggle.type = "button";
-    toggle.className = "button primary compact";
-    toggle.textContent = "补充 Team";
-    toggle.setAttribute("aria-expanded", "false");
-    const form = document.createElement("form");
-    form.className = "team-invite-form stack";
-    form.hidden = true;
-    const hint = document.createElement("p");
-    hint.className = "muted";
-    hint.textContent = "官方角色：Owner";
-    const seatControl = inviteSeatControl();
-    const phoneLabel = document.createElement("label");
-    phoneLabel.textContent = "接码号";
-    const phone = document.createElement("input");
-    phone.name = "phone_line";
-    phone.placeholder = "+1xxxxxxxxxx----https://api668.com/sms/by_key?key=...";
-    phone.autocomplete = "off";
-    phoneLabel.append(phone);
-    const status = document.createElement("p");
-    status.className = "muted";
-    status.hidden = true;
-    const actions = document.createElement("div");
-    actions.className = "row-actions";
-    const cancel = document.createElement("button");
-    cancel.type = "button";
-    cancel.className = "button ghost";
-    cancel.textContent = "取消";
-    const submit = document.createElement("button");
-    submit.type = "submit";
-    submit.className = "button primary";
-    submit.textContent = "开始补充";
-    actions.append(cancel, submit);
-    form.append(hint, seatControl, phoneLabel, status, actions);
-    const setOpen = (open) => {
-      form.hidden = !open;
-      toggle.setAttribute("aria-expanded", open ? "true" : "false");
-      toggle.textContent = open ? "收起补充" : "补充 Team";
-      if (open) phone.focus();
-    };
-    toggle.addEventListener("click", () => setOpen(form.hidden));
-    cancel.addEventListener("click", () => setOpen(false));
-    form.addEventListener("submit", async (event) => {
-      event.preventDefault();
-      const action = (entityActions.team || []).find((candidate) => candidate.id === "team.replenish");
-      const values = Object.fromEntries(new FormData(form).entries());
-      status.hidden = false;
-      status.className = "muted";
-      status.setAttribute("role", "status");
-      status.textContent = "正在补充 Team…";
-      try {
-        const result = await action.run({ workspace, values }, submit);
-        if (!result) return;
-        status.className = result.partial ? "error" : "muted";
-        status.textContent = result.message || (result.partial ? "已入组，授权未完成" : "补充完成");
-      } catch (error) {
-        status.className = "error";
-        status.setAttribute("role", "alert");
-        status.textContent = friendlyError(error);
-      }
-    });
-    wrapper.append(toggle, form);
-    return wrapper;
-  }
+      const wrapper = document.createElement("div"); wrapper.className = "team-invite-controls";
+      const toggle = document.createElement("button"); toggle.type = "button"; toggle.className = "button compact";
+      toggle.textContent = "补充团队"; toggle.setAttribute("aria-expanded", "false");
+      const form = document.createElement("form"); form.className = "team-invite-form stack"; form.hidden = true; form._toggle = toggle;
+      const previous = (workspace.former_members || []).filter(row => ["owner", "member"].includes(row.official_role || row.role));
+      const originalRole = previous.length === 1 ? previous[0].official_role || previous[0].role : "";
+      const roleControl = inviteRoleControl(originalRole);
+      const hint = document.createElement("p"); hint.className = "hint";
+      hint.textContent = originalRole ? "默认沿用已离队成员的官方角色，可按实际席位调整。" : "未能确定原席位角色，请明确选择。官方角色与本地母号/子号用途相互独立。";
+      const seatControl = inviteSeatControl();
+      const more = document.createElement("details"); more.className = "team-detail-disclosure";
+      const summary = document.createElement("summary"); summary.textContent = "更多补充参数";
+      const phoneLabel = document.createElement("label"); phoneLabel.textContent = "接码号（选填）";
+      const phone = document.createElement("input"); phone.name = "phone_line"; phone.placeholder = "+1 号码----接码链接"; phone.autocomplete = "off"; phoneLabel.append(phone);
+      const phoneHint = document.createElement("p"); phoneHint.className = "hint"; phoneHint.textContent = "默认从已配置的号池分配。手填时用四个连字符分隔完整号码和接码链接。";
+      more.append(summary, phoneLabel, phoneHint);
+      const status = document.createElement("p"); status.className = "muted"; status.hidden = true;
+      const actions = document.createElement("div"); actions.className = "row-actions";
+      const cancel = document.createElement("button"); cancel.type = "button"; cancel.className = "button ghost"; cancel.textContent = "取消";
+      const submit = document.createElement("button"); submit.type = "submit"; submit.className = "button primary"; submit.textContent = "开始补充";
+      actions.append(cancel, submit); form.append(roleControl, hint, seatControl, more, status, actions);
+      toggle.addEventListener("click", () => setTeamFormOpen(form, toggle, form.hidden));
+      cancel.addEventListener("click", () => setTeamFormOpen(form, toggle, false));
+      form.addEventListener("submit", async event => {
+        event.preventDefault();
+        if (!form.reportValidity()) return;
+        const values = Object.fromEntries(new FormData(form).entries());
+        status.hidden = false; status.className = "muted"; status.setAttribute("role", "status"); status.textContent = "正在补充团队…";
+        try {
+          const result = await entityActions.team.find(action => action.id === "team.replenish").run({workspace, values}, submit);
+          if (result) status.textContent = result.message || "补充已结束，结果见上方任务进度";
+        } catch (error) { status.className = "error"; status.setAttribute("role", "alert"); status.textContent = friendlyError(error); }
+      });
+      wrapper.append(toggle, form); return wrapper;
+    }
 
   async function replenishTeam(workspace, button, values) {
     const phoneLine = String(values?.phone_line || "").trim();
     setButtonBusy(button, true, "补充中");
-    const stopProgress = watchInviteProgress(workspace.id, button);
+    const stopProgress = collapseTaskForm(workspace.id, button);
     try {
       const result = await postAction(`workspace-replenish-${workspace.id}`, `/api/workspaces/${workspace.id}/replenish`, {
         phone_line: phoneLine,
+        role: values?.role || "owner",
         seat_intent: values?.seat_intent || "workspace_default",
       });
       await handleActionResult(result, {
-        successMessage: result.message || "补充 Team 已完成",
+        successMessage: result.message || "补充团队已完成",
         refresh: false,
         context: {
           retry: result.partial && result.account_id
@@ -2663,59 +2767,67 @@ function hmeRow(item) {
     }
   }
 
+  function rotationCandidates(workspace) {
+    return teamMemberRows(workspace).map(row => ({...row, ...(window.Team48Accounts?.memberAccount(workspace, row) || {})}))
+      .filter(row => row.email?.toLowerCase() !== workspace.owner_email?.toLowerCase() && row.purpose !== "mother" && !row.is_owner
+        && !["invited", "local_only", "remote_only", "unmanaged", "departed", "removed", "history", "conflict", "pending_sync"].includes(teamMemberKind(row)))
+      .sort((a, b) => {
+        const rank = row => row.latest_check?.http_status === 401 && row.latest_check?.current_credential !== false ? 0
+          : (row.last_success_quota || row.quota || {}).seven_day_used_percent >= 100 ? 1 : 2;
+        return rank(a) - rank(b) || String(a.email).localeCompare(String(b.email));
+      });
+  }
+
   function canRotateWorkspace(workspace) {
-      return workspace?.rotation?.eligible === true || workspace?.rotation_eligible === true || workspace?.can_rotate === true;
+      if (workspace?.rotation?.eligible === false || workspace?.rotation_eligible === false || workspace?.can_rotate === false) return false;
+      return Boolean(workspace?.owner_account_id && rotationCandidates(workspace).length);
     }
 
     function renderTeamRotationControls(container, workspace) {
-      const form = document.createElement("form");
-      form.className = "team-rotation-form stack";
-      const emailLabel = document.createElement("label");
-      emailLabel.textContent = "要轮转的成员";
-      const email = document.createElement("input");
-      email.type = "email";
-      email.name = "email";
-      email.required = true;
-      emailLabel.append(email);
-      const replacementLabel = document.createElement("label");
-      replacementLabel.textContent = "补位邮箱 / 原文";
-      const replacement = document.createElement("textarea");
-      replacement.name = "email_line";
-      replacement.rows = 3;
-      replacement.placeholder = "可留空，由现有策略选择待命账号";
-      replacementLabel.append(replacement);
-      const forceLabel = document.createElement("label");
-      forceLabel.className = "check";
-      const force = document.createElement("input");
-      force.type = "checkbox";
-      force.name = "force_refill";
-      forceLabel.append(force, document.createTextNode(" 强制补位"));
-      const submit = document.createElement("button");
-      submit.type = "submit";
-      submit.className = "button danger";
-      submit.textContent = "执行受控轮转";
-      form.append(emailLabel, replacementLabel, forceLabel, submit);
-      form.addEventListener("submit", async (event) => {
-        event.preventDefault();
-        if (!confirmDanger(`确认对 ${email.value} 执行受控轮转？这会修改官方 Team 席位。`)) return;
-        setButtonBusy(submit, true, "轮转中");
-        try {
-          const result = await postAction(`rotate-${workspace.id}-${email.value}`, `/api/workspaces/${workspace.id}/rotate`, {
-            email: email.value.trim(),
-            email_line: replacement.value || "",
-            force_refill: force.checked,
-            reason: "console_team_detail",
-          });
-          await handleActionResult(result, { successMessage: result.message || "轮转已提交", refresh: false });
-          await reloadTeamDetails();
-        } catch (error) {
-          toast(friendlyError(error), "error");
-        } finally {
-          setButtonBusy(submit, false);
+        const form = document.createElement("form"); form.className = "team-rotation-form stack"; form.hidden = true;
+        const emailLabel = document.createElement("label"); emailLabel.textContent = "要轮转的在席成员";
+        const email = document.createElement("select"); email.name = "email"; email.required = true;
+        const candidates = rotationCandidates(workspace);
+        email.append(new Option(candidates.length ? "请选择成员（401、周额度用尽优先）" : "没有可轮转的在席成员", ""));
+        for (const row of candidates) {
+          const q = row.last_success_quota || row.quota || {};
+          const auth = row.latest_check?.http_status === 401 && row.latest_check?.current_credential !== false ? "401" : row.health?.label || labelOf(statusLabels, row.auth || row.auth_state) || "授权待确认";
+          email.append(new Option(`${row.email} · 5h ${q.five_hour_used_percent ?? "未知"}${q.five_hour_used_percent == null ? "" : "%"} / 7d ${q.seven_day_used_percent ?? "未知"}${q.seven_day_used_percent == null ? "" : "%"} · ${auth}${q.stale ? " · 旧快照" : ""}`, row.email));
         }
-      });
-      container.append(form);
-    }
+        email.disabled = !candidates.length; emailLabel.append(email);
+        const replacementLabel = document.createElement("label"); replacementLabel.textContent = "新邮箱（必填）";
+        const replacement = document.createElement("input"); replacement.type = "email"; replacement.name = "replacement_email"; replacement.required = true; replacement.autocomplete = "off"; replacement.placeholder = "name@icloud.com，验证码从 Cloudflare 邮箱读取"; replacementLabel.append(replacement);
+        const submit = document.createElement("button"); submit.type = "submit"; submit.className = "button primary"; submit.textContent = "执行受控轮转"; submit.disabled = !candidates.length;
+        const errorBox = document.createElement("p"); errorBox.className = "text-warning"; errorBox.setAttribute("role", "alert"); errorBox.hidden = true;
+        const cancel = document.createElement("button"); cancel.type = "button"; cancel.className = "button ghost"; cancel.textContent = "取消";
+        cancel.addEventListener("click", () => setTeamFormOpen(form, form._toggle, false));
+        const actions = document.createElement("div"); actions.className = "row-actions"; actions.append(cancel, submit);
+        form.append(emailLabel, replacementLabel, errorBox, actions);
+        form.addEventListener("submit", async event => {
+          event.preventDefault();
+          if (!email.value || !form.reportValidity()) return;
+          const target = email.value, next = replacement.value.trim().toLowerCase();
+          if (next === target.toLowerCase()) { errorBox.textContent = "新邮箱不能与旧号相同"; errorBox.hidden = false; return; }
+          setButtonBusy(submit, true, "检查中"); errorBox.hidden = true;
+          let preview;
+          try {
+            preview = await postAction(`rotate-preview-${workspace.id}-${target}`, `/api/workspaces/${workspace.id}/rotate/preview`, {email:target, replacement_email:next});
+            if (!preview.ok) throw new Error(preview.error || "轮转预检未通过，请检查配置后重试");
+          } catch (error) { errorBox.textContent = friendlyError(error); errorBox.hidden = false; return; }
+          finally { setButtonBusy(submit, false); }
+          const role = preview.role === "owner" ? "Owner" : "Member";
+          const seat = preview.seat_intent === "premium" ? "Premium" : "Standard";
+          if (!await confirmDanger(`确认将 ${target} 轮转为 ${next}？`, {title:"执行受控轮转", items:["会修改官方团队席位", `补位账号继承原角色和席位：${role} / ${seat}`, "新号确认可用后才删除旧号的 Sub2API 记录"], confirmLabel:"执行轮转"}, submit)) return;
+          setButtonBusy(submit, true, "轮转中"); form.hidden = true; errorBox.hidden = true;
+          try {
+            const result = await postAction(`rotate-${workspace.id}-${target}`, `/api/workspaces/${workspace.id}/rotate`, {email:target, replacement_email:next});
+            await handleActionResult(result, {successMessage:result.message || "轮转已提交", refresh:false});
+            await reloadTeamDetails();
+          } catch (error) { errorBox.textContent = friendlyError(error); errorBox.hidden = false; }
+          finally { setButtonBusy(submit, false); if (form.isConnected && form._toggle?.getAttribute("aria-expanded") === "true") form.hidden = false; }
+        });
+        container.append(form); return form;
+      }
 
   async function deleteLocalTeam(workspace, trigger) {
     const name = workspace.display_name || workspace.name || workspace.owner_email || `#${workspace.id}`;
@@ -2755,6 +2867,9 @@ function hmeRow(item) {
           const result = await patchAction(`workspace-expiry-${workspace.id}`, `/api/workspaces/${workspace.id}/expiry`, { expires_on: expiresOn });
           if (!result?.ok) throw new Error(result?.error || "日期保存失败");
           workspace.expiry = result.expiry;
+          const heading = document.querySelector('.team-expiry-details > summary');
+          const expiryInfo = window.Team48Expiry.summary(result.expiry);
+          if (heading) heading.textContent = expiryInfo.date ? `到期 ${expiryInfo.date} · ${expiryInfo.label} · 修改` : '到期未填 · 填写';
           if (document.body.dataset.page === "accounts") {
             const focusKey = overlayState.returnFocus?.dataset.focusKey;
             window.Team48Accounts.updateExpiry(workspace.id, result.expiry);
@@ -2766,131 +2881,133 @@ function hmeRow(item) {
     }
 
     function openWorkspaceExpiry(trigger, workspace) {
-      if (!sheet || !workspace) return;
-      teamDetailState = null;
-      document.getElementById("sheet-title").textContent = "记录到期日期";
-      document.getElementById("sheet-subtitle").textContent = workspace.display_name || workspace.name || `团队 #${workspace.id}`;
-      document.getElementById("sheet-body").replaceChildren(workspaceExpiryEditor(workspace));
-      openOverlay("entity", { returnFocus: trigger, context: { kind: "workspace-expiry", workspace }, initialFocus: 'input[name="expires_on"]' });
-    }
+        if (!sheet || !workspace) return;
+        renderTeamDetails(workspace);
+        const body = document.getElementById("sheet-body");
+        body.querySelector(".team-information").open = true;
+        body.querySelector(".team-expiry-details").open = true;
+        openOverlay("entity", {returnFocus:trigger, context:{kind:"workspace-expiry",workspace}, initialFocus:'input[name="expires_on"]'});
+        body.querySelector('input[name="expires_on"]').scrollIntoView({block:"center"});
+      }
+
+    const revenueSourceLabels = { manual_rotation: "手动轮转", auto_rotation: "自动轮转", kick: "踢人", purge: "踢人并删档", binding_cleanup: "绑定整理", sync_departure: "同步发现离队" };
+    const revenueAmountNotes = { lifetime_capped_90d: "仅近 90 天", cache_lifetime: "估算", cache_seven_day: "估算", missing: "未取到" };
+
+    // 收入记录：抽屉打开时单独拉账本，不依赖列表数据里有没有 revenue。
+    function renderTeamRevenue(workspace) {
+        const section = document.createElement("details"); section.className = "team-detail-disclosure team-revenue";
+        const summary = document.createElement("summary"); summary.textContent = "收入记录 · 读取中…";
+        const listNode = document.createElement("div"); listNode.className = "team-revenue-list";
+        section.append(summary, listNode);
+        fetchEntity(`workspace-revenue-${workspace.id}`, `/api/workspaces/${workspace.id}/revenue`).then((payload) => {
+          if (!section.isConnected) return;
+          const items = payload.items || [];
+          summary.textContent = `收入记录 · ${items.length} 笔 · ${window.Team48Format.formatCost(payload.settled ?? "0")}`;
+          listNode.replaceChildren();
+          if (!items.length) { const empty = document.createElement("p"); empty.className = "hint"; empty.textContent = "还没有入账记录，子号离队时自动记录"; listNode.append(empty); return; }
+          for (const item of items) {
+            const row = document.createElement("div"); row.className = "team-revenue-row";
+            const who = document.createElement("span"); who.className = "team-revenue-email"; who.textContent = item.email || `远端 #${item.remote_account_id}`;
+            const when = document.createElement("time"); when.className = "muted tabular"; when.dateTime = item.settled_at || "";
+            when.textContent = item.settled_at ? new Date(item.settled_at).toLocaleString("zh-CN", { hour12: false }) : "—";
+            const amount = document.createElement("strong"); amount.className = "tabular"; amount.textContent = window.Team48Format.formatCost(item.user_cost);
+            const tags = document.createElement("span"); tags.className = "team-revenue-tags";
+            const source = document.createElement("span"); source.className = "management-badge tone-muted"; source.textContent = revenueSourceLabels[item.departure_source] || item.departure_source || "离队";
+            tags.append(source);
+            const note = revenueAmountNotes[item.amount_source];
+            if (note) {
+              const tag = document.createElement("span"); tag.className = `management-badge tone-${item.amount_source === "missing" ? "error" : "warning"}`; tag.textContent = note;
+              if (item.window_days) tag.title = `按 ${item.window_days} 天计算`;
+              tags.append(tag);
+            }
+            row.append(who, when, amount, tags); listNode.append(row);
+          }
+        }).catch((error) => {
+          if (isAbortError(error)) return;
+          summary.textContent = "收入记录 · 暂时无法读取";
+          const failed = document.createElement("p"); failed.className = "hint"; failed.textContent = friendlyError(error); listNode.replaceChildren(failed);
+        });
+        return section;
+      }
 
     function renderTeamDetails(workspace) {
-      if (!sheet || !workspace) return;
-      teamDetailState = { ...(teamDetailState || {}), workspaceId: workspace.id, workspace, view: "details" };
-      const title = document.getElementById("sheet-title");
-      const subtitle = document.getElementById("sheet-subtitle");
-      const body = document.getElementById("sheet-body");
-      title.textContent = workspace.display_name || workspace.name || "团队详情";
-      subtitle.textContent = workspace.official_workspace_id || "";
-      body.replaceChildren();
-      const official = workspace.official || {};
-      const seats = official.occupied_seats != null && official.seat_limit != null
-        ? `${official.occupied_seats} / ${official.seat_limit}`
-        : (official.joined_people_total == null ? "尚未同步" : `${official.joined_people_total} 人`);
-      body.append(kvSection("团队概览", [
-        ["团队名称", workspace.display_name || workspace.name],
-        ["Workspace ID", workspace.official_workspace_id],
-        ["官方席位", seats],
-        ["最近同步", workspace.last_sync ? relativeTime(workspace.last_sync) : "尚未同步"],
-        ["健康状态", workspace.owner_auth_reason === "owner_account_missing" ? "母号本地档案缺失" : (workspace.owner_needs_auth ? "母号要授权" : labelOf(statusLabels, workspace.health || workspace.status))],
-      ]));
-
-      body.append(workspaceExpiryEditor(workspace));
-
-      const mother = document.createElement("section");
-      mother.className = "sheet-section team-mother-section";
-      const motherTitle = document.createElement("h3");
-      motherTitle.textContent = "母号";
-      const motherGrid = document.createElement("div");
-      motherGrid.className = "team-mother-grid";
-      motherGrid.append(kvSection("", [
-        ["邮箱", workspace.owner_email],
-        ["授权状态", labelOf(statusLabels, workspace.owner_auth_state || workspace.owner_auth)],
-        ["代理状态", workspace.owner_proxy || (workspace.owner_proxy_set ? "已绑定" : "未绑定")],
-        ["额度更新时间", workspace.owner_quota_updated_at ? relativeTime(workspace.owner_quota_updated_at) : "暂无额度快照"],
-      ]));
-      const motherAside = document.createElement("div");
-      motherAside.className = "team-mother-aside";
-      const ownerQuota = workspace.owner_quota || {};
-      if ([ownerQuota.five_hour_used_percent, ownerQuota.seven_day_used_percent, ownerQuota.queried_at].some((value) => value != null)) {
-        motherAside.append(quotaCell({ quota: ownerQuota }));
+        if (!sheet || !workspace) return;
+        teamDetailState = {...(teamDetailState || {}), workspaceId:workspace.id, workspace, view:"details"};
+        const title = document.getElementById("sheet-title"), subtitle = document.getElementById("sheet-subtitle"), body = document.getElementById("sheet-body");
+        title.textContent = workspace.display_name || workspace.name || "团队详情";
+        const official = workspace.official || {};
+        const seats = official.occupied_seats != null && official.seat_limit != null ? `${official.occupied_seats}/${official.seat_limit} 席` : official.joined_people_total != null ? `已加入 ${official.joined_people_total} 人` : "席位尚未同步";
+        subtitle.textContent = `${seats} · ${workspace.owner_needs_auth ? "母号需授权" : labelOf(statusLabels, workspace.health || workspace.status) || "状态待确认"}`;
+        body.replaceChildren();
+        const progress = document.createElement("section"); progress.dataset.teamTask = String(workspace.id); body.append(progress);
+        window.Team48TaskProgress?.mount(progress, {workspaceId:workspace.id, density:"standard"});
+        const members = document.createElement("section"); members.className = "sheet-section team-members-section";
+        const rows = teamMemberRows(workspace).map(row => ({...row, ...(window.Team48Accounts?.memberAccount(workspace,row) || {})}));
+        const seen = new Set(rows.map(row => row.email.toLowerCase()));
+        for (const row of workspace.former_members || []) if (!seen.has(row.email?.toLowerCase())) rows.push({...row, kind:"departed"});
+        const rank = row => ["departed", "history", "removed"].includes(teamMemberKind(row)) ? 3 : teamMemberKind(row) === "invited" ? 2 : authStatus(row).needsAuth || row.health?.needs_auth || ["conflict", "remote_only", "unmanaged"].includes(teamMemberKind(row)) ? 0 : 1;
+        rows.sort((a,b) => rank(a)-rank(b) || String(a.email).localeCompare(String(b.email)));
+        const heading = document.createElement("h3"); heading.textContent = `成员（${rows.length + (workspace.owner_email ? 1 : 0)}）`;
+        const list = document.createElement("div"); list.className = "team-member-list";
+        if (workspace.owner_email) {
+          const owner = {email:workspace.owner_email, id:workspace.owner_account_id, purpose:"mother", kind:"owner", is_owner:true, official_role:"owner", auth:workspace.owner_auth_state || workspace.owner_auth, quota:workspace.owner_quota};
+          list.append(renderTeamMember(workspace, {...owner, ...(window.Team48Accounts?.memberAccount(workspace,owner) || {}), purpose:"mother", is_owner:true}));
+        }
+        rows.forEach(row => list.append(renderTeamMember(workspace,row)));
+        if (!list.children.length) list.append(emptyState("没有成员记录", "同步团队后查看成员与席位。", true));
+        members.append(heading,list); body.append(members);
+        body.append(renderTeamRevenue(workspace));
+        const actionSection = document.createElement("section"); actionSection.className = "sheet-section team-action-section";
+        const bar = document.createElement("div"); bar.className = "team-primary-actions";
+        const forms = document.createElement("div"); forms.dataset.teamActionForms = "";
+        for (const wrapper of [renderTeamInviteControls(workspace), renderTeamReplenishControls(workspace)]) {
+          const toggle = wrapper.querySelector("button"), form = wrapper.querySelector("form");
+          form._toggle = toggle; bar.append(toggle); forms.append(form);
+        }
+        const rotate = document.createElement("button"); rotate.type = "button"; rotate.className = "button compact"; rotate.textContent = "受控轮转"; rotate.setAttribute("aria-expanded","false");
+        rotate.disabled = !canRotateWorkspace(workspace); bar.append(rotate);
+        const rotationForm = renderTeamRotationControls(forms,workspace); rotationForm._toggle = rotate;
+        rotate.addEventListener("click", () => setTeamFormOpen(rotationForm,rotate,rotationForm.hidden));
+        actionSection.append(bar,forms);
+        if (rotate.disabled) { const hint = document.createElement("p"); hint.className = "hint"; hint.textContent = "当前团队不满足轮转条件，请先同步成员并核对母号授权。"; actionSection.append(hint); }
+        body.append(actionSection);
+        const info = document.createElement("details"); info.className = "team-detail-disclosure team-information";
+        const infoTitle = document.createElement("summary"); infoTitle.textContent = "团队信息"; info.append(infoTitle);
+        info.append(kvSection("", [["Workspace ID",workspace.official_workspace_id], ["最近同步",workspace.last_sync ? relativeTime(workspace.last_sync) : "尚未同步"], ["团队代理",workspace.owner_proxy || (workspace.owner_proxy_set ? "已配置" : "直连")]]));
+        if (workspace.official_workspace_id) {
+          const copy = document.createElement("button"); copy.type = "button"; copy.className = "button compact"; copy.textContent = "复制 Workspace ID";
+          copy.addEventListener("click", async () => {try {await navigator.clipboard.writeText(workspace.official_workspace_id); toast("已复制 Workspace ID","success");} catch (_) {toast("复制失败，请选中 ID 手动复制","error");}}); info.append(copy);
+        }
+        const tools = document.createElement("div"); tools.className = "team-info-actions";
+        const sync = document.createElement("button"); sync.type = "button"; sync.className = "button"; sync.textContent = workspace.sync_operation ? "同步中" : "同步本团队"; sync.disabled = Boolean(workspace.sync_operation);
+        sync.addEventListener("click", () => entityActions.workspace.find(a=>a.id==="workspace.sync").run(workspace,sync)); tools.append(sync);
+        if (workspace.owner_account_id && workspace.owner_purpose === "mother") {
+          const proxy = document.createElement("button"); proxy.type = "button"; proxy.className = "button"; proxy.textContent = "切换代理"; proxy.addEventListener("click",()=>openWorkspaceProxy(proxy,workspace)); tools.append(proxy);
+        }
+        const ownerAction = workspacePrimaryAction(workspace);
+        if (["owner-missing","owner-auth"].includes(ownerAction.id)) {
+          const action = document.createElement("button"); action.type="button"; action.className="button primary"; action.textContent=ownerAction.label; action.addEventListener("click",()=>runWorkspacePrimaryAction(workspace,action)); tools.append(action);
+        }
+        info.append(tools);
+        const expiry = document.createElement("details"); expiry.className = "team-expiry-details";
+        const expiryLabel = document.createElement("summary"), expiryInfo = window.Team48Expiry.summary(workspace.expiry);
+        expiryLabel.textContent = expiryInfo.date ? `到期 ${expiryInfo.date} · ${expiryInfo.label} · 修改` : "到期未填 · 填写";
+        expiry.append(expiryLabel,workspaceExpiryEditor(workspace)); info.append(expiry);
+        const purchaseEditor = window.Team48Purchase?.editor?.(workspace, {onSaved: (purchase) => {
+          workspace.purchase = purchase;
+          purchaseLabel.textContent = window.Team48Purchase.summary(purchase);
+        }});
+        const purchase = document.createElement("details"); purchase.className = "team-purchase-details";
+        const purchaseLabel = document.createElement("summary");
+        purchaseLabel.textContent = window.Team48Purchase?.summary?.(workspace.purchase) || "购买信息";
+        if (purchaseEditor) { purchase.append(purchaseLabel, purchaseEditor); info.append(purchase); }
+        body.append(info);
+        const danger = document.createElement("details"); danger.className = "team-detail-disclosure team-danger-zone";
+        const dangerTitle = document.createElement("summary"); dangerTitle.textContent = "危险操作";
+        const warning = document.createElement("p"); warning.className = "hint"; warning.textContent = "只移除本地团队记录，不影响官方团队；本地账号与共享关系按现有安全规则处理。";
+        const remove = document.createElement("button"); remove.type="button"; remove.className="button danger"; remove.textContent="移除本地记录"; remove.addEventListener("click",()=>deleteLocalTeam(workspace,remove));
+        danger.append(dangerTitle,warning,remove); body.append(danger);
       }
-      const ownerAction = workspacePrimaryAction(workspace);
-      if (workspace.owner_account_id && workspace.owner_purpose === "mother") {
-        const proxyButton = document.createElement("button");
-        proxyButton.type = "button";
-        proxyButton.className = "button";
-        proxyButton.textContent = "切换代理";
-        proxyButton.addEventListener("click", () => openWorkspaceProxy(proxyButton, workspace));
-        motherAside.append(proxyButton);
-      }
-      if (ownerAction.id === "owner-missing" || ownerAction.id === "owner-auth") {
-        const ownerButton = document.createElement("button");
-        ownerButton.type = "button";
-        ownerButton.className = ownerAction.id === "owner-auth" ? "button danger" : "button";
-        ownerButton.textContent = ownerAction.label;
-        ownerButton.addEventListener("click", () => runWorkspacePrimaryAction(workspace, ownerButton));
-        motherAside.append(ownerButton);
-      }
-      if (motherAside.childElementCount) motherGrid.append(motherAside);
-      mother.append(motherTitle, motherGrid);
-      body.append(mother);
-
-      const members = document.createElement("section");
-      members.className = "sheet-section";
-      const membersTitle = document.createElement("h3");
-      const rows = teamMemberRows(workspace);
-      membersTitle.textContent = `成员（${rows.length}）`;
-      const list = document.createElement("div");
-      list.className = "team-member-list";
-      if (!rows.length) list.append(emptyState("没有子成员", "同步官方成员后，这里会显示当前 Team 成员。", true));
-      else rows.forEach((row) => list.append(renderTeamMember(workspace, row)));
-      const memberToolbar = document.createElement("div");
-      memberToolbar.className = "team-invite-controls";
-      memberToolbar.append(renderTeamReplenishControls(workspace), renderTeamInviteControls(workspace));
-      members.append(membersTitle, memberToolbar, list);
-      body.append(members);
-      if (workspace.former_members?.length) {
-        const former = document.createElement("section");
-        former.className = "sheet-section team-former-members";
-        const heading = document.createElement("h3");
-        heading.textContent = `已离队账号（${workspace.former_members.length}）`;
-        former.append(heading);
-        workspace.former_members.forEach(row => former.append(renderTeamMember(workspace, row)));
-        body.append(former);
-      }
-
-      if (canRotateWorkspace(workspace)) {
-        const advanced = document.createElement("details");
-        advanced.className = "team-detail-disclosure";
-        const summary = document.createElement("summary");
-        summary.textContent = "高级操作";
-        const content = document.createElement("div");
-        content.className = "team-detail-disclosure-body";
-        renderTeamRotationControls(content, workspace);
-        advanced.append(summary, content);
-        body.append(advanced);
-      }
-
-      const danger = document.createElement("details");
-      danger.className = "team-detail-disclosure team-danger-zone";
-      const dangerSummary = document.createElement("summary");
-      dangerSummary.textContent = "危险操作";
-      const dangerBody = document.createElement("div");
-      dangerBody.className = "team-detail-disclosure-body";
-      const warning = document.createElement("p");
-      warning.className = "hint";
-      warning.textContent = "删除只清理本地团队数据，不会修改官方 Team。成员和历史关联会按后端安全规则处理。";
-      const deleteButton = document.createElement("button");
-      deleteButton.type = "button";
-      deleteButton.className = "button danger";
-      deleteButton.textContent = "删除本地团队";
-      deleteButton.addEventListener("click", () => deleteLocalTeam(workspace, deleteButton));
-      dangerBody.append(warning, deleteButton);
-      danger.append(dangerSummary, dangerBody);
-      body.append(danger);
-      if (document.body.dataset.page === "accounts") window.Team48Accounts.decorateTeam(workspace, body);
-    }
 
     function openWorkspaceDetails(trigger, workspace) {
       if (!workspace || !sheet) return;
@@ -2901,16 +3018,6 @@ function hmeRow(item) {
 
     async function fetchTeamDetails(workspaceId) {
         const payload = await fetchEntity("workspace-list", "/api/workspaces");
-        if (document.body.dataset.page === "workspaces") {
-          pageCache.kind = "workspace";
-          pageCache.items = payload.items || [];
-          paintList("workspace");
-          if (overlayState.returnFocus && !overlayState.returnFocus.isConnected) {
-            overlayState.returnFocus = document.querySelector(`[data-entity-id="${workspaceId}"] [data-action="workspace.manage"]`)
-              || document.querySelector(`[data-entity-id="${workspaceId}"]`)
-              || document.getElementById("page-root");
-          }
-        }
         const workspace = (payload.items || []).find((item) => Number(item.id) === Number(workspaceId));
         if (!workspace) throw new Error("团队已不存在或无法读取");
         if (teamDetailState) teamDetailState.workspace = workspace;
@@ -2944,7 +3051,7 @@ function hmeRow(item) {
     label.textContent = "邀请角色";
     const role = document.createElement("select");
     role.name = "role";
-    role.append(new Option("Member", "member"), new Option("Owner", "owner"));
+    role.append(new Option("成员（Member）", "member"), new Option("所有者（Owner）", "owner"));
     role.value = ["owner", "account-owner"].includes(row.role || row.official_role) ? "owner" : "member";
     label.append(role);
     const actions = document.createElement("div");
@@ -2975,33 +3082,17 @@ function hmeRow(item) {
     item.append(form); role.focus();
   }
 
-  function watchInviteProgress(workspaceId, button) {
-    const status = button.closest("form")?.querySelector('[role="status"]');
-    const controller = new AbortController();
-    let stopped = false;
-    let timer;
-    async function poll() {
-      try {
-        const response = await fetch("/api/runtime/status", { signal: controller.signal, cache: "no-store" });
-        if (response.ok) {
-          const payload = await response.json();
-          const operation = (payload.active_operations || []).find((item) =>
-            item.workspace_id === workspaceId && ["onboard", "replenish"].includes(item.kind) && item.state === "running");
-          if (!stopped && status && operation) status.textContent = `${operation.stage_label} · ${operation.elapsed_seconds || 0} 秒`;
-        }
-      } catch (_) {
-        // Progress reads must not interrupt the submitted operation.
-      } finally {
-        if (!stopped) timer = setTimeout(poll, 2000);
-      }
-    }
-    void poll();
-    return () => { stopped = true; clearTimeout(timer); controller.abort(); };
+  function collapseTaskForm(workspaceId, button) {
+    // Submission UI only; runtime polling continues independently after this form closes.
+    const form = button.closest("form");
+    if (form) form.hidden = true;
+    document.querySelector(`#sheet-body [data-team-task="${workspaceId}"]`)?.focus();
+    return () => { if (form?.isConnected && form._toggle?.getAttribute("aria-expanded") === "true") form.hidden = false; };
   }
 
   async function inviteTeamMember(workspace, values, button) {
     setButtonBusy(button, true, "处理中");
-    const stopProgress = watchInviteProgress(workspace.id, button);
+    const stopProgress = collapseTaskForm(workspace.id, button);
     try {
       const result = await postAction(`workspace-invite-${workspace.id}`, `/api/workspaces/${workspace.id}/onboard`, {
         email_line: String(values.email_line || "").trim(),
@@ -3066,7 +3157,7 @@ function hmeRow(item) {
 
     async function changeTeamMemberRole(workspace, row, button, role) {
       const email = String(row.email || "").trim();
-      if (!email || !confirmDanger(`确认把 ${email} 的官方角色改为 ${role === "owner" ? "Owner" : "Member"}？`)) return;
+      if (!email || !(await confirmDanger(`确认把 ${email} 的官方角色改为${role === "owner" ? "所有者" : "成员"}？`, { title: "修改官方角色", confirmLabel: "修改角色" }, button))) return;
       setButtonBusy(button, true, "更新中");
       try {
         const body = { email, role };
@@ -3084,14 +3175,34 @@ function hmeRow(item) {
       const email = String(row.email || "").trim();
       const accountId = row.id || row.local_account_id;
       const kind = presentTeamMember(row).code;
-      const copy = mode === "purge"
-        ? `永久删除本地档案 ${email}？这会移出官方席位、下架 Sub2API 并清理本地档案，且不可恢复。`
+      const confirmCopy = mode === "purge"
+        ? {
+          title: "永久删除本地档案",
+          message: `永久删除 ${email} ？此操作不可恢复。`,
+          items: ["移出官方席位", "下架已绑定的 Sub2API 账号", "清理本地档案、凭据与历史"],
+          confirmLabel: "永久删除",
+        }
         : mode === "official"
           ? (kind === "invited"
-            ? `撤销官方邀请：${email}？保留本地账号与历史，以后可重新邀请。`
-            : `将此成员移出官方团队：${email}？保留本地账号、授权凭据、历史与费用记录；不会调整已购买席位数量。确认移出后会尝试暂停已绑定的 Sub2API 远端调度（不解绑、不删远端账号）。`)
-          : `只从本地移除 ${email}？官方 Team 不会改变。`;
-      if (!confirmDanger(copy)) return;
+            ? {
+              title: "撤销官方邀请",
+              message: `撤销对 ${email} 的官方邀请？`,
+              hint: "保留本地账号与历史，以后可重新邀请。",
+              confirmLabel: "撤销邀请",
+            }
+            : {
+              title: "移出官方团队",
+              message: `将 ${email} 移出官方团队？`,
+              items: ["保留本地账号、授权凭据、历史与费用记录", "不调整已购买的席位数量", "会尝试暂停已绑定的 Sub2API 远端调度（不解绑、不删远端账号）"],
+              confirmLabel: "移出团队",
+            })
+          : {
+            title: "从本地移除成员",
+            message: `只从本地移除 ${email} ？`,
+            hint: "官方团队不会改变。",
+            confirmLabel: "本地移除",
+          };
+      if (!await confirmDanger(confirmCopy.message, confirmCopy, button)) return;
       setButtonBusy(button, true, "处理中");
       try {
         let result;
@@ -3185,7 +3296,42 @@ function hmeRow(item) {
       submit.type = "submit";
       submit.className = "button primary";
       submit.textContent = "完成授权";
-      form.append(linkLabel, linkActions, callbackLabel, status, submit);
+      // Follow-ups for a child joining this team; mother accounts never use them.
+      const isOwner = Boolean(teamDetailState.workspace?.owner_account_id) && teamDetailState.workspace.owner_account_id === account.id;
+      const followupPrefs = readAuthFollowups();
+      const followups = document.createElement("fieldset");
+      followups.className = "team-auth-followups";
+      followups.hidden = isOwner || !account.workspace_id;
+      const legend = document.createElement("legend");
+      legend.textContent = "授权成功后";
+      const followupBox = (key, text) => {
+        const label = document.createElement("label");
+        label.className = "check";
+        const input = document.createElement("input");
+        input.type = "checkbox";
+        input.checked = followupPrefs[key];
+        input.addEventListener("change", () => writeAuthFollowups({ ...readAuthFollowups(), [key]: input.checked }));
+        label.append(input, document.createTextNode(text));
+        followups.append(label);
+        return input;
+      };
+      followups.append(legend);
+      const pushBox = followupBox("push", authPushLabel(authPushTarget));
+      if (!followups.hidden) {
+        void loadAuthPushTarget().then((target) => {
+          const text = pushBox.nextSibling;
+          if (text && text.nodeType === Node.TEXT_NODE) text.textContent = authPushLabel(target);
+        });
+      }
+      const countBox = followupBox("count", "今日切换 +1（同一成员只计一次）");
+      const autoLabel = document.createElement("label");
+      autoLabel.className = "check";
+      const autoBox = document.createElement("input");
+      autoBox.type = "checkbox";
+      autoBox.checked = followupPrefs.autoSubmit;
+      autoBox.addEventListener("change", () => writeAuthFollowups({ ...readAuthFollowups(), autoSubmit: autoBox.checked }));
+      autoLabel.append(autoBox, document.createTextNode("粘贴回调地址后自动提交"));
+      form.append(linkLabel, linkActions, callbackLabel, followups, autoLabel, status, submit);
       body.append(back, form);
       activateFocusTrap(panel || sheet);
       back.focus();
@@ -3230,15 +3376,26 @@ function hmeRow(item) {
           return;
         }
         setButtonBusy(submit, true, "授权中");
+        const wantPush = !followups.hidden && pushBox.checked;
+        const wantCount = !followups.hidden && countBox.checked;
+        if (wantPush || wantCount) status.textContent = "正在换票，随后推送 / 计数…";
         try {
           const result = await fetchEntity(`account:${account.id}:reauth:complete:${ticket}`, `/api/accounts/${account.id}/reauth/complete`, {
             method: "POST",
             headers: { "Content-Type": "application/json", Accept: "application/json" },
-            body: JSON.stringify({ ticket, callback_url: callback.value.trim() }),
+            body: JSON.stringify({
+              ticket,
+              callback_url: callback.value.trim(),
+              ...(wantPush || wantCount ? { workspace_id: account.workspace_id, push_sub2api: wantPush, count_switch: wantCount } : {}),
+            }),
           });
+          const steps = [["授权", { ok: true, message: result.message || "授权成功" }],
+            ["Sub2API", result.followups?.sub2api], ["codex-rs", result.followups?.codex_rs],
+            ["切换次数", result.followups?.switch_count]].filter(([, step]) => step);
+          const failed = steps.some(([, step]) => step.ok === false);
           teamDetailState.stage = "authorization_completed";
           await reloadTeamDetails();
-          toast(result.message || "授权成功", "success");
+          toast(steps.map(([name, step]) => `${name}：${step.message}`).join("；"), failed ? "warning" : "success");
           void window.Team48Accounts?.refreshRemote(true).catch(() => {});
         } catch (error) {
           const code = extractErrorCode(error);
@@ -3250,6 +3407,12 @@ function hmeRow(item) {
           setButtonBusy(submit, false);
         }
       });
+      callback.addEventListener("paste", () => {
+        // Let the pasted text land first, then submit only a complete localhost callback.
+        setTimeout(() => {
+          if (autoBox.checked && ticket && !submit.disabled && isOAuthCallback(callback.value)) form.requestSubmit(submit);
+        }, 0);
+      });
       try {
         await startAuth();
       } catch (error) {
@@ -3259,6 +3422,43 @@ function hmeRow(item) {
         regenerate.hidden = false;
       }
     }
+
+  const AUTH_FOLLOWUPS_KEY = "team48:auth-followups";
+  // Where reauth pushes after success follows the settings switch; the request body stays push_sub2api.
+  let authPushTarget = null;
+  function authPushLabel(target) {
+    return target === "codex_rs"
+      ? "导入 codex-rs（带刷新令牌，之后由 codex-rs 续期）"
+      : "推送到 Sub2API（使用设置里的默认分组和代理）";
+  }
+  async function loadAuthPushTarget() {
+    try {
+      const settings = await fetchEntity("settings-push-target", "/api/settings");
+      authPushTarget = settings?.codex_rs?.push_target === "codex_rs" ? "codex_rs" : "sub2api";
+    } catch (_) {}
+    return authPushTarget;
+  }
+  function readAuthFollowups() {
+    const defaults = { push: true, count: true, autoSubmit: true };
+    try {
+      const saved = JSON.parse(localStorage.getItem(AUTH_FOLLOWUPS_KEY) || "{}");
+      return Object.fromEntries(Object.entries(defaults).map(([key, value]) => [key, typeof saved[key] === "boolean" ? saved[key] : value]));
+    } catch (_) {
+      return defaults;
+    }
+  }
+  function writeAuthFollowups(value) {
+    try { localStorage.setItem(AUTH_FOLLOWUPS_KEY, JSON.stringify(value)); } catch (_) {}
+  }
+  function isOAuthCallback(value) {
+    try {
+      const url = new URL(String(value || "").trim());
+      return ["localhost", "127.0.0.1"].includes(url.hostname) && url.port === "1455" && url.pathname === "/auth/callback" &&
+        (url.searchParams.has("code") || url.searchParams.has("error")) && url.searchParams.has("state");
+    } catch (_) {
+      return false;
+    }
+  }
 
   function proxyOptionLabel(item) {
     const name = item.name || `Sub2API #${item.id}`;
@@ -3507,6 +3707,10 @@ function hmeRow(item) {
     const data = new FormData(form);
     return JSON.stringify({
       sub2api_push: window.Team48Sub2ApiDefaults.value(),
+      codex_rs: window.Team48CodexRs.value(),
+      sub2api_proxy_mode: data.get("sub2api_proxy_mode"),
+      codex_base_url: data.get("codex_base_url"),
+      codex_admin_key: data.get("codex_admin_key"),
       sub2api_base_url: data.get("sub2api_base_url"),
       sub2api_api_key: data.get("sub2api_api_key"),
       sub2api_admin_email: data.get("sub2api_admin_email"),
@@ -3529,18 +3733,46 @@ function hmeRow(item) {
     });
   }
 
-  function updateDirty() {
+  function changedSettings(current, baseline) {
+    const flatten = (snapshot) => {
+      const { sub2api_push: push = {}, codex_rs: codex = {}, sub2api_proxy_mode: mode, ...fields } = JSON.parse(snapshot || "{}");
+      return { ...fields, sub2api_concurrency: push.concurrency, sub2api_group_ids: push.group_ids,
+        sub2api_proxy_mode: [mode, push.proxy_id, push.proxy_group_id],
+        codex_rs_push_target: codex.push_target, codex_rs_group_ids: codex.group_ids,
+        codex_rs_concurrency: codex.concurrency_limit ?? null, codex_rs_weight: codex.weight, codex_rs_enabled: codex.enabled,
+        codex_rs_auto_reauth: codex.auto_reauth,
+        codex_rs_refill_enabled: codex.refill?.enabled, codex_rs_refill_target: codex.refill?.target,
+        codex_rs_refill_daily_limit: codex.refill?.daily_limit, codex_rs_refill_workspace_ids: codex.refill?.workspace_ids };
+    };
+    const draft = flatten(current), saved = flatten(baseline);
+    return Object.keys(draft).filter(key => JSON.stringify(draft[key]) !== JSON.stringify(saved[key]));
+  }
+
+  function updateDirty(event) {
     const form = document.getElementById("settings-form");
     const bar = document.getElementById("settings-savebar");
     const status = document.getElementById("settings-status");
     const discard = document.getElementById("settings-discard");
     if (!form || !bar) return;
-    settingsDirty = snapshotSettings(form) !== settingsBaseline;
+    const changes = changedSettings(snapshotSettings(form), settingsBaseline);
+    settingsDirty = changes.length > 0;
+    bar.hidden = !settingsDirty;
     bar.classList.toggle("is-dirty", settingsDirty);
+    form.querySelectorAll("label.is-dirty, fieldset.is-dirty").forEach(node => node.classList.remove("is-dirty"));
+    for (const key of changes) {
+      const target = key === "sub2api_group_ids" ? form.querySelector(".sub2api-default-groups")
+        : key === "auto_rotate_workspace_ids" ? document.getElementById("auto-rotation-workspaces")
+          : key === "codex_rs_group_ids" ? document.getElementById("codex-rs-group-field")
+            : key === "codex_rs_push_target" ? document.getElementById("codex-rs-push-target")
+              : key === "codex_rs_refill_workspace_ids" ? document.getElementById("codex-rs-refill-workspaces")
+                : form.elements.namedItem(key)?.closest?.("label");
+      target?.classList.add("is-dirty");
+    }
     if (discard) discard.hidden = !settingsDirty;
+    if (status && event && ["input", "change"].includes(event.type)) delete status.dataset.locked;
     if (status && !status.dataset.locked) {
       status.className = "muted";
-      status.textContent = settingsDirty ? "有未保存的修改" : "没有未保存的修改";
+      status.textContent = settingsDirty ? `${changes.length} 项未保存` : "没有未保存的修改";
     }
   }
 
@@ -3564,13 +3796,13 @@ function hmeRow(item) {
       input.dataset.rotationWorkspace = ""; input.checked = selected.has(workspace.id);
       label.append(text, input); list.append(label);
     });
-    if (!list.children.length) list.textContent = "尚无工作空间，请先添加团队。";
+    if (!list.children.length) list.textContent = "还没有团队，请先登记团队。";
     const updateHint = () => {
       const all = form.auto_rotate_scope.value === "all";
       document.getElementById("auto-rotation-workspaces").hidden = all;
       document.getElementById("auto-rotation-scope-hint").textContent = all
-        ? "全局范围包含以后新增的工作空间。打开总开关并保存后生效。"
-        : `已选择 ${rotationWorkspaceIds(form).length} 个工作空间。只会在这些工作空间轮转；总开关关闭时均不执行。`;
+        ? "全局范围包含以后新增的团队。打开总开关并保存后生效。"
+        : `已选择 ${rotationWorkspaceIds(form).length} 个团队。只会在这些团队内轮转；总开关关闭时均不执行。`;
     };
     form.auto_rotate_scope.onchange = updateHint;
     list.onchange = updateHint;
@@ -3592,6 +3824,10 @@ function hmeRow(item) {
     const secretState = payload.secret_state || {};
     const account = payload.account || {};
     window.Team48Sub2ApiDefaults.fill(payload.sub2api_push);
+    window.Team48CodexRs.fill(payload.codex_rs || {}, automation.rotation_workspaces || []);
+    authPushTarget = payload.codex_rs?.push_target === "codex_rs" ? "codex_rs" : "sub2api";
+    form.codex_base_url.value = connections.codex_base_url || "";
+    form.codex_admin_key.value = "";
     form.sub2api_base_url.value = connections.sub2api_base_url || "";
     form.sub2api_admin_email.value = connections.sub2api_admin_email || "";
     form.hme_base_url.value = connections.hme_base_url || "";
@@ -3614,7 +3850,7 @@ function hmeRow(item) {
     if (autoReauthHint) {
       const state = automation.auto_reauth || {};
       autoReauthHint.textContent = state.effective
-        ? "实际生效 · dispatcher 会执行已就绪账号"
+        ? "实际生效 · 后台会处理已就绪的账号"
         : state.requested && !state.deployment_allowed
           ? "已请求但部署总闸关闭 · 设置 AUTO_REAUTH_ENABLED=true 后生效"
           : "未启用";
@@ -3641,6 +3877,7 @@ function hmeRow(item) {
     setMeta("sub2api", connections.sub2api?.configured);
     setMeta("hme", connections.hme?.configured);
     setMeta("mail", connections.mail?.configured);
+    setMeta("codex_rs", connections.codex?.configured);
     const accountEl = document.getElementById("settings-account");
     if (accountEl) accountEl.textContent = account.username ? `当前登录账号：${account.username}` : "登录账号会显示在这里。";
     settingsBaseline = snapshotSettings(form);
@@ -3669,6 +3906,8 @@ function hmeRow(item) {
 
   function connectionsPayload(form) {
     return {
+      codex_base_url: form.codex_base_url.value,
+      codex_admin_key: secretOrNull(form.codex_admin_key.value),
       sub2api_base_url: form.sub2api_base_url.value,
       sub2api_admin_email: form.sub2api_admin_email.value,
       hme_base_url: form.hme_base_url.value,
@@ -3696,24 +3935,30 @@ function hmeRow(item) {
     const sub = payload.sub2api || {};
     const hme = payload.hme || {};
     const mail = payload.mail || {};
-    if (sub.ok) {
+    if (payload.sub2api && sub.ok) {
       setServiceState("sub2api", `连接正常 · ${relativeTime(sub.checked_at)}`, `${sub.group_count || 0} 个分组 · ${sub.account_count || 0} 个账号`);
-    } else {
+    } else if (payload.sub2api) {
       setServiceState("sub2api", sub.error || "检测失败", sub.error || "连不上 Sub2API");
     }
-    if (hme.ok) {
+    if (payload.hme && hme.ok) {
       setServiceState(
         "hme",
         `连接正常 · ${relativeTime(hme.checked_at)}`,
         `${hme.account_name || hme.account_id || "当前账号"} · ${hme.alias_count || 0} 个别名 · ${hme.unused_count || 0} 个可用`
       );
-    } else {
+    } else if (payload.hme) {
       setServiceState("hme", hme.error || "检测失败", hme.error || "连不上 HME");
     }
-    if (mail.ok) {
+    if (payload.mail && mail.ok) {
       setServiceState("mail", `连接正常 · ${relativeTime(mail.checked_at)}`, mail.address || "连接成功");
-    } else {
+    } else if (payload.mail) {
       setServiceState("mail", mail.error || "检测失败", mail.error || "连不上临时邮箱");
+    }
+    const codex = payload.codex_rs || {};
+    if (payload.codex_rs && !codex.skipped) {
+      const when = codex.checked_at ? ` · ${relativeTime(codex.checked_at)}` : "";
+      if (codex.ok) setServiceState("codex_rs", `连接正常${when}`, codex.message || "连接成功");
+      else setServiceState("codex_rs", codex.message || codex.error || "检测失败", codex.message || codex.error || "连不上 codex-rs");
     }
   }
 
@@ -3725,8 +3970,9 @@ function hmeRow(item) {
       button.disabled = true;
     });
     const target = focus || "all";
+    const allServices = ["sub2api", "codex_rs", "hme", "mail"];
     if (target === "all") {
-      ["sub2api", "hme", "mail"].forEach((service) => setServiceState(service, "检测中…"));
+      allServices.forEach((service) => setServiceState(service, "检测中…"));
     } else {
       setServiceState(target, "检测中…");
     }
@@ -3739,7 +3985,7 @@ function hmeRow(item) {
       probeCopy(payload);
     } catch (error) {
       const message = friendlyError(error);
-      (target === "all" ? ["sub2api", "hme", "mail"] : [target]).forEach((service) => setServiceState(service, message));
+      (target === "all" ? allServices : [target]).forEach((service) => setServiceState(service, message));
     } finally {
       buttons.forEach((button) => {
         button.disabled = false;
@@ -3790,6 +4036,7 @@ function hmeRow(item) {
     const payload = {
       connections: connectionsPayload(form),
       sub2api_push: window.Team48Sub2ApiDefaults.value(),
+      codex_rs: window.Team48CodexRs.value(),
       automation: {
         official_quota_probe: form.official_quota_probe.checked,
         auto_reauth: form.auto_reauth.checked,
@@ -3818,6 +4065,8 @@ function hmeRow(item) {
       });
       fillSettings(saved);
       void window.Team48Sub2ApiDefaults.refresh();
+      void window.Team48CodexRs.refresh();
+      void window.Team48CodexRs.refreshRefill();
       if (statusEl) {
         statusEl.className = "muted";
         statusEl.textContent = "已保存 · 刚刚";
@@ -3872,244 +4121,18 @@ function hmeRow(item) {
     }
   }
 
-  function bindSearch(input, kind) {
-    if (!input || input.dataset.bound) return;
-    input.dataset.bound = "1";
-    const params = currentQuery();
-    if (params.get("q")) input.value = params.get("q");
-    input.addEventListener("input", () => {
-      window.clearTimeout(searchTimer);
-      searchTimer = window.setTimeout(() => {
-        const next = currentQuery();
-        const value = input.value.trim();
-        if (value) next.set("q", value);
-        else next.delete("q");
-        writeQuery(next);
-        if (kind === "account" && (currentQuery().get("view") || "portfolio") !== "flat") renderPortfolio(pageCache.portfolio || { groups: [], unassigned: [] });
-        else paintList(kind);
-      }, 200);
-    });
-  }
-
-  function kindBadge(kind) {
-    const span = document.createElement("span");
-    span.className = kind === "mother" ? "badge badge-primary" : (kind === "child" ? "badge badge-info" : (kind === "unmanaged" ? "badge badge-warning" : "badge badge-muted"));
-    span.textContent = { mother: "母号", child: "子号", history: "历史", unmanaged: "未接入", invited: "待接受", unassigned: "未归属" }[kind] || kind;
-    return span;
-  }
-
-  function portfolioAccountRow(account, kind) {
-    const row = document.createElement("div");
-    row.className = kind === "history" ? "portfolio-row is-history" : (kind === "mother" ? "portfolio-row is-mother" : "portfolio-row");
-    const canOpen = Boolean(account.id) && kind !== "unmanaged" && kind !== "invited";
-    if (canOpen) bindRow(row, "account", account);
-
-    const identity = document.createElement("div");
-    identity.className = "portfolio-cell portfolio-identity";
-    identity.append(kindBadge(kind));
-    const label = twoLine(account.email || account.name || "—", roleLabel(account.official_role) || account.note || null);
-    identity.append(label);
-    row.append(identity);
-
-    const authCol = document.createElement("div");
-    authCol.className = "portfolio-cell portfolio-auth";
-    authCol.append(statusNode(account.auth || account.membership_state, labelOf(statusLabels, account.auth || account.membership_state)));
-    if (canOpen && (kind === "child" || account.purpose === "child")) {
-      authCol.append(createAutoReauthButton(account));
-    }
-    row.append(authCol);
-
-    const quotaCol = document.createElement("div");
-    quotaCol.className = "portfolio-cell portfolio-quota";
-    quotaCol.append(canOpen ? quotaCell(account) : document.createTextNode(kind === "unmanaged" ? "未接入，无法读取额度" : (kind === "invited" ? "待接受邀请" : "尚未获取")));
-    row.append(quotaCol);
-
-    const sub2Col = document.createElement("div");
-    sub2Col.className = "portfolio-cell portfolio-sub2 row-action-host";
-    sub2Col.append(statusNode(account.sub2api, labelOf(statusLabels, account.sub2api)));
-    if (canOpen) {
-      const actions = document.createElement("div");
-      actions.className = "row-actions row-actions-contextual";
-      actions.append(menuButton("account", account));
-      sub2Col.append(actions);
-    }
-    row.append(sub2Col);
-    return row;
-  }
-
-  function renderPortfolio(payload) {
-    if (window.Team48Accounts) return window.Team48Accounts.render(payload);
-    const root = document.getElementById("accounts-portfolio");
-    const table = document.querySelector("#accounts-body")?.closest(".table-scroll");
-    if (!root) return;
-    pageCache.portfolio = payload || pageCache.portfolio || { groups: [], unassigned: [] };
-    const data = pageCache.portfolio;
-    root.hidden = false;
-    if (table) table.hidden = true;
-    root.replaceChildren();
-    const q = (currentQuery().get("q") || "").trim().toLowerCase();
-    const purpose = currentQuery().get("purpose") || "all";
-    const groups = data.groups || [];
-    let shown = 0;
-
-    const matchesPurpose = (account) => {
-      if (!purpose || purpose === "all") return true;
-      if (!account) return false;
-      if (purpose === "conflict") return account.state === "conflict";
-      if (purpose === "archived") return account.state === "archived" || account.kind === "history";
-      if (purpose === "needs_auth") return needsAuth(account);
-      if (purpose === "quota_full") return (account.quota || {}).seven_day_used_percent === 100;
-      return account.purpose === purpose;
-    };
-    const haystack = (group) => [
-      group.display_name,
-      group.name,
-      group.owner_email,
-      group.official_workspace_id,
-      (group.mother || {}).email,
-      ...(group.current_children || []).map((row) => row.email),
-      ...(group.unmanaged || []).map((row) => row.email),
-      ...(group.history || []).map((row) => row.email),
-    ].join(" ").toLowerCase();
-
-    groups.forEach((group) => {
-      if (q && !haystack(group).includes(q)) return;
-      const mother = group.mother && matchesPurpose(group.mother) ? group.mother : null;
-      const currentChildren = (group.current_children || []).filter(matchesPurpose);
-      const unmanaged = (group.unmanaged || []).filter((row) => purpose === "all" || purpose === "conflict" ? matchesPurpose(row) : false);
-      const history = (group.history || []).filter(matchesPurpose);
-      if (purpose && purpose !== "all" && !mother && !currentChildren.length && !unmanaged.length && !history.length) return;
-      shown += 1;
-      const box = document.createElement("section");
-      box.className = "portfolio-group";
-      const head = document.createElement("div");
-      head.className = "portfolio-head";
-      head.tabIndex = 0;
-      head.setAttribute("role", "button");
-      head.setAttribute("aria-expanded", "true");
-
-      const toggle = document.createElement("span");
-      toggle.className = "toggle-icon";
-      toggle.textContent = "▾";
-      toggle.setAttribute("aria-hidden", "true");
-
-      const body = document.createElement("div");
-      body.className = "portfolio-body";
-      const collapse = () => {
-        const closed = box.classList.toggle("is-collapsed");
-        head.setAttribute("aria-expanded", closed ? "false" : "true");
-      };
-      head.addEventListener("click", (event) => {
-        if (event.target.closest(".row-actions")) return;
-        collapse();
-      });
-      head.addEventListener("keydown", (event) => {
-        if (event.key !== "Enter" && event.key !== " ") return;
-        event.preventDefault();
-        collapse();
-      });
-
-      const counts = group.counts || {};
-      const meta = document.createElement("div");
-      meta.className = "portfolio-meta";
-      meta.append(twoLine(group.display_name || group.name, shortId(group.official_workspace_id)));
-
-      const ownerCol = document.createElement("div");
-      ownerCol.className = "portfolio-owner";
-      ownerCol.append(twoLine(group.owner_email || "无母号", `${counts.joined_people ?? ((counts.managed_children ?? counts.current_children ?? 0) + (counts.unmanaged ?? 0) + (group.mother ? 1 : 0))} 人 · ${counts.managed_children ?? counts.current_children ?? 0} 子号 · ${counts.unmanaged ?? 0} 未接入`));
-      const groupUsage = workspaceUsageSummary(group.usage);
-      if (groupUsage) ownerCol.append(groupUsage);
-
-      const healthCol = document.createElement("div");
-      healthCol.className = "portfolio-health";
-      healthCol.append(statusNode(group.health, labelOf(statusLabels, group.health)));
-
-      const syncCol = document.createElement("div");
-      syncCol.className = "portfolio-sync";
-      syncCol.append(timeNode(group.last_sync));
-
-      head.append(toggle, meta, ownerCol, healthCol, syncCol);
-
-      if (mother) body.append(portfolioAccountRow(mother, "mother"));
-      currentChildren.forEach((row) => body.append(portfolioAccountRow(row, "child")));
-      unmanaged.forEach((row) => body.append(portfolioAccountRow(row, "unmanaged")));
-      if (history.length) {
-        const hist = document.createElement("details");
-        hist.className = "portfolio-history";
-        const summary = document.createElement("summary");
-        summary.className = "portfolio-history-toggle";
-        summary.textContent = "历史归档成员 (" + history.length + ")";
-        hist.append(summary);
-        history.forEach((row) => hist.append(portfolioAccountRow(row, "history")));
-        body.append(hist);
-      }
-      box.append(head, body);
-      root.append(box);
-    });
-    (data.unassigned || []).forEach((row) => {
-      if (q && !String(row.email || "").toLowerCase().includes(q)) return;
-      if (!matchesPurpose(row)) return;
-      shown += 1;
-      root.append(portfolioAccountRow(row, "unassigned"));
-    });
-    if (!shown) root.append(emptyState("没有符合当前筛选的工作区", "清除筛选或换一个关键词。", true));
-    setCount("accounts-count", shown, (data.groups || []).length + (data.unassigned || []).length);
-  }
-
-  function paintList(kind) {
-    const items = filterItems(kind, pageCache.items);
-    if (kind === "workspace") {
-      renderRows(
-        "workspaces-body",
-        items,
-        6,
-        workspaceRow,
-        items.length === 0 && pageCache.items.length
-          ? emptyState("没有符合当前筛选的工作区", "清除筛选或换一个关键词。")
-          : emptyState("还没有工作区", "点「登记团队」，填母号邮箱并完成 OAuth 授权。")
-      );
-      setCount("workspaces-count", items.length, pageCache.items.length);
-    } else if (kind === "account") {
-      const view = currentQuery().get("view") || "portfolio";
-      const table = document.querySelector("#accounts-body")?.closest(".table-scroll");
-      const portfolio = document.getElementById("accounts-portfolio");
-      if (view === "flat") {
-        if (table) table.hidden = false;
-        if (portfolio) portfolio.hidden = true;
-        renderRows(
-          "accounts-body",
-          items,
-          7,
-          accountRow,
-          items.length === 0 && pageCache.items.length
-            ? emptyState("没有符合当前筛选的账号", "清除筛选或换一个关键词。")
-            : emptyState("还没有账号", "先登记团队母号。归档的默认不显示。")
-        );
-        setCount("accounts-count", items.length, pageCache.items.length);
-      } else if (pageCache.portfolio) {
-        renderPortfolio(pageCache.portfolio);
-      }
-    }
-  }
-
   async function bootOverview() {
+    window.Team48Board?.mount(document.getElementById("team-board-root"));
     renderOverview(await fetchEntity("overview", "/api/overview"));
-  }
-
-  async function bootWorkspaces() {
-    bindSearch(document.getElementById("workspaces-search"), "workspace");
-    const payload = await fetchEntity("workspace-list", "/api/workspaces");
-    pageCache.kind = "workspace";
-    pageCache.items = payload.items || [];
-    paintList("workspace");
   }
 
   async function bootAccounts() {
       return window.Team48Accounts.boot({
-        fetchEntity, postAction, startCurrentOperation, entityActions, menuButton, deleteLocalTeam, linkTeamMember,
+        fetchEntity, postAction, startCurrentOperation, entityActions, menuButton, deleteLocalTeam, linkTeamMember, openOperationById,
         openWorkspaceExpiry,
         openWorkspaceProxy,
         openSheet, openWorkspaceDetails, openOverlay, openRegister, openConfirm, relativeTime, toast, friendlyError, showPageError,
+        importCodexRsAccounts,
         cache: pageCache,
       });
     }
@@ -4223,7 +4246,7 @@ function hmeRow(item) {
       bulk.addEventListener("click", async () => {
         const ids = Array.from(document.querySelectorAll(".operation-select:checked")).map((node) => node.dataset.publicId).filter(Boolean);
         if (!ids.length) return;
-        if (!confirmDanger(`确认清除当前选中的 ${ids.length} 条已完成任务？`)) return;
+        if (!await confirmDanger(`确认清除当前选中的 ${ids.length} 条已完成任务？`, { title: "批量清除任务记录", hint: "记录会软归档，可在“已清除”里恢复。", confirmLabel: "清除", tone: "primary" })) return;
         const result = await postAction("operations-bulk-archive", "/api/operations/bulk-archive", { public_ids: ids, reason: "bulk_clear" });
         toast(result.ok ? `已清除 ${result.count || ids.length} 条` : (result.error || "清除失败"), result.ok ? "success" : "error");
         await bootOperations();
@@ -4290,12 +4313,19 @@ function hmeRow(item) {
   async function bootPhones() {
     const payload = await fetchEntity("phone-list", "/api/resources/phones");
     const items = payload.items || [];
-    renderRows(
+    renderSortableRows(
       "phones-body",
       items,
       8,
       phoneRow,
-      emptyState("还没有手机号", "点「导入号码」，按 号码----接码链接 批量入库。")
+      emptyState("还没有手机号", "点「导入号码」，按 号码----接码链接 批量入库。"),
+      {
+        number: (item) => sortText(item.number),
+        status: (item) => sortText(item.status),
+        uses: (item) => sortNumber(item.used_count),
+        risk: (item) => sortNumber(item.risk_count),
+        cooldown: (item) => sortTime(item.cooldown_until),
+      }
     );
     setCount("phones-count", items.length, items.length);
   }
@@ -4303,12 +4333,18 @@ function hmeRow(item) {
   async function bootHme() {
     const payload = await fetchEntity("hme-list", "/api/resources/hme");
     const items = payload.items || [];
-    renderRows(
+    renderSortableRows(
       "hme-body",
       items,
       7,
       hmeRow,
-      emptyState("还没有 HME 占用记录", "领用别名后会显示本地占用和同步状态。")
+      emptyState("还没有 HME 占用记录", "领用别名后会显示本地占用和同步状态。"),
+      {
+        email: (item) => sortText(item.email),
+        state: (item) => sortText(item.state),
+        pending: (item) => (item.pending ? 0 : 1),
+        expires: (item) => sortTime(item.expires_at),
+      }
     );
     setCount("hme-count", items.length, items.length);
   }
@@ -4316,12 +4352,19 @@ function hmeRow(item) {
   async function bootProxies() {
     const payload = await fetchEntity("proxy-list", "/api/resources/proxies");
     const items = payload.items || [];
-    renderRows(
+    renderSortableRows(
       "proxies-body",
       items,
       8,
       proxyRow,
-      emptyState("暂无远端代理", "Sub2API 尚未返回可用的远端代理目录。")
+      emptyState("暂无远端代理", "Sub2API 尚未返回可用的远端代理目录。"),
+      {
+        name: (item) => sortText(item.name),
+        region: (item) => sortText(item.region),
+        status: (item) => sortText(item.status),
+        health: (item) => sortText(item.health),
+        checked: (item) => sortTime(item.checked_at),
+      }
     );
     setCount("proxies-count", items.length, items.length);
   }
@@ -4330,6 +4373,7 @@ function hmeRow(item) {
     const form = document.getElementById("settings-form");
     const passwordForm = document.getElementById("password-form");
     window.Team48Sub2ApiDefaults.init(form, fetchEntity);
+    window.Team48CodexRs.init(form, fetchEntity);
     if (form && !form.dataset.bound) {
       form.dataset.bound = "1";
       form.addEventListener("submit", saveSettings);
@@ -4356,12 +4400,280 @@ function hmeRow(item) {
     }
     fillSettings(await fetchEntity("settings", "/api/settings"));
     void window.Team48Sub2ApiDefaults.refresh();
+    void window.Team48CodexRs.refresh();
+    void window.Team48CodexRs.refreshRefill();
     void loadSub2ApiManagement();
+    void loadRunnerCard();
+  }
+
+  /* 浏览器环境卡片：只读展示运行器配置，发起自检并展示指纹信号、问题和截图。 */
+  const RUNNER_SIGNUP_LABELS = { playwright: "Playwright（旧方式）", extension: "Chromix + 插件（新方式）" };
+  const RUNNER_PLATFORM_LABELS = { linux: "Linux", windows: "Windows" };
+  const RUNNER_GPU_LABELS = { native: "原生（不改显卡）", preset: "预设显卡型号" };
+  let runnerWatching = "";
+
+  function runnerNode(tag, className, text) {
+    const node = document.createElement(tag);
+    if (className) node.className = className;
+    if (text != null) node.textContent = text;
+    return node;
+  }
+
+  function fillRunnerConfig(config) {
+    const set = (key, value) => {
+      const node = document.querySelector(`[data-runner-config="${key}"]`);
+      if (node) node.textContent = value;
+    };
+    set("signup_runner", RUNNER_SIGNUP_LABELS[config.signup_runner] || config.signup_runner || "—");
+    set("executable", !config.executable_set ? "✕ 未配置 RUNNER_BROWSER_EXECUTABLE"
+      : config.executable_exists ? "✓ 文件存在" : "✕ 已配置，但文件不存在");
+    set("platform", RUNNER_PLATFORM_LABELS[config.platform] || config.platform || "—");
+    set("gpu_mode", RUNNER_GPU_LABELS[config.gpu_mode] || config.gpu_mode || "—");
+    const meta = document.getElementById("runner-config-meta");
+    if (meta) {
+      meta.textContent = config.ready ? "✓ 运行器可用" : `✕ 运行器不可用：${config.error || "配置不完整"}`;
+      meta.className = `service-meta ${config.ready ? "text-ok" : "text-warn"}`;
+    }
+    const start = document.getElementById("runner-selfcheck-start");
+    if (start) start.dataset.configReady = config.ready ? "1" : "";
+  }
+
+  function fillRunnerWorkspaces(items) {
+    const select = document.getElementById("runner-workspace");
+    if (!select) return;
+    const previous = select.value;
+    select.replaceChildren();
+    items.forEach((item) => {
+      const option = document.createElement("option");
+      option.value = String(item.id);
+      option.textContent = item.proxy_set ? `${item.name} · #${item.id}` : `${item.name} · #${item.id}（母号未配置代理）`;
+      option.disabled = !item.proxy_set;
+      select.append(option);
+    });
+    if (!items.length) {
+      const option = document.createElement("option");
+      option.value = "";
+      option.textContent = "没有启用的团队";
+      select.append(option);
+    }
+    const usable = items.filter((item) => item.proxy_set).map((item) => String(item.id));
+    select.value = usable.includes(previous) ? previous : (usable[0] || "");
+  }
+
+  function runnerUaPlatform(ua) {
+    const text = String(ua || "");
+    if (/Windows NT/.test(text)) return "Windows";
+    if (/Macintosh|Mac OS/.test(text)) return "macOS";
+    if (/Android/.test(text)) return "Android";
+    if (/Linux|X11/.test(text)) return "Linux";
+    return "未知";
+  }
+
+  function runnerOffsetText(minutes) {
+    if (typeof minutes !== "number") return "";
+    const sign = minutes >= 0 ? "+" : "-";
+    const abs = Math.abs(minutes);
+    return `UTC${sign}${Math.floor(abs / 60)}${abs % 60 ? `:${String(abs % 60).padStart(2, "0")}` : ""}`;
+  }
+
+  function runnerSignalRows(result) {
+    const exit = result.exit || null;
+    const signals = result.signals || null;
+    const rows = [];
+    if (!exit) rows.push(["出口 IP", "✕ 浏览器内未查到"]);
+    else if (exit.error) rows.push(["出口 IP", `✕ 未查到（${exit.error}）`]);
+    else {
+      rows.push(["出口 IP", exit.ip || "未知"]);
+      rows.push(["出口国家 / 地区", [exit.country, exit.region, exit.city].filter(Boolean).join(" · ") || "未知"]);
+      rows.push(["出口 IP 时区", exit.timezone || "未知"]);
+    }
+    if (!signals) {
+      rows.push(["浏览器信号", "✕ 没有收到（插件未能在 chatgpt.com 采集）"]);
+      return rows;
+    }
+    rows.push(["页面时区", [signals.timezone || "未知", runnerOffsetText(signals.utcOffsetMinutes)].filter(Boolean).join(" · ")]);
+    const uaData = signals.uaData || {};
+    rows.push(["UA 平台", `UA：${runnerUaPlatform(signals.userAgent)} · navigator.platform：${signals.platform || "未知"} · UA-CH：${[uaData.platform, uaData.platformVersion].filter(Boolean).join(" ") || "未知"}`]);
+    const webgl = signals.webgl || {};
+    rows.push(["WebGL 渲染器", webgl.unmaskedRenderer || webgl.renderer || "未取到"]);
+    rows.push(["WebGL 厂商", webgl.unmaskedVendor || webgl.vendor || "未取到"]);
+    const ips = Array.isArray(signals.webrtcIps) ? signals.webrtcIps : [];
+    rows.push(["WebRTC 候选", ips.length
+      ? ips.map((ip) => (exit?.ip && ip === exit.ip ? `${ip}（出口 IP）` : ip)).join("、")
+      : "无候选 IP（未暴露）"]);
+    rows.push(["webdriver", signals.webdriver === true ? "✕ true（会被识别为自动化）"
+      : signals.webdriver === false ? "✓ false" : "未知"]);
+    rows.push(["语言", Array.isArray(signals.languages) ? signals.languages.join(", ") : (signals.language || "未知")]);
+    const screen = signals.screen || {}, win = signals.window || {};
+    rows.push(["屏幕 / 窗口", `${screen.width ?? "?"}×${screen.height ?? "?"} · 窗口 ${win.outerWidth ?? "?"}×${win.outerHeight ?? "?"}`]);
+    rows.push(["CPU / 内存", `${signals.hardwareConcurrency ?? "?"} 核 · ${signals.deviceMemory ?? "?"} GB`]);
+    rows.push(["User-Agent", signals.userAgent || "未知"]);
+    return rows;
+  }
+
+  function renderRunnerResult(detail) {
+    const host = document.getElementById("runner-result");
+    if (!host) return;
+    const result = detail?.result && typeof detail.result === "object" ? detail.result : null;
+    host.replaceChildren();
+    host.hidden = !detail;
+    if (!detail) return;
+    const when = detail.finished || detail.finished_at;
+    host.append(runnerNode("h3", "", `最近一次自检${when ? ` · ${relativeTime(when)}` : ""}${result?.workspace_name ? ` · 代理：${result.workspace_name}` : ""}`));
+    if (!result || !result.completed) {
+      const verdict = runnerNode("p", "runner-verdict is-warn");
+      verdict.append(runnerNode("span", "runner-icon", "!"), runnerNode("span", "", `自检未完成：${result?.error || detail.error || "没有结果"}`));
+      verdict.firstChild.setAttribute("aria-hidden", "true");
+      host.append(verdict);
+      if (!result) return;
+    }
+    const findings = Array.isArray(result.findings) ? result.findings : [];
+    const errors = findings.filter((item) => item.level === "error");
+    if (result.completed) {
+      const tone = errors.length ? "is-error" : findings.length ? "is-warn" : "is-ok";
+      const text = errors.length ? `发现 ${errors.length} 个问题${findings.length > errors.length ? `、${findings.length - errors.length} 个提醒` : ""}，建议处理后再用于轮转`
+        : findings.length ? `没有严重问题，有 ${findings.length} 个提醒` : "通过：未发现问题";
+      const verdict = runnerNode("p", `runner-verdict ${tone}`);
+      const icon = runnerNode("span", "runner-icon", errors.length ? "✕" : findings.length ? "!" : "✓");
+      icon.setAttribute("aria-hidden", "true");
+      verdict.append(icon, runnerNode("span", "", text));
+      host.append(verdict);
+    }
+    if (result.summary) host.append(runnerNode("p", "hint", `档案：${result.summary}`));
+    if (findings.length) {
+      const list = runnerNode("ul", "runner-findings");
+      list.setAttribute("aria-label", "发现的问题");
+      findings.forEach((item) => {
+        const error = item.level === "error";
+        const li = runnerNode("li", error ? "is-error" : "is-warn");
+        const icon = runnerNode("span", "runner-icon", error ? "✕" : "!");
+        icon.setAttribute("aria-hidden", "true");
+        li.append(icon, runnerNode("strong", "", error ? "问题" : "提醒"), runnerNode("span", "", item.message || item.code));
+        list.append(li);
+      });
+      host.append(list);
+    }
+    const dl = runnerNode("dl", "kv runner-signals");
+    runnerSignalRows(result).forEach(([label, value]) => {
+      dl.append(runnerNode("dt", "", label), runnerNode("dd", "", value));
+    });
+    host.append(dl);
+    const shots = Array.isArray(result.screenshots) ? result.screenshots : [];
+    if (shots.length) {
+      const grid = runnerNode("div", "runner-shots");
+      shots.forEach((shot) => {
+        const figure = runnerNode("figure");
+        const link = runnerNode("a");
+        link.href = shot.url;
+        link.target = "_blank";
+        link.rel = "noopener";
+        link.title = `打开 ${shot.label} 大图`;
+        const img = runnerNode("img");
+        img.src = shot.url;
+        img.alt = `${shot.label} 检测页截图`;
+        img.loading = "lazy";
+        link.append(img);
+        figure.append(link, runnerNode("figcaption", "", `${shot.label} · 点开看大图`));
+        grid.append(figure);
+      });
+      host.append(grid);
+    } else if (result.completed) {
+      host.append(runnerNode("p", "hint", "没有截图（插件截图失败，详见问题列表）。"));
+    }
+  }
+
+  async function watchRunnerSelfcheck(operationId) {
+    const progress = document.getElementById("runner-selfcheck-progress");
+    const start = document.getElementById("runner-selfcheck-start");
+    const status = document.getElementById("runner-selfcheck-status");
+    if (!operationId || runnerWatching === operationId) return;
+    runnerWatching = operationId;
+    if (start) start.disabled = true;
+    if (status) status.textContent = "自检进行中，约 2~4 分钟；可离开本页，稍后回来查看结果。";
+    if (progress && window.Team48TaskProgress) {
+      progress.hidden = false;
+      window.Team48TaskProgress.mount(progress, { id: operationId, density: "standard" });
+    }
+    try {
+      const detail = await window.Team48Runtime.waitFor(operationId);
+      if (runnerWatching !== operationId) return;
+      renderRunnerResult(detail);
+      const result = detail?.result || {};
+      if (status) status.textContent = result.message || "自检已结束。";
+      toast(result.message || "自检已结束", result.completed ? (result.passed ? "success" : "warning") : "error",
+        { label: "查看详情", onClick: () => openOperationById(operationId) });
+    } finally {
+      if (runnerWatching === operationId) {
+        runnerWatching = "";
+        if (start) start.disabled = !start.dataset.configReady;
+        if (progress) { progress.hidden = true; progress.replaceChildren(); }
+      }
+    }
+  }
+
+  async function startRunnerSelfcheck(event) {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const status = document.getElementById("runner-selfcheck-status");
+    const start = document.getElementById("runner-selfcheck-start");
+    const workspaceId = Number(form.workspace_id.value) || null;
+    const body = { platform: form.platform.value || null, workspace_id: workspaceId };
+    if (start) start.disabled = true;
+    if (status) status.textContent = "正在启动自检…";
+    try {
+      const result = await fetchEntity("runner-selfcheck", "/api/runner/selfcheck", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (result?.operation_id) {
+        // Seed the shared runtime store so the task center and the card show progress at once.
+        window.Team48Runtime?.put({ id: result.operation_id, kind: "runner_selfcheck", operation: "runner_selfcheck",
+          operation_label: "浏览器环境自检", state: "running", workspace_id: workspaceId,
+          started_at: new Date().toISOString(), stage_label: "后台任务已开始" });
+        void window.Team48Runtime?.refresh();
+        void watchRunnerSelfcheck(result.operation_id);
+      } else if (start) start.disabled = !start.dataset.configReady;
+    } catch (error) {
+      if (start) start.disabled = !start.dataset.configReady;
+      const message = extractErrorMessage(error) || friendlyError(error) || "自检没有启动";
+      if (status) status.textContent = `自检没有启动：${message}`;
+      toast(`自检没有启动：${message}`, "error");
+    }
+  }
+
+  async function loadRunnerCard() {
+    const form = document.getElementById("runner-selfcheck-form");
+    if (!form) return;
+    if (!form.dataset.bound) {
+      form.dataset.bound = "1";
+      form.addEventListener("submit", startRunnerSelfcheck);
+    }
+    let payload;
+    try {
+      payload = await fetchEntity("runner-selfcheck-view", "/api/runner/selfcheck");
+    } catch (error) {
+      if (isAbortError(error)) return;
+      const meta = document.getElementById("runner-config-meta");
+      if (meta) meta.textContent = `读取失败：${friendlyError(error)}`;
+      return;
+    }
+    fillRunnerConfig(payload.config || {});
+    fillRunnerWorkspaces(payload.workspaces || []);
+    const start = document.getElementById("runner-selfcheck-start");
+    const latest = payload.latest;
+    const running = latest && ACTIVE_OPERATION_STATES.has(String(latest.state || "").toLowerCase());
+    if (start && !runnerWatching) start.disabled = !payload.config?.ready;
+    if (running) {
+      window.Team48Runtime?.put(latest);
+      void watchRunnerSelfcheck(latest.id);
+    } else if (!runnerWatching) {
+      renderRunnerResult(latest);
+    }
   }
 
   const pageBootstraps = {
     overview: bootOverview,
-    workspaces: bootWorkspaces,
     accounts: bootAccounts,
     operations: bootOperations,
     phones: bootPhones,
@@ -4383,21 +4695,105 @@ function hmeRow(item) {
     }
   }
 
+  let paletteIndex = 0;
+
+  function paletteItems() {
+    return Array.from(commandList?.querySelectorAll("li[data-href]") || []);
+  }
+
+  function highlightPalette(index) {
+    const items = paletteItems();
+    if (!items.length) {
+      paletteIndex = 0;
+      return;
+    }
+    paletteIndex = (index + items.length) % items.length;
+    items.forEach((li, position) => {
+      const active = position === paletteIndex;
+      li.classList.toggle("is-active", active);
+      li.firstElementChild?.setAttribute("aria-current", String(active));
+    });
+    items[paletteIndex].scrollIntoView({ block: "nearest" });
+  }
+
+  function runPaletteItem(index) {
+    const target = paletteItems()[index]?.dataset.href;
+    if (!target) return;
+    palette?.close();
+    window.location.href = target;
+  }
+
   function renderPalette(query) {
+    if (!commandList) return;
     const q = query.trim().toLowerCase();
     commandList.replaceChildren();
     destinations
       .filter((item) => item.label.toLowerCase().includes(q) || item.label.includes(query.trim()))
       .forEach((item) => {
         const li = document.createElement("li");
-        li.textContent = item.label;
-        li.addEventListener("click", () => {
-          window.location.href = item.href;
-        });
+        li.dataset.href = item.href;
+        const option = document.createElement("button");
+        option.type = "button";
+        option.textContent = item.label;
+        option.addEventListener("click", () => runPaletteItem(paletteItems().indexOf(li)));
+        option.addEventListener("mousemove", () => highlightPalette(paletteItems().indexOf(li)));
+        li.append(option);
         commandList.append(li);
       });
+    if (!commandList.children.length) {
+      const empty = document.createElement("li");
+      empty.className = "palette-empty";
+      empty.textContent = "没有匹配的入口";
+      commandList.append(empty);
+    }
+    highlightPalette(0);
   }
 
+  async function cancelTrackedOperation(item, trigger) {
+    if (!item.can_cancel || window.Team48Runtime?.isStale()) return;
+    if (!await confirmDanger("请求取消此任务？", {title: "取消任务", items: ["将在下一个安全检查点停止", "已发出的官方邀请不会自动撤回", "已移出的成员和已修改的远端状态不会自动恢复"], confirmLabel: "请求取消"}, trigger)) return;
+    setButtonBusy(trigger, true, "请求中");
+    try {
+      const result = await postAction(`operation-cancel-${item.id}`, `/api/operations/${encodeURIComponent(item.id)}/cancel`);
+      if (!result.ok) throw new Error(result.error || "取消未确认");
+      window.Team48Runtime.put({...item, can_cancel: false, cancel_requested: true});
+      toast("已请求取消，等待安全停止", "muted");
+      await window.Team48Runtime.refresh();
+    } catch (error) { toast(friendlyError(error), "error"); }
+    finally { setButtonBusy(trigger, false); }
+  }
+
+  window.Team48TaskProgress?.configure({
+    friendlyError,
+    open: (id, trigger) => openOperationById(id, overlayState.active === "tasks" ? document.getElementById("task-center-open") : trigger),
+    cancel: cancelTrackedOperation,
+    retry: async (item, trigger) => {
+      setButtonBusy(trigger, true, "提交中");
+      try {
+        const result = await postAction(`operation-retry-${item.id}`, `/api/operations/${encodeURIComponent(item.id)}/retry`);
+        await handleActionResult(result, {successMessage: "重试已提交"});
+        await window.Team48Runtime.refresh();
+      } catch (error) { toast(friendlyError(error), "error"); }
+      finally { setButtonBusy(trigger, false); }
+    },
+    continueRotation: async (item, trigger) => {
+      await (entityActions.operation || []).find((action) => action.id === "operation.continue_rotation")?.run(item, trigger);
+      await window.Team48Runtime.refresh();
+    },
+    resolveRotation: async (item, trigger) => {
+      try {
+        await (entityActions.operation || []).find((action) => action.id === "operation.resolve_rotation")?.run(item, trigger);
+      } catch (error) { toast(friendlyError(error), "error"); }
+      await window.Team48Runtime.refresh();
+    },
+  });
+  document.getElementById("task-center-open")?.addEventListener("click", event => {
+    openOverlay("tasks", {returnFocus: event.currentTarget, initialFocus: "[data-close-tasks]"});
+    window.Team48TaskProgress.update();
+    void window.Team48Runtime.refresh();
+  });
+  document.querySelector("[data-close-tasks]")?.addEventListener("click", () => closeOverlay());
+  document.getElementById("task-center-refresh")?.addEventListener("click", () => void window.Team48Runtime.refresh());
   document.querySelector("[data-close-sheet]")?.addEventListener("click", closeSheet);
   document.querySelectorAll("[data-open-register]").forEach((button) => {
     button.addEventListener("click", () => openRegister(button));
@@ -4406,6 +4802,14 @@ function hmeRow(item) {
   document.getElementById("register-form")?.addEventListener("submit", submitRegister);
   document.querySelector("[data-close-reauth]")?.addEventListener("click", closeReauth);
   document.getElementById("reauth-form")?.addEventListener("submit", submitReauth);
+  document.querySelector("#reauth-form [name='callback_url']")?.addEventListener("paste", (event) => {
+    const field = event.currentTarget;
+    setTimeout(() => {
+      const form = field.form;
+      const button = form?.querySelector("#reauth-submit");
+      if (readAuthFollowups().autoSubmit && form?.ticket.value && !button?.disabled && isOAuthCallback(field.value)) form.requestSubmit(button || undefined);
+    }, 0);
+  });
   document.querySelectorAll("[data-open-phone-import]").forEach((button) => {
     button.addEventListener("click", () => openPhoneImport(button));
   });
@@ -4464,6 +4868,7 @@ function hmeRow(item) {
       if (event.target !== overlay) return;
       if (name === "confirm") finishConfirm(false);
       else if (name === "entity") closeSheet();
+      else if (name === "reauth") closeReauth();
       else if (name === "proxy-edit") closeProxyEdit();
       else closeOverlay();
     });
@@ -4472,20 +4877,29 @@ function hmeRow(item) {
     if (menu && !menu.hidden && !event.target.closest("#action-menu, [data-menu-trigger], .row-actions")) closeMenu();
   });
 
+  // A fixed-position menu would drift away from its trigger; close it instead.
+  // Clicking a trigger outside the viewport scrolls it into view first; that scroll must not close the menu it opens.
+  window.addEventListener("scroll", () => {
+    if (menu && !menu.hidden && performance.now() - menuOpenedAt > 150) closeMenu();
+  }, { passive: true, capture: true });
+  window.addEventListener("resize", () => { if (menu && !menu.hidden) closeMenu(); });
   window.addEventListener("keydown", (event) => {
     if (!getActiveOverlay() && (event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
       event.preventDefault();
       palette.showModal();
+      commandInput.value = "";
       renderPalette("");
       commandInput.focus();
     }
+    if (handleMenuKeydown(event)) return;
     if (event.key === "Escape") {
       if (menu && !menu.hidden) {
-        closeMenu();
+        closeMenu({ restoreFocus: true });
       } else if (getActiveOverlay()) {
         event.preventDefault();
         if (getActiveOverlay() === "confirm") finishConfirm(false);
         else if (getActiveOverlay() === "entity") closeSheet();
+        else if (getActiveOverlay() === "reauth") closeReauth();
         else if (getActiveOverlay() === "proxy-edit") closeProxyEdit();
         else closeOverlay();
       }
@@ -4494,6 +4908,11 @@ function hmeRow(item) {
     handleFocusTrap(event);
   });
   commandInput?.addEventListener("input", () => renderPalette(commandInput.value));
+  commandInput?.addEventListener("keydown", (event) => {
+    if (event.key === "ArrowDown") { event.preventDefault(); highlightPalette(paletteIndex + 1); }
+    else if (event.key === "ArrowUp") { event.preventDefault(); highlightPalette(paletteIndex - 1); }
+    else if (event.key === "Enter") { event.preventDefault(); runPaletteItem(paletteIndex); }
+  });
   window.addEventListener("beforeunload", (event) => {
     stopPolling();
     if (!settingsDirty) return;
@@ -4526,6 +4945,12 @@ function hmeRow(item) {
     bootPage,
     presentTeamMember,
     workspacePrimaryAction,
+    openConfirm,
+    toast,
+    friendlyError,
+    statusNode,
+    emptyState,
+    registerOverlay: (name, element) => overlayRegistry.set(name, element),
   };
   bootPage();
 })();

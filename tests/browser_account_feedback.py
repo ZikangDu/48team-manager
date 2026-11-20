@@ -83,14 +83,20 @@ def main():
             link = page.locator(".team-auth-form textarea").first.input_value()
             state = parse_qs(urlsplit(link).query)["state"][0]
             callback = "http://localhost:1455/auth/callback?" + urlencode({"state": state, "code": "fixture-code"})
+            # Follow-ups default on; keep the manual push path under test here, but count the switch.
+            expect(page.get_by_label("今日切换 +1（同一成员只计一次）")).to_be_checked()
+            page.get_by_label("推送到 Sub2API（使用设置里的默认分组和代理）").uncheck()
             page.locator(".team-auth-form textarea").nth(1).fill(callback)
             page.get_by_role("button", name="完成授权", exact=True).click()
+            page.locator(".toast").filter(has_text="切换次数：今日切换 +1，现为 1 次").wait_for()
             new_row = page.locator(".management-table tr").filter(has_text="new@example.com")
-            new_row.get_by_text("已授权 · 等待额度检测", exact=True).wait_for()
+            # Rows show the short badge; the full health label lives in its tooltip and the detail drawer.
+            new_row.locator('.management-badge[title^="已授权 · 等待额度检测"]').wait_for()
             page.keyboard.press("Escape")
             expect(new_row.get_by_role("button", name="详情", exact=True)).to_have_count(1)
             push = new_row.get_by_role("button", name="推送到 Sub2API", exact=True)
-            expect(push).to_have_class("button primary")
+            # Batch 3: each row keeps one primary action (授权 / 详情); push is secondary.
+            expect(push).to_have_class("button")
             push.click()
             expect(push).to_be_enabled()
             assert len(pushes) == 2, pushes
@@ -102,22 +108,29 @@ def main():
             existing.get_by_role("button", name="授权", exact=True).click()
             page.wait_for_function("document.querySelector('#reauth-authorize-url').value.includes('state=')")
             state = parse_qs(urlsplit(page.locator("#reauth-authorize-url").input_value()).query)["state"][0]
-            page.locator('#reauth-form [name="callback_url"]').fill("http://localhost:1455/auth/callback?" + urlencode({"state": state, "code": "fixture-code-2"}))
-            page.locator("#reauth-submit").click()
-            existing.get_by_text("已授权 · 等待额度检测", exact=True).wait_for()
+            # Pasting a complete callback submits it without clicking the button.
+            page.locator('#reauth-form [name="callback_url"]').focus()
+            page.evaluate("text => { const field = document.querySelector('#reauth-form [name=callback_url]'); field.value = text;"
+                          " field.dispatchEvent(new ClipboardEvent('paste', {bubbles: true})); }",
+                          "http://localhost:1455/auth/callback?" + urlencode({"state": state, "code": "fixture-code-2"}))
+            existing.locator('.management-badge[title^="已授权 · 等待额度检测"]').wait_for()
             # A complete empty remote inventory must show deletion, not quota alone.
             expect(existing.get_by_role("button", name="更新 Sub2API", exact=True)).to_be_visible()
             page.wait_for_load_state("networkidle")
             remotes.clear()
             existing.locator('[data-remote-state="missing"]').wait_for(timeout=45000)
+            # Batch 3 moved the remote filter and the check button into "更多筛选".
+            page.locator('.management-more-filters > summary').click()
             page.locator("#management-remote").select_option("missing")
             assert page.locator(".management-table tbody tr").count() == 1
             assert "existing@example.com" in page.locator(".management-table tbody tr").inner_text()
             page.locator("#management-remote").select_option("all")
             runtime["failure"] = True
             page.get_by_role("button", name="核对 Sub2API 状态", exact=True).click()
-            existing.get_by_text("暂时无法核对 Sub2API", exact=True).wait_for()
+            # Row shows a short failure badge plus the last known state; the full reason is in the status line and tooltip.
+            existing.get_by_text("核对失败", exact=True).wait_for()
             assert "上次：远端已删除" in existing.inner_text()
+            assert "暂时无法核对 Sub2API" in existing.locator(".management-money").get_attribute("title")
             runtime["failure"] = False
             remotes.append({"id": 42, "status": "inactive", "schedulable": False, "credentials": {"email": "existing@example.com"}})
             page.get_by_role("button", name="核对 Sub2API 状态", exact=True).click()
@@ -133,7 +146,7 @@ def main():
                 assert page.evaluate("document.documentElement.scrollWidth <= innerWidth"), width
             assert not errors, errors
             assert not external, external
-            print(json.dumps({"ok": True, "checks": ["direct link", "team OAuth refresh", "inline push with workspace context", "standalone OAuth refresh", "inline update", "remote deletion", "remote filter", "network failure", "pause readback", "responsive layout"], "page_errors": errors}))
+            print(json.dumps({"ok": True, "checks": ["direct link", "team OAuth refresh", "inline push with workspace context", "standalone OAuth refresh", "paste auto-submit", "switch follow-up", "inline update", "remote deletion", "remote filter", "network failure", "pause readback", "responsive layout"], "page_errors": errors}))
             browser.close()
 
 

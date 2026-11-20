@@ -33,7 +33,7 @@ class AutomationSettings(BaseModel):
 
 class ConnectionProbeRequest(BaseModel):
     connections: ConnectionSettings | None = None
-    target: Literal["sub2api", "hme", "mail", "all"] = "all"
+    target: Literal["sub2api", "hme", "mail", "codex_rs", "all"] = "all"
 
 
 class ResourceSettings(BaseModel):
@@ -62,9 +62,44 @@ class Sub2ApiPushDefaults(BaseModel):
         return self
 
 
+class CodexRsRefillSettings(BaseModel):
+    """codex-rs auto refill config; saved as a whole block."""
+
+    enabled: bool
+    target: int = Field(ge=1, le=50)
+    daily_limit: int = Field(ge=0, le=50)  # 0 = never refill
+    workspace_ids: list[PositiveInt] = Field(max_length=500)
+
+    @model_validator(mode="after")
+    def dedupe_workspaces(self):
+        self.workspace_ids = sorted(set(self.workspace_ids))
+        return self
+
+
+class CodexRsSettings(BaseModel):
+    """codex-rs import defaults and the post-authorization push target; only sent fields are saved."""
+
+    push_target: Literal["sub2api", "codex_rs"] | None = None
+    group_ids: list[str] | None = Field(default=None, max_length=50)
+    concurrency_limit: int | None = Field(default=None, ge=1, le=4294967295)
+    concurrency_inherit: bool | None = None  # True clears concurrency_limit (inherit codex-rs global)
+    weight: int | None = Field(default=None, ge=1, le=100)
+    enabled: bool | None = None
+    refill: CodexRsRefillSettings | None = None
+    auto_reauth: bool | None = None
+
+
 class SettingsPatch(BaseModel):
     sub2api_push: Sub2ApiPushDefaults | None = None
     connections: ConnectionSettings | None = None
     automation: AutomationSettings | None = None
     resources: ResourceSettings | None = None
     password: PasswordSettings | None = None
+    codex_rs: CodexRsSettings | None = None
+
+
+class RunnerSelfcheckRequest(BaseModel):
+    """Browser environment self-check: ``platform`` null follows RUNNER_FINGERPRINT_PLATFORM."""
+
+    platform: Literal["linux", "windows"] | None = None
+    workspace_id: PositiveInt | None = None

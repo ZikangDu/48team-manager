@@ -1,0 +1,327 @@
+/* 设置页：每张卡片一块 tile（无边框、无阴影、直角），卡内分组用 12px 说明色小标题，不用边框。规范见 DESIGN.md。 */
+body:has(#settings-savebar:not([hidden])) .toast-region {
+  bottom: 112px;
+  max-height: calc(100dvh - 144px);
+}
+.page-settings { overflow: visible; }
+.settings-page { min-width: 0; }
+.settings-column {
+  display: grid;
+  gap: var(--tile-gap);
+  min-width: 0;
+}
+.settings-security .panel-body {
+  display: grid;
+  gap: var(--space-md);
+  min-width: 0;
+}
+
+.settings-columns {
+  display: grid;
+  grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr);
+  gap: var(--tile-gap);
+  align-items: start;
+}
+
+.settings-column { align-content: start; }
+.settings-security { margin-top: var(--space-lg); }
+
+/* 卡片外观沿用通用 .panel（components.css）；这里只调卡头 / 卡身的内边距 */
+.page-settings .panel-header {
+  min-height: 0;
+  padding: 16px 20px 0;
+  align-items: flex-start;
+}
+.page-settings .panel-body { padding: 12px 20px 20px; }
+.settings-page .panel-title,
+.settings-security .panel-title { font-size: var(--text-heading); font-weight: 600; }
+.settings-page p,
+.settings-security p { margin: 0; }
+
+.service-card .panel-header > div:first-child { min-width: 0; }
+.service-meta {
+  padding-top: var(--space-xxs);
+  font-size: var(--text-meta);
+  overflow-wrap: anywhere;
+}
+.service-summary { overflow-wrap: anywhere; }
+.service-edit {
+  display: grid;
+  gap: var(--space-sm);
+  padding-top: var(--space-xs);
+}
+.settings-page .service-management-grid {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  padding-block: var(--space-xxs);
+  border-block: 0;
+}
+.settings-page .service-management-grid > :last-child { grid-column: auto; width: auto; }
+.settings-page .sub2api-push-defaults { padding-top: 0; border-top: 0; }
+/* codex-rs 卡片：推送去向单选横排；导入参数小节沿用 sub2api-push-defaults 的类 */
+.codex-rs-choice-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-xs) var(--space-lg);
+}
+.codex-rs-choice-row .check { min-height: var(--control-h-sm); color: var(--text); font-size: var(--text-body); }
+.settings-page .hint.text-warn { color: var(--warning-text); }
+/* codex-rs 自动补号：团队勾选沿用 sub2api-group-options；状态区是只读小字列表 */
+#codex-rs-refill-workspaces .toolbar {
+  min-height: 0;
+  padding: 0 0 var(--space-xs);
+  background: transparent;
+}
+.codex-rs-refill-status { gap: var(--space-xxs); }
+.codex-rs-refill-paused {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-xs) var(--space-sm);
+}
+.codex-rs-refill-list {
+  margin: 0;
+  padding-left: var(--space-md);
+  font-size: var(--text-meta);
+  line-height: 1.45;
+  color: var(--text-secondary);
+  overflow-wrap: anywhere;
+}
+.settings-page .sub2api-push-defaults .panel-header {
+  padding: var(--space-sm) 0 0;
+  border: 0;
+  background: transparent;
+  align-items: center;
+}
+
+/* 卡内分组小标题：12px 说明色 */
+.settings-page .field-label,
+.settings-page .sub2api-push-defaults .panel-header strong,
+.runner-result h3 {
+  font-size: var(--text-meta);
+  font-weight: 400;
+  color: var(--muted);
+}
+
+.settings-page fieldset,
+.settings-security fieldset {
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+.settings-page legend,
+.settings-security legend {
+  padding: 0 0 var(--space-xs);
+  font-size: var(--text-meta);
+  font-weight: 400;
+  color: var(--muted);
+}
+.settings-page .automation-card .panel-body {
+  display: grid;
+  gap: var(--space-md);
+}
+.settings-page .setting-row {
+  display: grid;
+  grid-template-columns: 36px minmax(0, 1fr);
+  gap: var(--space-sm);
+  align-items: start;
+  padding-block: var(--space-xs);
+  cursor: pointer;
+}
+.setting-row > span {
+  grid-column: 2;
+  grid-row: 1;
+  min-width: 0;
+}
+.setting-row strong {
+  display: block;
+  font-size: var(--text-body);
+  font-weight: 600;
+}
+.setting-row .hint {
+  display: block;
+  margin-top: var(--space-xxs);
+  font-weight: 400;
+}
+.setting-row > input[type="checkbox"] {
+  grid-column: 1;
+  grid-row: 1;
+  width: 36px;
+  height: 22px;
+  margin: 0;
+  appearance: none;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-pill);
+  background: var(--surface-muted);
+  cursor: pointer;
+}
+.setting-row > input[type="checkbox"]::before {
+  content: "";
+  display: block;
+  width: 14px;
+  height: 14px;
+  margin: 3px;
+  border-radius: 50%;
+  background: var(--text-secondary);
+}
+.setting-row > input[type="checkbox"]:checked {
+  background: var(--primary-bg);
+  border-color: var(--primary-bg);
+}
+.setting-row > input[type="checkbox"]:checked::before {
+  transform: translateX(14px);
+  background: var(--primary-text);
+}
+/* Selecting a scope remains a checkbox; only automation on/off uses switches. */
+#auto-rotation-workspace-list .setting-row { grid-template-columns: 18px minmax(0, 1fr); }
+#auto-rotation-workspace-list input[type="checkbox"] {
+  appearance: auto;
+  width: 18px;
+  height: 18px;
+  accent-color: var(--accent);
+}
+#auto-rotation-workspace-list input::before { content: none; }
+#auto-rotation-workspaces .toolbar {
+  min-height: 0;
+  padding: 0 0 var(--space-xs);
+  background: transparent;
+}
+
+.settings-page label:has(> input:not([type="checkbox"])),
+.settings-page label:has(> select),
+.settings-page label:has(> .input-with-unit) {
+  max-width: 520px;
+  gap: var(--space-xs);
+}
+.input-with-unit {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  max-width: 320px;
+}
+.settings-page .input-with-unit input { grid-area: 1 / 1 / 2 / 3; padding-right: 80px; }
+.input-with-unit > span {
+  grid-area: 1 / 2;
+  padding-inline: var(--space-sm) 36px;
+  color: var(--muted);
+  font-size: var(--text-meta);
+  pointer-events: none;
+  white-space: nowrap;
+}
+.settings-page input[type="number"] { font-variant-numeric: tabular-nums; }
+.settings-page :is(label, fieldset).is-dirty {
+  border-inline-start: 2px solid var(--accent);
+  padding-inline-start: var(--space-xs);
+}
+
+.settings-savebar {
+  position: sticky;
+  bottom: var(--space-sm);
+  z-index: 5;
+  margin-top: var(--space-md);
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-sm);
+  padding: var(--space-sm) var(--space-md);
+  /* 浮在内容上：页面底 + 1px 细线外框，不用阴影 */
+  background: var(--surface-overlay);
+  border: 0;
+  border-radius: 0;
+  box-shadow: var(--shadow-overlay);
+}
+.settings-savebar-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-xs);
+}
+.settings-page-tools { display: flex; justify-content: flex-end; margin-bottom: var(--space-md); }
+.password-fields {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--space-md);
+}
+
+/* 浏览器环境自检：状态用图标 + 文字表达，颜色只是辅助。 */
+.settings-runner { margin-top: var(--space-lg); }
+.settings-runner .panel-title { font-size: var(--text-heading); }
+.settings-runner p { margin: 0; }
+.runner-card .kv { grid-template-columns: 150px minmax(0, 1fr); font-size: var(--text-body); }
+.runner-selfcheck-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: var(--space-sm) var(--space-md);
+}
+.runner-selfcheck-form label { display: grid; gap: var(--space-xs); min-width: 220px; }
+.runner-result {
+  display: grid;
+  gap: var(--space-sm);
+  padding-top: var(--space-xs);
+  min-width: 0;
+}
+.runner-result h3 { margin: 0; line-height: 1.4; }
+.runner-verdict,
+.runner-findings li {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-xs);
+  overflow-wrap: anywhere;
+}
+.runner-verdict { font-weight: 600; }
+.runner-icon {
+  flex: none;
+  display: inline-grid;
+  place-items: center;
+  width: 1.2em;
+  font-size: var(--text-body);
+  font-weight: 600;
+  line-height: 1;
+}
+.runner-findings {
+  display: grid;
+  gap: var(--space-xs);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.runner-findings li strong { flex: none; }
+.runner-result .is-ok { color: var(--success-text); }
+.runner-result .is-warn { color: var(--warning-text); }
+.runner-result .is-error { color: var(--danger-text); }
+.runner-findings li > span:last-child { color: var(--text); }
+.runner-signals dd { font-variant-numeric: tabular-nums; }
+.runner-shots {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: var(--space-md);
+}
+.runner-shots figure { margin: 0; display: grid; gap: var(--space-xs); }
+.runner-shots a {
+  display: block;
+  border: 0;
+  border-radius: 0;
+  overflow: hidden;
+  background: var(--surface-muted);
+}
+.runner-shots a:hover { outline: 1px solid var(--border-strong); }
+.runner-shots img { display: block; width: 100%; aspect-ratio: 16 / 9; object-fit: cover; object-position: top; }
+.runner-shots figcaption { color: var(--muted); font-size: var(--text-meta); }
+
+@media (max-width: 1024px) {
+  .settings-columns { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 720px) {
+  .password-fields { grid-template-columns: minmax(0, 1fr); }
+  .settings-savebar { bottom: 0; }
+  .settings-savebar-actions { margin-left: auto; }
+  .settings-page .panel-header { flex-wrap: wrap; }
+  .runner-card .kv { grid-template-columns: minmax(0, 1fr); }
+  .runner-selfcheck-form label { min-width: 0; width: 100%; }
+}
+@media (forced-colors: active) {
+  .setting-row > input[type="checkbox"] { appearance: auto; }
+  .setting-row > input[type="checkbox"]::before { content: none; }
+}

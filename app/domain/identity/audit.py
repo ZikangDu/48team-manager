@@ -50,10 +50,8 @@ def audit_account(
         if row.membership_state in (MEMBERSHIP_STATE_JOINED, MEMBERSHIP_STATE_INVITED)
     ]
 
-    if looks_like_gmail(account.email) and not owner_memberships:
-        result = AUDIT_CONFLICT
-        reasons.append("Gmail 无 workspace owner membership")
-
+    # An email provider is not evidence of a workspace role. Ordinary Gmail
+    # children and unassigned imported accounts use the same identity checks.
     if account.local_purpose == LOCAL_PURPOSE_MOTHER and not owner_memberships:
         result = AUDIT_CONFLICT
         reasons.append("本地用途是母号，但没有 owner membership")

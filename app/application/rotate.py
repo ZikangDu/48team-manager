@@ -15,6 +15,7 @@ from app.application.console_maintenance import purge_local_child_record
 from app.application.identity import automation_gate
 from app.application.operations import operation_store
 from app.application.quota import quota_service
+from app.application.revenue_ledger import revenue_ledger
 from app.application.settings import as_bool, get_setting_value
 from app.application.workspaces import workspace_service
 from app.core.config import load_settings
@@ -45,6 +46,16 @@ from app.persistence.models.identity import Account, ExternalBinding, Workspace,
 from app.persistence.models.operations import Operation, OperationStep
 
 logger = logging.getLogger(__name__)
+
+
+def _revenue_departure_source(reason: str, *, purge_local: bool) -> str:
+    if reason == "manual_rotation":
+        return "manual_rotation"
+    if purge_local:
+        return "purge"
+    if should_unbind_sub2api(reason):
+        return "auto_rotation"
+    return "kick"
 
 
 class RotateService:
@@ -305,6 +316,39 @@ class RotateService:
         return {"ok": confirmed, "skipped": not confirmed,
                 "code": "" if confirmed else "unauthorized_not_confirmed"}
 
+    async def _confirm_deactivated(self, db, *, account, workspace):
+        """A recorded ban must match local auth state, and a live official read may veto it."""
+        if (account is None or account.auth_state != "deactivated"
+                or str(account.last_reauth_code or "") != "account_deactivated"):
+            return {"ok": False, "skipped": True, "code": "deactivated_not_confirmed"}
+        try:
+            live = await self.quota.peek_official(db, account, workspace=workspace)
+        except Exception:
+            live = None
+        finally:
+            await db.commit()  # Release reads opened by proxy resolution.
+        # Only an official rejection confirms; success vetoes and transport errors stay unknown.
+        rejected = bool(
+            live is not None and not live.success
+            and getattr(live, "error_source", None) == "official_quota"
+            and (getattr(live, "http_status", None) in {401, 403}
+                 or "deactivated" in str(getattr(live, "error_code", "") or ""))
+        )
+        return {"ok": rejected, "skipped": not rejected,
+                "code": "" if rejected else "deactivated_not_confirmed"}
+
+    async def _consecutive_auto_failures(self, db, account_id: int, limit: int = 10) -> int:
+        """Failed automatic attempts since this account's last non-failed automatic rotation."""
+        states = list(await db.scalars(select(Operation.state).where(
+            Operation.op_type == "rotate", Operation.source == "auto", Operation.account_id == int(account_id),
+        ).order_by(Operation.created_at.desc(), Operation.id.desc()).limit(limit)))
+        count = 0
+        for state in states:
+            if state != "failed":
+                break
+            count += 1
+        return count
+
     async def _confirm_weekly_limit(
         self,
         db: AsyncSession,
@@ -548,7 +592,9 @@ class RotateService:
         invitation_only: bool = False,
         job_id: str | None = None,
         in_test: bool = False,
+        keep_remote: bool = False,
     ) -> dict[str, Any]:
+        """keep_remote: never delete the Sub2API account here, whatever the reason says."""
         busy = await operation_store.active_for_workspace(
             db,
             workspace_id,
@@ -659,8 +705,32 @@ class RotateService:
         await record_confirmed_departure(db, workspace, target)
         await db.commit()
         await self._mark_step(db, job_id, "official_removed", state="success", result={"workspace_id": workspace.id})
+        # Book revenue before any unbind / remote delete / purge wipes the binding and usage snapshots.
+        if child is not None and not should_revoke and not invitation_only:
+            await revenue_ledger.settle_departure(
+                db,
+                workspace_id=workspace.id,
+                account_id=child.id,
+                source=_revenue_departure_source(reason, purge_local=purge_local),
+                operation_id=job_id,
+            )
+            await db.commit()
+        # Disable (never delete) the codex-rs copy; a failure is only recorded, never blocks the kick.
+        codex_rs_disable = None
+        if child is not None and not invitation_only:
+            from app.application import codex_publish
+            try:
+                codex_rs_disable = await codex_publish.disable_on_departure(db, child.id, workspace.official_workspace_id)
+            except Exception as exc:  # noqa: BLE001
+                await db.rollback()
+                await db.refresh(child)  # rolled-back objects are expired; async code cannot lazy-load
+                await db.refresh(workspace)
+                codex_rs_disable = {"ok": False, "skipped": False, "error_code": "codex_rs_disable_failed", "message": str(exc)}
+            if not codex_rs_disable.get("ok") and not codex_rs_disable.get("skipped"):
+                logger.warning("codex-rs 停用失败 email=%s error=%s", target,
+                               codex_rs_disable.get("error_code") or codex_rs_disable.get("message"))
         other_context = bool(child and await has_other_active_context(db, child, workspace.id))
-        unbind = bool(unbind_sub2api or should_unbind_sub2api(reason) or purge_local)
+        unbind = False if keep_remote else bool(unbind_sub2api or should_unbind_sub2api(reason) or purge_local)
         deleted_sub = None
         remote_unbind_confirmed = False
         binding_error = None
@@ -767,6 +837,7 @@ class RotateService:
             "paused_sub2api": bool(pause_result and pause_result.get("ok") and not pause_result.get("skipped")),
             "pause_result": pause_result,
             "deleted_sub2api": deleted_sub,
+            "codex_rs_disable": codex_rs_disable,
             "error": binding_error if status == "partial" else None,
             "error_code": "sub2api_unbind_failed" if status == "partial" else None,
         }
@@ -1069,7 +1140,8 @@ class RotateService:
         # An unfinished automatic replacement blocks this workspace, not all other teams.
         occupied = {row.workspace_id for row in await operation_store.iter_running(db, WORKSPACE_LOCK_ACTIONS)}
         occupied.update(await db.scalars(select(Operation.workspace_id).where(
-            Operation.op_type == "rotate", Operation.source == "auto", Operation.archived_at.is_(None),
+            Operation.op_type == "rotate", Operation.source.in_(("auto", "manual_rotation")),
+            (Operation.source == "manual_rotation") | Operation.archived_at.is_(None),
             Operation.state.in_(("partial", "manual_required")),
         )))
         candidates = []
@@ -1085,7 +1157,8 @@ class RotateService:
                     and snapshot.credential_revision == int(child.credential_revision or 1)):
                 kind = "401"
             reason = classify_rotate_reason(
-                kind=kind, last_reauth_code=child.last_reauth_code or "",
+                # A leftover ban code after credentials were restored must not trigger rotation.
+                kind=kind, last_reauth_code=(child.last_reauth_code or "") if child.auth_state == "deactivated" else "",
                 on_deactivated=bool(cfg.get("auto_rotate_on_deactivated", True)),
                 on_weekly_limit=bool(cfg.get("auto_rotate_on_weekly_limit", True)),
             )
@@ -1112,6 +1185,10 @@ class RotateService:
                 confirmed = await self._confirm_weekly_limit(db, account=child, remote_id=remote.get("id"), workspace_id=workspace.id)
             elif reason == "unauthorized":
                 confirmed = await self._confirm_unauthorized(db, account=child, workspace_id=workspace.id)
+            elif reason == "deactivated":
+                confirmed = await self._confirm_deactivated(db, account=child, workspace=workspace)
+            else:
+                confirmed = {"ok": False, "code": "rotate_reason_unknown"}
             if not confirmed.get("ok"):
                 child.next_eligible_at = stamp + timedelta(minutes=5)
                 stats["skipped"] += 1
@@ -1180,7 +1257,8 @@ class RotateService:
                 stats["failed"] += 1
             # Keep the official reset time set during departure; never shorten it to 12h.
             if child.operational_state != "standby":
-                child.next_eligible_at = stamp + timedelta(minutes=5)
+                failures = await self._consecutive_auto_failures(db, child.id) if op.state == "failed" else 0
+                child.next_eligible_at = rotate_backoff_at(stamp, failures) if failures else stamp + timedelta(minutes=5)
             await db.commit()
             if not in_test:
                 await refresh_after_rotation(db, op.workspace_id)

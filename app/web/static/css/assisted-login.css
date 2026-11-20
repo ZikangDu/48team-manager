@@ -1,0 +1,95 @@
+/* Account tools drawer. Flat and square (DESIGN.md): one left-aligned column,
+   groups split by hairlines, state as symbol + text, green only for the one
+   primary action, the chosen option and the live step. */
+.assisted-panel { width: min(640px, 100%); max-width: 100%; }
+.assisted-header { align-items: flex-start; gap: var(--space-md); }
+.assisted-header > div { min-width: 0; }
+.assisted-header h2 { margin: 0; font-size: var(--text-heading); }
+.assisted-header p { margin: var(--space-xs) 0 0; font-size: var(--text-meta); }
+.assisted-header > button { flex-shrink: 0; }
+.assisted-tabs { display: flex; gap: var(--space-xxs); border-bottom: 1px solid var(--border); margin-top: calc(var(--space-xs) * -1); }
+.assisted-body { display: grid; gap: var(--space-lg); align-content: start; }
+.assisted-body > * { min-width: 0; }
+.assisted-form, .assisted-task, .assisted-vault { display: grid; gap: var(--space-lg); align-content: start; }
+.assisted-form > *, .assisted-task > *, .assisted-vault > * { min-width: 0; }
+
+/* Groups: a quiet 12px heading, then content. */
+.assisted-group { display: grid; gap: var(--space-sm); min-width: 0; margin: 0; padding: 0; border: 0; }
+.assisted-group > legend, .assisted-group > h3 { padding: 0; margin: 0; font-size: var(--text-meta); font-weight: 500; color: var(--muted); }
+.assisted-group > legend { margin-bottom: var(--space-sm); }
+.assisted-vault > .assisted-group + .assisted-group,
+.assisted-vault > .assisted-manual { padding-top: var(--space-lg); border-top: 1px solid var(--border); }
+.assisted-pair { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space-sm); }
+.assisted-form input:not([type="checkbox"]):not([type="radio"]),
+.assisted-vault input:not([type="checkbox"]):not([type="radio"]) { width: 100%; min-width: 0; }
+.assisted-body input[type="email"], .assisted-mono { font-family: var(--font-mono); }
+.assisted-hints { margin: 0; min-height: 1.45em; font-size: var(--text-meta); line-height: 1.45; color: var(--muted); overflow-wrap: anywhere; }
+.assisted-hints[data-tone="warning"] { color: var(--warning-text); }
+.assisted-hints[data-tone="warning"]::before { content: "▲ "; font-size: 10px; }
+.assisted-hints[data-tone="success"] { color: var(--text-secondary); }
+.assisted-hints[data-tone="success"]::before { content: "● "; font-size: 10px; color: var(--success-text); }
+
+/* The four operations: one flat block, rows split by hairlines; the chosen row steps one tile deeper. */
+.assisted-choices { display: grid; background: var(--surface); }
+.assisted-choice { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: start; column-gap: var(--space-sm); row-gap: 0;
+  padding: 10px var(--space-md); font-size: var(--text-body); color: var(--text); cursor: pointer; transition: background-color 0.15s ease; }
+.assisted-choice + .assisted-choice { border-top: 1px solid var(--border); }
+.assisted-choice:hover, .assisted-choice.is-selected { background: var(--surface-muted); }
+.assisted-choice input { width: 16px; height: 16px; margin: 3px 0 0; cursor: pointer; }
+.assisted-choice-copy { display: grid; gap: 2px; min-width: 0; }
+.assisted-choice-copy strong { font-weight: 600; }
+.assisted-choice-copy small { color: var(--muted); font-size: var(--text-meta); line-height: 1.45; }
+.assisted-choice.is-selected .assisted-choice-copy strong { color: var(--accent-text); }
+.assisted-choice:focus-within { outline: 2px solid var(--accent); outline-offset: -2px; }
+.assisted-confirm { display: flex; align-items: flex-start; gap: var(--space-xs); min-height: 0; font-size: var(--text-body); color: var(--text); }
+.assisted-confirm input { width: 16px; height: 16px; flex: 0 0 auto; margin: 3px 0 0; }
+
+.assisted-actions { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-xs); }
+.assisted-actions .button { max-width: 100%; }
+.assisted-actions .button.is-armed { color: var(--danger-text); background: var(--danger-bg); }
+.assisted-link { margin-left: var(--space-xs); color: var(--text-secondary); font-size: var(--text-body); text-decoration: underline; text-underline-offset: 3px; }
+.assisted-link:hover { color: var(--text); }
+.assisted-foot { margin: 0; font-size: var(--text-meta); line-height: 1.45; color: var(--muted); }
+
+/* Task: what is happening now, then the real sequence of steps. */
+.assisted-task-head { display: grid; gap: var(--space-xxs); }
+.assisted-task-head h3 { margin: 0; font-size: var(--text-heading); font-weight: 600; }
+.assisted-task-head p { margin: 0; font-family: var(--font-mono); font-size: var(--text-meta); color: var(--muted); overflow-wrap: anywhere; }
+.assisted-result { display: flex; align-items: baseline; gap: var(--space-xs); margin: 0; font-size: var(--text-body); line-height: 1.6; color: var(--text); overflow-wrap: anywhere; }
+.assisted-result::before { content: "○"; flex: 0 0 auto; font-size: 10px; line-height: 1; color: var(--muted); }
+.assisted-result[data-tone="accent"]::before { content: "●"; color: var(--accent-text); }
+.assisted-result[data-tone="success"] { color: var(--success-text); }
+.assisted-result[data-tone="success"]::before { content: "●"; color: inherit; }
+.assisted-result[data-tone="warning"] { color: var(--warning-text); }
+.assisted-result[data-tone="warning"]::before { content: "▲"; color: inherit; }
+.assisted-result[data-tone="danger"] { color: var(--danger-text); }
+.assisted-result[data-tone="danger"]::before { content: "✕"; color: inherit; }
+.assisted-note { margin: 0; font-size: var(--text-meta); line-height: 1.6; color: var(--text-secondary); overflow-wrap: anywhere; }
+.assisted-steps { margin: 0; }
+.assisted-steps .is-attention > .task-step-mark { border-color: var(--warning); color: var(--warning-text); }
+.assisted-steps .is-attention .task-step-copy strong,
+.assisted-steps .is-attention .task-step-copy small { color: var(--warning-text); }
+.assisted-steps .is-skipped .task-step-copy strong { color: var(--muted); }
+
+/* 2FA keys: one lookup, then what is saved for that email. */
+.assisted-lookup { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: end; gap: var(--space-sm); }
+.assisted-meta { margin: 0; font-size: var(--text-meta); color: var(--muted); font-variant-numeric: tabular-nums; }
+.assisted-manual > summary { cursor: pointer; font-size: var(--text-body); color: var(--text-secondary); list-style: none; }
+.assisted-manual > summary::-webkit-details-marker { display: none; }
+.assisted-manual > summary::before { content: "＋"; display: inline-block; width: 1.2em; color: var(--muted); }
+.assisted-manual[open] > summary::before { content: "－"; }
+.assisted-manual > summary:hover { color: var(--text); }
+.assisted-manual[open] > summary { margin-bottom: var(--space-md); }
+.assisted-manual .assisted-group { gap: var(--space-md); }
+.assisted-error { margin: 0; overflow-wrap: anywhere; }
+
+@media (max-width: 720px) {
+  .assisted-header { gap: var(--space-xs); }
+  .assisted-pair, .assisted-lookup { grid-template-columns: minmax(0, 1fr); }
+  .assisted-body input:not([type="checkbox"]):not([type="radio"]) { font-size: var(--text-heading); }
+  .assisted-actions > .button, .assisted-lookup > .button { flex: 1 1 auto; }
+  .assisted-link { margin-left: 0; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .assisted-choice { transition: none; }
+}

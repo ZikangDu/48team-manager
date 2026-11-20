@@ -17,6 +17,7 @@ MAX_PUBLISH_ATTEMPTS = 5
 
 async def preflight(service, db, workspace, child):
     """Check replacement dependencies and preserve the live role/seat before removing."""
+    from app.application.extension_runner import check_runner_proxy, runner_enabled, validate_runner_configuration
     from app.application.reauth import load_cf_config
     from app.application.resources.hme import load_config
     from app.application.sub2api_defaults import load_defaults, validate_defaults
@@ -24,13 +25,20 @@ async def preflight(service, db, workspace, child):
     from app.integrations.openai.browser.environment import validate_configuration
     from app.integrations.openai.member_adapter import normalize_official_role
 
-    validate_configuration(load_settings())
-    if getattr(load_settings(), "browser_signup_flow", "legacy") == "extension":
-        from app.integrations.openai.browser.signup import validate_signup_assets
-        validate_signup_assets()
+    extension_runner = runner_enabled()
+    if extension_runner:
+        validate_runner_configuration()
+    else:
+        validate_configuration(load_settings())
+        if getattr(load_settings(), "browser_signup_flow", "legacy") == "extension":
+            from app.integrations.openai.browser.signup import validate_signup_assets
+            validate_signup_assets()
     owner = await db.get(Account, workspace.owner_account_id)
     if owner is None or not owner.proxy or not owner.access_token_encrypted:
         raise ValueError("母号凭据或代理未就绪")
+    if extension_runner:
+        # An authenticated HTTP proxy cannot drive the Chromix subprocess; stop before removing anyone.
+        await check_runner_proxy(owner.proxy)
     if not all((await load_cf_config(db)).values()):
         raise ValueError("验证码邮箱未配置")
     if not (await load_config(db)).configured:
@@ -67,6 +75,7 @@ async def publish_replacement(db, invite, workspace_id):
     pushed = {}
     written = bool(invite.get("publish_written"))
     receipt_ok = bool(invite.get("publish_receipt_ok"))
+    outcome_unknown = False
     try:
         if written:
             if not receipt_ok:
@@ -79,31 +88,42 @@ async def publish_replacement(db, invite, workspace_id):
                         latest = (current.get("snapshot") or {}).get("latest_operation") or {}
                     receipt_ok = bool(current.get("ok") and latest.get("state") == "completed")
         else:
-            pushed = await account_sub2api_push(db, child_id, workspace_id=workspace_id)
+            options = {"rotation_operation_id": invite["rotation_operation_id"]} if invite.get("rotation_operation_id") else {}
+            pushed = await account_sub2api_push(db, child_id, workspace_id=workspace_id, **options)
             receipt_ok = bool(pushed.get("ok"))
             written = receipt_ok or pushed.get("credential_write") == "succeeded"
+            outcome_unknown = pushed.get("credential_write") == "unknown"
         await refresh(db, force=True)
         states, _ = await payloads(db)
         state = states.get((child_id, workspace_id), {})
         ready = bool(receipt_ok and not state.get("stale", True) and state.get("state") == "healthy")
     except Exception:
         await db.rollback()
+        outcome_unknown = not bool(pushed) and not written
         ready = False
     if ready:
         return {**invite, "success": True, "partial": False, "status": "success", "pushed": True,
                 "error_code": None, "error": None, "publish_pending": False,
-                "sub2api_operation_id": pushed.get("operation_id"),
+                "sub2api_operation_id": pushed.get("operation_id") or invite.get("sub2api_operation_id"),
+                "publish_written": written, "publish_receipt_ok": receipt_ok, "publish_revision": revision,
                 "message": "补位已完成授权，Sub2API 身份和可调度状态已确认"}
     return {**invite, "success": False, "partial": True, "status": "partial", "pushed": False,
             "error_code": "auto_publish_pending", "publish_pending": True,
             "publish_revision": revision, "publish_written": written, "publish_receipt_ok": receipt_ok,
+            "publish_outcome_unknown": outcome_unknown,
             "sub2api_operation_id": pushed.get("operation_id") or invite.get("sub2api_operation_id"),
             "error": "补位账号已授权，Sub2API 尚未确认可用；将仅重试同步，不重复注册"}
 
 
 async def refill_and_publish(service, db, *, seat_intent="workspace_default", **kwargs):
+    from app.application.extension_runner import runner_enabled
+
+    # Both engines use the number pool; the runner relays it to the extension (docs/contracts/phone-relay.md).
+    extension_runner = runner_enabled()
     invite = await service.onboard.refill(
-        db, **kwargs, seat_intent=seat_intent, oauth_signup=True, use_phone_pool=True,
+        db, **kwargs, seat_intent=seat_intent, oauth_signup=True,
+        use_phone_pool=True,
+        signup_runner="extension" if extension_runner else "playwright",
     )
     if not invite.get("success"):
         return invite

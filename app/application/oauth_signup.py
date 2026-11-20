@@ -7,16 +7,29 @@ from app.application.oauth_sessions import OAuthSessionError, oauth_session_stor
 from app.core.jwt import jwt_parser
 from app.domain.identity.ids import normalize_email
 from app.integrations.openai import oauth_sessions
+from app.integrations.openai.browser.onboard import NOT_REGISTERED_ERROR
 from app.integrations.openai.chatgpt import chatgpt_client
 
 
 async def run_invited_oauth_signup(
     db, *, child, workspace, password, pickup_url, use_cloudflare, cf_config,
     job_id=None, executable_path="", phone_line="",
-    browser_session=None, use_phone_pool=False,
+    browser_session=None, use_phone_pool=False, mailbox=None, login_only=False,
 ):
+    """mailbox: {"hme_base_url","hme_service_token","hme_account_id"} reads codes from HME instead of Cloudflare.
+
+    login_only stops with account_not_registered on any account-creation page (standby pool accounts).
+    """
     from app.integrations.sms.client import parse_optional_sms
 
+    hme_kwargs = {}
+    if mailbox:
+        use_cloudflare = False
+        hme_kwargs = {
+            "hme_base_url": str(mailbox.get("hme_base_url") or ""),
+            "hme_service_token": str(mailbox.get("hme_service_token") or ""),
+            "hme_account_id": str(mailbox.get("hme_account_id") or ""),
+        }
     phone, sms_url = parse_optional_sms(phone_line)
     authorize = chatgpt_client.create_oauth_authorize_url(
         client_id=oauth_sessions.CLIENT_ID,
@@ -72,6 +85,7 @@ async def run_invited_oauth_signup(
             cf_address=cf_config["address"],
             cf_admin_password=cf_config["admin_password"],
             allow_signup=False,
+            login_only=login_only,
             allow_sms=bool(phone and sms_url),
             phone=phone,
             sms_url=sms_url,
@@ -80,14 +94,17 @@ async def run_invited_oauth_signup(
             team_name=str(workspace.name or ""),
             executable_path=executable_path,
             on_stage=on_stage,
+            **hme_kwargs,
         )
         browser_result = result
         if not result.get("ok"):
             # Do not expose callback URLs, tokens or browser diagnostics to the CLI.
+            code = result.get("error_code") or "browser_failed"
             return {
                 "ok": False,
-                "error_code": result.get("error_code") or "browser_failed",
-                "error": "OAuth 授权未完成，请使用同一邮箱继续；不会自动换号",
+                "error_code": code,
+                "error": NOT_REGISTERED_ERROR if code == "account_not_registered"
+                else "OAuth 授权未完成，请使用同一邮箱继续；不会自动换号",
             }
         stored, callback = await oauth_session_store.begin_exchange(
             db, ticket, result.get("callback_url") or "",

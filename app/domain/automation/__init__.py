@@ -1,8 +1,9 @@
 """Persistent operations and automation policies."""
 
 ACTIVE_STATES = ("queued", "running", "waiting")
-TERMINAL_STATES = ("success", "partial", "failed", "cancelled", "manual_required")
+TERMINAL_STATES = ("success", "partial", "failed", "cancelled", "manual_required", "resolved")
 OPERATION_TYPES = (
+    "assisted_login",
     "quota_probe",
     "auth_probe",
     "reauth",
@@ -25,6 +26,11 @@ OPERATION_TYPES = (
     "proxy_check",
     "free_register",
     "reregister",
+    "runner_selfcheck",
+    "pool_join",
+    "codex_reauth",
+    "protocol_login",
+    "protocol_reset",
 )
 SENSITIVE_INPUT_KEYS = (
     "password",
@@ -42,8 +48,8 @@ SENSITIVE_INPUT_KEYS = (
 REDACT_VALUE_MARKERS = ("password", "passwd", "secret", "token", "verifier")
 DEFAULT_LEASE_SECONDS = 180
 MAX_LOG_ITEMS = 40
-BROWSER_ACTIONS = ("reauth", "onboard", "replenish", "rotate", "free_register", "reregister", "free")
-WORKSPACE_LOCK_ACTIONS = ("workspace_sync", "rotate", "onboard", "replenish", "reregister", "kick_member", "purge_child", "invite_child", "revoke_invite", "update_member_role")
+BROWSER_ACTIONS = ("assisted_login", "reauth", "onboard", "replenish", "rotate", "free_register", "reregister", "free", "runner_selfcheck", "pool_join", "codex_reauth")
+WORKSPACE_LOCK_ACTIONS = ("workspace_sync", "rotate", "onboard", "replenish", "reregister", "kick_member", "purge_child", "invite_child", "revoke_invite", "update_member_role", "pool_join", "codex_reauth")
 DEFAULT_AUTO_REAUTH_ENABLED = False
 DEFAULT_AUTO_REAUTH_INTERVAL_MINUTES = 30
 MIN_AUTO_REAUTH_INTERVAL_MINUTES = 5

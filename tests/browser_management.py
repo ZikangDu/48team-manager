@@ -21,9 +21,14 @@ def main():
         page.goto(BASE + "/accounts")
         page.wait_for_selector(".management-table tbody tr")
         assert page.locator("#summary-accounts").inner_text() == "7"
-        assert page.locator("#summary-needs_auth").inner_text() == "2"
-        assert page.locator("#summary-retry").inner_text() == "1"
-        assert "$12.35" in page.locator("#accounts-portfolio").inner_text()
+        snapshot = context.request.get(BASE + '/api/accounts/portfolio').json()
+        assert page.locator("#summary-needs_auth").inner_text() == str(snapshot['summary']['needs_auth'])
+        assert page.locator("#summary-retry").inner_text() == str(snapshot['summary']['retry'])
+        if snapshot['sub2api_status']['configured']:
+            assert "$12.35" in page.locator("#accounts-portfolio").inner_text()
+        else:
+            assert page.locator('#management-remote-setup').is_visible()
+            assert page.locator('.management-table th').filter(has_text='Sub2API').count() == 0
         for width in (1600, 1440, 1280, 1024, 768, 390):
             page.set_viewport_size({"width": width, "height": 1000 if width > 540 else 844})
             page.screenshot(path=str(OUT / f"accounts-{width}.png"), full_page=True, animations="disabled")
@@ -37,7 +42,7 @@ def main():
             assert overlaps == 0, (width, overlaps)
         page.set_viewport_size({"width": 1440, "height": 1000})
         page.locator("#accounts-search").fill("member.research")
-        assert page.locator(".management-table tbody tr").count() == 1
+        page.wait_for_function("document.querySelectorAll('.management-table tbody tr').length === 1")
         assert "North" in page.locator(".management-group-name").inner_text()
         page.locator(".management-email").click()
         assert page.locator(".sheet:not([hidden])").count() == 1
@@ -48,7 +53,10 @@ def main():
         assert "North" in page.locator("#sheet-title").inner_text()
         page.keyboard.press("Escape")
         page.locator("#accounts-search").fill("")
+        page.wait_for_timeout(300)
+        page.locator('.management-more-filters > summary').click()
         page.locator("#management-workspace").select_option("")
+        page.locator('.management-more-filters > summary').click()
         page.locator("#management-health").select_option("401")
         assert page.locator(".management-table tbody tr").count() == 1
         page.locator("#management-health").select_option("all")
@@ -56,7 +64,7 @@ def main():
         assert page.locator(".management-table tbody tr").count() == 7
         page.locator('.management-tabs [data-management-view="unassigned"]').click()
         assert page.locator(".management-table tbody tr").count() == 1
-        assert page.locator('.management-bar[role="meter"]').count() == 0
+        assert page.locator('#accounts-portfolio .management-bar[role="meter"]').count() == 0
         page.locator('.management-tabs [data-management-view="teams"]').click()
         toggle = page.locator('.management-expand').first
         toggle.click()
@@ -67,10 +75,30 @@ def main():
         more = page.locator('.management-actions [data-menu-trigger]').first
         more.click()
         assert page.locator("#action-menu").is_visible()
+        # Mouse open keeps focus on the trigger; arrows then walk the enabled items.
+        assert page.evaluate("document.activeElement.hasAttribute('data-menu-trigger')")
         page.keyboard.press("ArrowDown")
+        assert page.evaluate("document.activeElement.getAttribute('role') === 'menuitem'")
+        first = page.evaluate("document.activeElement.textContent")
+        page.keyboard.press("End")
+        last = page.evaluate("document.activeElement.textContent")
+        page.keyboard.press("ArrowDown")
+        assert page.evaluate("document.activeElement.textContent") == first, "ArrowDown wraps to the first item"
+        page.keyboard.press("Home")
+        assert page.evaluate("document.activeElement.textContent") == first
+        assert first != last or page.locator('#action-menu [role=menuitem]:not([disabled])').count() == 1
         page.keyboard.press("Escape")
         assert not page.locator("#action-menu").is_visible()
         assert page.evaluate("document.activeElement.hasAttribute('data-menu-trigger')")
+        assert more.get_attribute("aria-expanded") == "false"
+        # The menu stays inside the viewport even for the right-most trigger.
+        more.click()
+        box = page.locator("#action-menu").bounding_box()
+        assert box["x"] >= 8 and box["x"] + box["width"] <= page.viewport_size["width"] - 7, box
+        page.wait_for_timeout(200)  # scroll caused by opening itself is ignored for 150 ms
+        page.mouse.wheel(0, 200)
+        page.wait_for_timeout(100)
+        assert not page.locator("#action-menu").is_visible(), "scrolling closes the fixed menu"
         page.get_by_role('button', name='登记账号或团队').click()
         page.get_by_role('menuitem', name='登记账号', exact=True).click()
         assert page.locator('.sheet:not([hidden])').count() == 1

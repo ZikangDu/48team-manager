@@ -57,11 +57,13 @@ test('pagination splits large teams while retaining each workspace context', () 
   assert.equal(second.items[5].group, null);
 });
 test('filters apply before pagination and deleting the final page clamps to the last page', () => {
-  const accounts = Array.from({length: 21}, (_, i) => ({id:i + 1, purpose:i < 10 ? 'child' : 'standby'}));
+  const accounts = Array.from({length: 31}, (_, i) => ({id:i + 1, purpose:i < 10 ? 'child' : 'standby'}));
   const entries = filteredEntries({accounts}, 'all', new URLSearchParams('purpose=standby'));
-  assert.equal(entries.length, 11);
-  assert.equal(pageWindow(entries, 5, 10).page, 2);
-  assert.equal(pageWindow(entries.slice(0, 10), 2, 10).page, 1);
+  assert.equal(entries.length, 21);
+  assert.equal(pageWindow(entries, 5, 20).page, 2);
+  assert.equal(pageWindow(entries.slice(0, 20), 2, 20).page, 1);
+  // Retired page size falls back to the default.
+  assert.equal(pageWindow(entries, 1, 10).size, 20);
   assert.equal(pageWindow(entries, '-3', 'bad').size, 20);
   assert.equal(pageWindow([], 100, 20).page, 1);
 });
@@ -69,4 +71,60 @@ test('attention and remote filters still inspect all rows before slicing', () =>
   const accounts = [{id:1, health:{code:'healthy'}, remote_status:{state:'missing'}}, {id:2, health:{code:'healthy'}, remote_status:{state:'healthy'}}];
   assert.equal(filteredEntries({accounts}, 'attention', new URLSearchParams()).length, 1);
   assert.equal(filteredEntries({accounts}, 'all', new URLSearchParams('remote=missing'))[0].account.id, 1);
+});
+
+const {sortAccounts, activeFilters} = window.Team48Accounts;
+test('column sorting orders the whole filtered set, not just the visible page', () => {
+  const accounts = [
+    {id:1, email:'b@example.com', quota:{seven_day_used_percent:10}, latest_check:{checked_at:'2026-09-01T00:00:00Z'}},
+    {id:2, email:'a@example.com', quota:{seven_day_used_percent:90}, latest_check:{checked_at:'2026-09-03T00:00:00Z'}},
+    {id:3, email:'c@example.com', quota:{}, latest_check:{}},
+  ];
+  const ids = (sort) => [...sortAccounts(accounts, new URLSearchParams(sort))].map(a => a.id);
+  assert.deepEqual(ids('sort=email'), [2, 1, 3]);
+  assert.deepEqual(ids('sort=-email'), [3, 1, 2]);
+  assert.deepEqual(ids('sort=quota'), [3, 1, 2]);
+  assert.deepEqual(ids('sort=-checked'), [2, 1, 3]);
+  assert.deepEqual(ids(''), [1, 2, 3]);
+  assert.deepEqual(ids('sort=unknown'), [1, 2, 3]);
+  const entries = filteredEntries({accounts}, 'all', new URLSearchParams('sort=-quota'));
+  assert.deepEqual([...entries].map(entry => entry.account.id), [2, 1, 3]);
+  assert.deepEqual([...accounts].map(a => a.id), [1, 2, 3], 'sorting must not mutate the source list');
+});
+test('active filters ignore defaults so the clear control only appears when filtering', () => {
+  assert.deepEqual([...activeFilters(new URLSearchParams('view=all&purpose=all&health=all'))], []);
+  assert.deepEqual([...activeFilters(new URLSearchParams('q=north&team=7&remote=missing'))], ['q', 'team', 'remote']);
+  assert.deepEqual([...activeFilters(new URLSearchParams('q=all'))], ['q']);
+});
+
+test('numeric sorting distinguishes unknown from zero and keeps equal rows stable', () => {
+  const accounts = [
+    {id: 1, quota: {seven_day_used_percent: 0}},
+    {id: 2, quota: {seven_day_used_percent: null}},
+    {id: 3, quota: {seven_day_used_percent: 0}},
+  ];
+  const ids = sort => [...sortAccounts(accounts, new URLSearchParams({sort}))].map(a => a.id);
+  assert.deepEqual(ids('quota'), [2, 1, 3]);
+  assert.deepEqual(ids('-quota'), [1, 3, 2]);
+});
+
+
+test('team pagination keeps each complete group together including oversized teams', () => {
+  const {teamPageWindow} = window.Team48Accounts;
+  const groups = [6,6,6,6,25].map((size,i)=>({id:i+1,members:Array.from({length:size},(_,j)=>({id:i*30+j,email:`${i}-${j}`}))}));
+  const entries = filteredEntries({groups},'teams',new URLSearchParams());
+  assert.equal(teamPageWindow(entries,1,20).items.length,18);
+  assert.deepEqual([...new Set(teamPageWindow(entries,2,20).items.map(e=>e.group.id))] ,[4]);
+  assert.equal(teamPageWindow(entries,3,20).items.length,25);
+  assert.equal(teamPageWindow(entries,99,20).page,3);
+});
+test('quota sorting orders groups by their worst member without interleaving them', () => {
+  const groups=[{id:1,members:[{id:1,quota:{seven_day_used_percent:20}},{id:2,quota:{seven_day_used_percent:90}}]},
+    {id:2,members:[{id:3,quota:{seven_day_used_percent:100}},{id:4,quota:{seven_day_used_percent:10}}]}];
+  const entries=filteredEntries({groups},'teams',new URLSearchParams('sort=-quota'));
+  assert.deepEqual([...entries].map(e=>e.account.id),[3,4,2,1]);
+});
+test('attention view honors the shared server flag over a stale health label', () => {
+  const accounts=[{id:1,health:{code:'healthy'},needs_attention:true}, {id:2,health:{code:'pending'},needs_attention:false}];
+  assert.deepEqual([...filteredEntries({accounts},'attention',new URLSearchParams())].map(e=>e.account.id),[1]);
 });

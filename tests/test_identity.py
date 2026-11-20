@@ -187,7 +187,7 @@ class IdentitySessionTests(unittest.IsolatedAsyncioTestCase):
         await self.session.close()
         await self.engine.dispose()
 
-    async def test_gmail_without_owner_membership_is_conflict(self):
+    async def test_gmail_child_without_membership_is_unbound(self):
         self.session.add(
             Account(
                 email="pro.user@gmail.com",
@@ -200,9 +200,8 @@ class IdentitySessionTests(unittest.IsolatedAsyncioTestCase):
         await self.session.commit()
         report = await audit_identity(self.session)
         finding = report["findings"][0]
-        self.assertEqual(finding["result"], AUDIT_CONFLICT)
-        self.assertIn("Gmail 无 workspace owner membership", finding["reasons"])
-        self.assertEqual(finding["automation"], "blocked")
+        self.assertEqual(finding["result"], AUDIT_UNBOUND)
+        self.assertNotIn("Gmail 无 workspace owner membership", finding["reasons"])
         self.assertNotEqual(finding["local_purpose"], "mother")
 
     async def test_name_like_mother_without_owner_membership_is_conflict(self):

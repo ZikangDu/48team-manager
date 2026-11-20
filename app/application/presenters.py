@@ -13,6 +13,7 @@ STATUS_LABELS = {
     "cancelled": "已取消",
     "manual_required": "需人工",
     "partial": "部分完成",
+    "resolved": "已人工结束",
     "pending": "待确认",
     "verified": "已验证",
     "missing": "缺失",
@@ -46,11 +47,12 @@ MEMBERSHIP_STATUS_LABELS = {
 }
 
 OPERATION_TYPE_LABELS = {
+    "assisted_login": "官方浏览器登录",
     "quota_probe": "额度刷新",
     "auth_probe": "检查授权",
     "reauth": "授权",
     "onboard": "拉人",
-    "replenish": "补充 Team",
+    "replenish": "补充团队",
     "rotate": "轮转",
     "kick_member": "踢出成员",
     "purge_child": "永久删除子号",
@@ -67,6 +69,9 @@ OPERATION_TYPE_LABELS = {
     "proxy_check": "代理检测",
     "free_register": "空闲号注册",
     "reregister": "重注册",
+    "runner_selfcheck": "浏览器环境自检",
+    "pool_join": "号池拉入",
+    "codex_reauth": "rs 邮箱重授权",
 }
 
 BUSINESS_STEP_LABELS = {
@@ -77,6 +82,14 @@ BUSINESS_STEP_LABELS = {
     "official_removed": "已确认旧账号离组",
     "kicked": "旧账号已移出",
     "refill": "完成补位与同步",
+    "continue": "继续未完成的轮转",
+    "kicking": "移出旧成员",
+    "vacancy": "确认空位",
+    "joined": "新号注册并入组",
+    "published": "新号推送并确认可用",
+    "old_remote_deleted": "删除旧号 Sub2API 记录",
+    "counted": "计数并完成",
+    "oauth_same_session": "同一浏览器继续授权",
     "queued": "排队",
     "done": "结束",
     "success": "结束",
@@ -84,6 +97,7 @@ BUSINESS_STEP_LABELS = {
     "partial": "部分完成",
     "manual_required": "需人工",
     "cancelled": "已取消",
+    "resolved": "已人工结束",
     "fetch_members": "读取官方成员",
     "fetch_invites": "读取官方邀请",
     "commit_snapshot": "提交官方快照",
@@ -103,6 +117,7 @@ BUSINESS_STEP_LABELS = {
     "invited": "邀请已确认",
     "invite_mail": "等待邀请邮件",
     "browser": "注册与入组",
+    "signup_runner": "新版注册流程",
     "browser_open": "打开邀请或授权页面",
     "email_otp": "等待邮箱验证码",
     "about_you": "填写注册资料",
@@ -115,10 +130,102 @@ BUSINESS_STEP_LABELS = {
     "mailbox": "绑定邮箱",
     "authorizing": "自动授权",
     "authorized": "已授权",
+    "codex_push": "更新并核对 rs 账号",
     "auth_failed": "授权失败",
     "blocked": "已拦截",
     "hme_failed": "领取邮箱失败",
+    # Extension runner (Chromix + real extension) stages.
+    "browser_environment": "准备浏览器环境",
+    "runner_started": "浏览器已启动",
+    "runner_signup_done": "插件已完成注册",
+    "runner_joined": "官方已确认入组",
+    "runner_authorizing": "插件授权中",
+    "runner_callback": "已收到授权回调",
+    "runner_authorized": "插件授权完成",
+    "runner_diagnostics": "运行诊断",
+    "pool_finish": "推送并计数",
+    "pool_label": "更新 HME 标签",
 }
+
+
+# Presentation only: these are workflow stages, not a percentage or proof of completion.
+_BROWSER_STAGES = ("browser", "signup_runner", "browser_environment", "runner_started", "runner_signup_done",
+                   "browser_open", "email_otp", "about_you", "workspace", "add_phone", "sms_otp", "oauth", "browser_failed")
+_RUNNER_AUTH_STAGES = ("runner_authorizing", "runner_callback", "runner_authorized")
+_ONBOARD_PLAN = (
+    ("checking", ("checking", "blocked")),
+    ("hme", ("hme", "hme_failed")),
+    ("inviting", ("inviting", "invited", "invite_mail", "skip_invite", "invite_failed", "invite_role_mismatch")),
+    ("browser", _BROWSER_STAGES),
+    ("reconciling", ("reconciling", "not_joined", "runner_joined")),
+    ("authorizing", ("authorizing", "authorized", "auth_failed") + _RUNNER_AUTH_STAGES),
+    ("active", ("active",)),
+)
+OPERATION_STAGE_PLANS = {
+    "codex_reauth": (("authorizing", ("authorizing",) + _BROWSER_STAGES),
+                     ("authorized", ("authorized",)), ("codex_push", ("codex_push",))),
+    "onboard": _ONBOARD_PLAN,
+    "replenish": _ONBOARD_PLAN,
+    "pool_join": (("kicked", ("kicking", "official_removed", "kicked")),) + _ONBOARD_PLAN[:-1] + (
+        ("pool_finish", ("pool_finish",)),
+        ("pool_label", ("pool_label",)),
+        _ONBOARD_PLAN[-1],
+    ),
+    "runner_selfcheck": (
+        ("browser_environment", ("browser_environment",)),
+        ("runner_started", ("runner_started",)),
+        ("runner_diagnostics", ("runner_diagnostics",)),
+    ),
+    "rotate": (
+        ("preflight", ("preflight",)), ("confirm_trigger", ("confirm_trigger",)),
+        ("paused", ("paused",)), ("drained", ("drained",)),
+        ("official_removed", ("official_removed", "kicked")),
+        ("refill", tuple(code for _, codes in _ONBOARD_PLAN for code in codes) + ("refill",)),
+    ),
+    "kick_member": (("official_removed", ("official_removed",)), ("paused", ("paused", "drained")), ("kicked", ("kicked",))),
+}
+_ONBOARD_CODES = tuple(code for _, codes in _ONBOARD_PLAN for code in codes)
+# Manual rotation records each stage separately; the new account's publish is not the old one's cleanup.
+MANUAL_ROTATION_PLAN = (
+    ("preflight", ("preflight", "continue")),
+    ("paused", ("paused", "drained")),
+    ("kicked", ("kicking", "official_removed", "kicked", "vacancy")),
+    ("joined", tuple(code for code in _ONBOARD_CODES
+                     if code not in {"authorizing", "authorized", "auth_failed", "active", *_RUNNER_AUTH_STAGES}) + ("joined",)),
+    ("authorized", ("authorizing", "authorized", "auth_failed", "oauth_same_session") + _RUNNER_AUTH_STAGES),
+    ("published", ("sub2api_push", "published")),
+    ("old_remote_deleted", ("old_remote_deleted",)),
+    ("counted", ("counted",)),
+)
+
+
+def operation_stage_plan(kind: str, source: str | None = None) -> list[dict[str, Any]]:
+    plan = MANUAL_ROTATION_PLAN if kind == "rotate" and source == "manual_rotation" else OPERATION_STAGE_PLANS.get(kind, ())
+    return [{"code": code, "label": BUSINESS_STEP_LABELS.get(code, code), "stages": list(stages)}
+            for code, stages in plan]
+
+
+def account_attention(item: dict[str, Any]) -> list[dict[str, str]]:
+    """Shared local read-model evidence; categories may overlap on one account."""
+    reasons = {}
+    for context in item.get("contexts") or [item]:
+        health = context.get("health") or {}
+        code = health.get("code")
+        if health.get("needs_auth") or context.get("needs_auth"):
+            reasons["auth"] = "需要授权"
+        quota = context.get("last_success_quota") or context.get("quota") or {}
+        if code == "quota_exhausted" or any(isinstance(quota.get(key), (int, float)) and quota[key] >= 100
+                                           for key in ("five_hour_used_percent", "seven_day_used_percent")):
+            reasons["quota"] = "额度用尽"
+        if code not in {None, "healthy", "disabled", "quota_exhausted"} and not health.get("needs_auth"):
+            reasons["check"] = health.get("label") or "检测需处理"
+        remote = context.get("remote_status") or {}
+        if any(state.get("state") in {"missing", "auth_error", "error", "forbidden", "phone_required", "identity_mismatch", "identity_unconfirmed", "binding_review"}
+               for state in remote.get("bindings") or [remote]):
+            reasons["remote"] = "远端状态需核对"
+        if context.get("state") == "conflict":
+            reasons["identity"] = "身份冲突"
+    return [{"code": code, "label": label} for code, label in reasons.items()]
 
 
 AUTH_NEED_STATES = frozenset({

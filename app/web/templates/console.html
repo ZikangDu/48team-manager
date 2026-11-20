@@ -1,38 +1,45 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="dark">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{{ title }} · 48 Team Manager</title>
-  <link rel="stylesheet" href="/static/css/tokens.css">
-  <link rel="stylesheet" href="/static/css/app.css">
-  <link rel="stylesheet" href="/static/css/components.css">
-  <link rel="stylesheet" href="/static/css/management.css">
-  {% if page == 'overview' %}<link rel="stylesheet" href="/static/css/runtime.css">{% endif %}
-  <link rel="icon" href="/static/logo.svg" type="image/svg+xml">
+  <script src="{{ static_url('js/theme.js') }}"></script>
+  <link rel="stylesheet" href="{{ static_url('css/tokens.css') }}">
+  <link rel="stylesheet" href="{{ static_url('css/app.css') }}">
+  <link rel="stylesheet" href="{{ static_url('css/components.css') }}">
+  <link rel="stylesheet" href="{{ static_url('css/task-progress.css') }}">
+  <link rel="stylesheet" href="{{ static_url('css/management.css') }}">
+  <link rel="stylesheet" href="{{ static_url('css/workspace-purchase.css') }}">
+  {% if page == 'accounts' %}<link rel="stylesheet" href="{{ static_url('css/auth-bridge.css') }}"><link rel="stylesheet" href="{{ static_url('css/assisted-login.css') }}">{% endif %}
+  {% if page == 'overview' %}<link rel="stylesheet" href="{{ static_url('css/runtime.css') }}">{% endif %}
+  {% if page == 'settings' %}<link rel="stylesheet" href="{{ static_url('css/settings.css') }}">{% endif %}
+  {% if page == 'pool' %}<link rel="stylesheet" href="{{ static_url('css/pool.css') }}">{% endif %}
+  <link rel="icon" href="{{ static_url('logo.svg') }}" type="image/svg+xml">
 </head>
 <body data-page="{{ page }}">
   <div class="shell">
     <aside class="sidebar" id="sidebar">
       <div class="brand">
-        <img class="brand-logo" src="/static/logo.svg" alt="">
+        <img class="brand-logo" src="{{ static_url('logo.svg') }}" alt="">
         <div>
           <strong>48 Team Manager</strong>
           <span>团队号后台</span>
         </div>
       </div>
       <nav class="nav">
-        <a href="/" class="nav-link{% if page == 'overview' %} is-active{% endif %}">总览</a>
-        <a href="/accounts" class="nav-link{% if page == 'accounts' %} is-active{% endif %}">账号与团队</a>
-        <a href="/operations" class="nav-link{% if page == 'operations' %} is-active{% endif %}">任务记录</a>
+        <a href="/" class="nav-link{% if page == 'overview' %} is-active{% endif %}"{% if page == 'overview' %} aria-current="page"{% endif %}>总览</a>
+        <a href="/accounts" class="nav-link{% if page == 'accounts' %} is-active{% endif %}"{% if page == 'accounts' %} aria-current="page"{% endif %}>账号与团队</a>
+        <a href="/operations" class="nav-link{% if page == 'operations' %} is-active{% endif %}"{% if page == 'operations' %} aria-current="page"{% endif %}>任务</a>
         <p class="nav-label">资源</p>
-        <a href="/resources/phones" class="nav-link{% if page == 'phones' %} is-active{% endif %}">手机号</a>
-        <a href="/resources/hme" class="nav-link{% if page == 'hme' %} is-active{% endif %}">HME</a>
-        <a href="/resources/proxies" class="nav-link{% if page == 'proxies' %} is-active{% endif %}">代理</a>
-        <a href="/settings" class="nav-link{% if page == 'settings' %} is-active{% endif %}">设置</a>
+        <a href="/resources/pool" class="nav-link{% if page == 'pool' %} is-active{% endif %}"{% if page == 'pool' %} aria-current="page"{% endif %}>备用号池</a>
+        <a href="/resources/phones"class="nav-link{% if page == 'phones' %} is-active{% endif %}"{% if page == 'phones' %} aria-current="page"{% endif %}>手机号</a>
+        <a href="/resources/hme" class="nav-link{% if page == 'hme' %} is-active{% endif %}"{% if page == 'hme' %} aria-current="page"{% endif %}>HME</a>
+        <a href="/resources/proxies" class="nav-link{% if page == 'proxies' %} is-active{% endif %}"{% if page == 'proxies' %} aria-current="page"{% endif %}>代理</a>
+        <a href="/settings" class="nav-link{% if page == 'settings' %} is-active{% endif %}"{% if page == 'settings' %} aria-current="page"{% endif %}>设置</a>
       </nav>
       <div class="sidebar-foot">
-        <div class="health-line"><span class="dot"></span> 控制台已连接</div>
+        <div class="health-line" id="global-runner-status">正在读取调度状态</div>
         <div class="muted">{{ app_version }}</div>
       </div>
     </aside>
@@ -44,13 +51,17 @@
           <p class="muted" id="page-subtitle">{{ subtitle }}</p>
         </div>
         <div class="topbar-actions">
+          {% include 'theme-select.html' %}
+          <button type="button" class="button" id="task-center-open" aria-haspopup="dialog" aria-controls="task-center">任务</button>
           {% if page == 'accounts' %}
           <button type="button" class="button" id="check-all-accounts"><span aria-hidden="true">↻</span> 立即检查</button>
+          <button type="button" class="button" id="assisted-login-open" aria-haspopup="dialog" aria-controls="assisted-login-sheet">登录与安全</button>
+          <button type="button" class="button" id="credential-import-open" aria-haspopup="dialog" aria-controls="credential-import-sheet">导入授权凭据</button>
           <button type="button" class="button primary" data-open-register><span aria-hidden="true">＋</span> 登记团队</button>
-          {% elif page == 'workspaces' %}
-          <button type="button" class="button primary" data-open-register>登记团队</button>
           {% elif page == 'hme' %}
           <button type="button" class="button primary" data-action-page="hme-reconcile">对账 HME</button>
+          {% elif page == 'pool' %}
+          <button type="button" class="button primary" data-open-pool-import>导入邮箱</button>
           {% endif %}
         </div>
       </header>
@@ -62,75 +73,31 @@
         </div>
         {% if page == 'overview' %}
         <section class="summary-strip" id="overview-summary" aria-label="运营摘要">
-          <a class="summary-item" href="/workspaces"><span class="summary-label">工作区</span><strong class="tabular" data-summary="workspaces">—</strong></a>
+          <a class="summary-item" href="/accounts?view=teams"><span class="summary-label">团队</span><strong class="tabular" data-summary="workspaces">—</strong></a>
           <a class="summary-item" href="/accounts"><span class="summary-label">账号</span><strong class="tabular" data-summary="accounts">—</strong></a>
-          <a class="summary-item" href="/"><span class="summary-label">待处理</span><strong class="tabular" data-summary="attention">—</strong></a>
+          <a class="summary-item" href="/accounts?view=attention"><span class="summary-label">待处理账号</span><strong class="tabular" data-summary="attention">—</strong><small id="overview-attention-breakdown"></small></a>
           <a class="summary-item" href="/accounts?purpose=conflict"><span class="summary-label">身份冲突</span><strong class="tabular" data-summary="conflicts">—</strong></a>
+          <div class="summary-item"><span class="summary-label">今日收入<small class="summary-hint" hidden></small></span><strong class="tabular" data-summary="revenue_today">—</strong></div>
+          <div class="summary-item"><span class="summary-label">近 7 天收入<small class="summary-hint" hidden></small></span><strong class="tabular" data-summary="revenue_seven_day">—</strong></div>
+          <div class="summary-item"><span class="summary-label">本月入账</span><strong class="tabular" data-summary="revenue_month">—</strong></div>
+          <div class="summary-item summary-item-wide"><span class="summary-label">团队收入<small class="summary-hint" hidden></small></span><strong class="tabular" data-summary="revenue_total">—</strong></div>
+          <a class="summary-item" href="/settings#codex-rs" id="overview-codex-rs"><span class="summary-label">codex-rs 可用</span><strong class="tabular" data-summary="codex_rs_refill">—</strong><small class="hint" id="overview-codex-rs-note" hidden></small></a>
         </section>
-        <section class="runtime-status" id="runtime-status" aria-labelledby="runtime-title">
-          <header class="runtime-header">
-            <h2 id="runtime-title">后台运行状态</h2>
-            <span id="runtime-counts" role="status">正在读取状态</span>
-            <a href="/operations">任务详情</a>
-            <button type="button" class="button ghost" id="runtime-refresh" title="刷新运行状态" aria-label="刷新运行状态">↻</button>
-          </header>
-          <div class="runtime-health"><span id="runtime-runner">执行状态未知</span><span id="runtime-browser">浏览器状态未知</span><time id="runtime-updated"></time></div>
-          <p id="runtime-error" role="status" hidden></p>
-          <div class="runtime-content">
-            <div class="runtime-current"><div id="runtime-active"></div><p id="runtime-idle" hidden>当前没有待执行任务</p><a id="runtime-more" href="/operations?state=running,queued,waiting,manual_required" hidden></a></div>
-            <div id="runtime-policies" aria-label="自动化策略"></div>
-          </div>
-          <div class="runtime-recent"><h3>最近记录</h3><ul id="runtime-recent"></ul><p id="runtime-recent-empty" hidden>暂无任务记录</p></div>
-        </section>
-        <div class="overview-layout">
-          <div class="overview-main">
-            <section class="panel" id="overview-health-panel">
-              <div class="panel-header"><span class="panel-title">工作区资产</span></div>
-              <div class="panel-body compact" id="overview-health">正在加载工作区…</div>
-            </section>
-          </div>
-          <aside class="overview-side">
-            <section class="panel" id="overview-attention-panel">
-              <div class="panel-header"><span class="panel-title">待处理</span></div>
-              <div class="panel-body compact" id="overview-attention">正在加载总览…</div>
-            </section>
-          </aside>
-        </div>
-        {% elif page == 'workspaces' %}
-        <section class="panel table-shell">
-          <div class="toolbar">
-            <input class="search" id="workspaces-search" placeholder="搜名称、母号或 Workspace ID" data-entity="workspace" autocomplete="off">
-            <button type="button" class="button" data-action-page="workspace-sync-all">同步全部</button>
-            <span class="toolbar-count muted" id="workspaces-count"></span>
-          </div>
-          <div class="table-scroll">
-            <table class="data-table">
-              <thead>
-                <tr>
-                  <th scope="col">工作区</th>
-                  <th scope="col">母号</th>
-                  <th scope="col" class="num">官方 / 本地</th>
-                  <th scope="col">健康</th>
-                  <th scope="col">最近同步</th>
-                  <th scope="col">操作</th>
-                </tr>
-              </thead>
-              <tbody id="workspaces-body"><tr><td colspan="6" class="muted">正在加载工作区…</td></tr></tbody>
-            </table>
-          </div>
+        <section class="team-board" id="team-board" aria-labelledby="team-board-title">
+          <header class="team-board-header"><h2 id="team-board-title">团队看板</h2><a href="/accounts?view=attention">查看待处理</a></header>
+          <div id="team-board-root" class="overview-layout"><p class="muted">正在加载团队…</p></div>
+          <details class="team-board-resources" id="overview-attention-panel"><summary>资源与任务提醒</summary><div id="overview-resource-attention"></div><div id="overview-attention" hidden></div><div id="overview-health" hidden></div></details>
         </section>
         {% elif page == 'accounts' %}
-        <section class="panel" aria-label="自动轮转">
-          <div class="panel-header">
-            <span class="panel-title">自动轮转</span>
+        <details class="auto-rotation-disclosure" aria-label="自动轮转">
+          <summary><strong>自动轮转</strong><span id="auto-rotation-summary" class="muted">正在读取状态…</span><span class="muted">设置</span></summary>
+          <div class="auto-rotation-options stack">
             <button type="button" class="button" id="auto-rotation-toggle" aria-pressed="false" disabled>读取状态…</button>
-          </div>
-          <div class="panel-body stack">
-            <p class="hint">开启后持续检查周额度耗尽、确认的 401 或已停用的子号，自动补位、授权并同步到 Sub2API。使用 HME 和已配置的手机号池。</p>
+            <p class="hint">检查周额度耗尽、确认的 401 或已停用的子号；使用 HME 和已配置的手机号池自动补位、授权并同步到 Sub2API。</p>
             <p id="auto-rotation-status" class="muted" role="status">正在读取后台状态…</p>
-            <a href="/settings#auto-rotation-scope">选择工作空间、批量启用或设置全局范围</a>
+            <a href="/settings#auto-rotation-scope">选择团队、批量启用或设置全局范围</a>
           </div>
-        </section>
+        </details>
         <section class="management-summary" aria-label="账号与团队摘要">
           <button type="button" data-management-view="teams"><span>团队</span><strong id="summary-teams">—</strong><small>已登记团队</small></button>
           <button type="button" data-management-view="all"><span>已管理账号</span><strong id="summary-accounts">—</strong><small>跨团队去重</small></button>
@@ -142,14 +109,15 @@
             <button type="button" data-management-view="teams" aria-pressed="true">按团队</button>
             <button type="button" data-management-view="all" aria-pressed="false">全部账号</button>
             <button type="button" data-management-view="unassigned" aria-pressed="false">未分配</button>
-            <button type="button" data-management-view="attention" aria-pressed="false">待处理</button>
+            <button type="button" data-management-view="attention" aria-pressed="false">待处理 <span id="accounts-attention-count"></span></button>
           </div>
           <span id="probe-runtime" class="muted" role="status"></span>
         </div>
+        <p id="management-remote-setup" class="management-service-notice" hidden>Sub2API 未配置，计费与远端同步不可用 · <a href="/settings">去设置</a></p>
         <section class="management-content">
           <div class="toolbar">
-            <input class="search" id="accounts-search" placeholder="搜邮箱、团队、Workspace ID、远端 ID" data-entity="account" autocomplete="off">
-            <select class="filter" data-filter="purpose">
+            <input class="search" id="accounts-search" aria-label="搜索账号或团队" placeholder="搜邮箱、团队或 Workspace ID" data-entity="account" autocomplete="off">
+            <select class="filter" data-filter="purpose" aria-label="本地用途">
               <option value="all">全部</option>
               <option value="mother">母号</option>
               <option value="child">子号</option>
@@ -165,26 +133,40 @@
               <option value="healthy">检测正常</option><option value="forbidden">访问被拒绝</option>
               <option value="credential_error">本地凭证异常</option><option value="pending">待验证</option>
             </select>
-            <select class="filter" id="management-workspace" aria-label="团队"><option value="">全部团队</option></select>
-            <button type="button" class="button" data-action-page="workspace-sync-all" title="同步全部团队的官方成员"><span aria-hidden="true">↻</span> 同步全部团队</button>
-            <span class="toolbar-count muted" id="accounts-count"></span>
-            <select class="filter" id="management-remote" aria-label="Sub2API 远端状态">
-              <option value="all">全部 Sub2API 状态</option>
-              <option value="missing">远端已删除 / 不存在</option><option value="healthy">远端正常</option>
-              <option value="paused">远端已暂停</option><option value="attention">远端异常 / 待核对</option>
-              <option value="rate_limited">远端限流 / 限额</option><option value="unknown">远端状态未确认</option>
-              <option value="unbound">未绑定 Sub2API</option>
+            <select class="filter" id="management-switches" aria-label="今日切换次数" title="按团队今日切换次数筛选，北京时间 00:00 清零；未分配账号不显示">
+              <option value="all">全部切换次数</option><option value="0">今日切换 0 次</option>
+              <option value="1">今日切换 1 次</option><option value="2">今日切换 2 次</option>
+              <option value="3">今日切换 3 次及以上</option>
             </select>
-            <button type="button" class="button" id="refresh-remote-status">核对 Sub2API 状态</button>
-            <span id="management-remote-status" class="muted" role="status"></span>
+            <details class="management-more-filters">
+              <summary class="button" id="accounts-more-label">更多筛选</summary>
+              <div class="management-filter-options">
+                <select class="filter" id="management-workspace" aria-label="团队"><option value="">全部团队</option></select>
+                <select class="filter" id="management-remote" aria-label="Sub2API 远端状态">
+                  <option value="all">全部 Sub2API 状态</option>
+                  <option value="missing">远端已删除 / 不存在</option><option value="healthy">远端正常</option>
+                  <option value="paused">远端已暂停</option><option value="attention">远端异常 / 待核对</option>
+                  <option value="rate_limited">远端限流 / 限额</option><option value="unknown">远端状态未确认</option>
+                  <option value="unbound">未绑定 Sub2API</option>
+                </select>
+                <button type="button" class="button" id="refresh-remote-status">核对 Sub2API 状态</button>
+                <span id="management-remote-status" class="muted" role="status"></span>
+                <button type="button" class="button" data-action-page="workspace-sync-all">同步全部团队</button>
+              </div>
+            </details>
+            <button type="button" class="button ghost" id="accounts-clear-filters" hidden>清除筛选</button>
           </div>
+          <p id="accounts-attention-breakdown" class="hint" hidden></p>
+          <div id="accounts-active-filters" class="management-filter-chips" aria-label="当前筛选" hidden></div>
           <p id="management-sync-status" class="management-sync-status" role="status" hidden></p>
-          <div id="accounts-portfolio" class="management-list" aria-live="polite"></div>
+          <p class="muted management-count" id="accounts-count" role="status"></p>
+          <div id="accounts-portfolio" class="management-list"></div>
           <nav id="accounts-pagination" class="management-pagination" aria-label="账号分页"></nav>
           <div id="account-selection-bar" class="management-selection" hidden>
             <span id="account-selection-count" aria-live="polite">已选 0 个</span>
             <button type="button" class="button" id="account-selection-clear">取消选择</button>
             <button type="button" class="button" id="account-selection-export">导出 Codex JSON</button>
+            <button type="button" class="button" id="account-selection-codex-rs">导入 codex-rs</button>
             <button type="button" class="button danger" id="account-selection-delete">永久删除本地档案</button>
           </div>
           <div class="table-scroll">
@@ -192,7 +174,7 @@
               <thead>
                 <tr>
                   <th scope="col">账号</th>
-                  <th scope="col">工作区</th>
+                  <th scope="col">团队</th>
                   <th scope="col">本地用途</th>
                   <th scope="col">授权</th>
                   <th scope="col">官方额度</th>
@@ -207,8 +189,8 @@
         {% elif page == 'operations' %}
         <section class="panel table-shell">
           <div class="toolbar" id="operations-toolbar">
-            <input class="search" id="operations-search" placeholder="搜邮箱、任务 ID、类型" autocomplete="off">
-            <select class="filter" id="operations-state">
+            <input class="search" id="operations-search" aria-label="搜索任务" placeholder="搜邮箱、任务 ID、类型" autocomplete="off">
+            <select class="filter" id="operations-state" aria-label="任务状态">
               <option value="">全部状态</option>
               <option value="running,queued,waiting">运行中</option>
               <option value="success">完成</option>
@@ -216,8 +198,9 @@
               <option value="failed">失败</option>
               <option value="manual_required">需人工</option>
               <option value="cancelled">已取消</option>
+              <option value="resolved">已人工结束</option>
             </select>
-            <select class="filter" id="operations-type">
+            <select class="filter" id="operations-type" aria-label="任务类型">
               <option value="">全部类型</option>
               <option value="workspace_sync">同步官方成员</option>
               <option value="quota_probe">额度刷新</option>
@@ -227,16 +210,16 @@
               <option value="proxy_check">代理检测</option>
               <option value="hme_reconcile">HME</option>
               <option value="onboard">拉人</option>
-              <option value="replenish">补充 Team</option>
+              <option value="replenish">补充团队</option>
               <option value="rotate">轮转</option>
             </select>
-            <select class="filter" id="operations-source">
+            <select class="filter" id="operations-source" aria-label="触发来源">
               <option value="">全部来源</option>
               <option value="manual">手动</option>
               <option value="scheduled">定时</option>
               <option value="retry">重试</option>
             </select>
-            <select class="filter" id="operations-range">
+            <select class="filter" id="operations-range" aria-label="时间范围">
               <option value="7d">最近 7 天</option>
               <option value="today">今天</option>
               <option value="30d">最近 30 天</option>
@@ -255,7 +238,7 @@
                   <th scope="col">状态</th>
                   <th scope="col">类型</th>
                   <th scope="col">对象</th>
-                  <th scope="col">工作区</th>
+                  <th scope="col">团队</th>
                   <th scope="col">业务步骤</th>
                   <th scope="col">更新时间</th>
                   <th scope="col" class="actions">操作</th>
@@ -268,13 +251,15 @@
             <button type="button" class="button ghost" id="operations-prev">上一页</button>
             <span class="muted" id="operations-page-label">第 1 页</span>
             <button type="button" class="button ghost" id="operations-next">下一页</button>
-            <select class="filter" id="operations-page-size">
-              <option value="25">25 / 页</option>
-              <option value="50" selected>50 / 页</option>
-              <option value="100">100 / 页</option>
+            <select class="filter" id="operations-page-size" aria-label="每页条数">
+              <option value="20">20 条</option>
+              <option value="50" selected>50 条</option>
+              <option value="100">100 条</option>
             </select>
           </div>
         </section>
+        {% elif page == 'pool' %}
+        {% include 'pool.html' %}
         {% elif page == 'phones' %}
         <section class="panel table-shell">
           <div class="toolbar">
@@ -285,12 +270,12 @@
             <table class="data-table">
               <thead>
                 <tr>
-                  <th scope="col">号码</th>
-                  <th scope="col">状态</th>
-                  <th scope="col" class="num">成功 / 上限</th>
-                  <th scope="col" class="num">风险</th>
+                  <th scope="col" data-sort="number">号码</th>
+                  <th scope="col" data-sort="status">状态</th>
+                  <th scope="col" class="num" data-sort="uses">成功 / 上限</th>
+                  <th scope="col" class="num" data-sort="risk">风险</th>
                   <th scope="col">当前租约</th>
-                  <th scope="col">冷却到</th>
+                  <th scope="col" data-sort="cooldown">冷却到</th>
                   <th scope="col">最后结果</th>
                   <th scope="col" class="actions">操作</th>
                 </tr>
@@ -310,12 +295,12 @@
             <table class="data-table">
               <thead>
                 <tr>
-                  <th scope="col">别名</th>
-                  <th scope="col">本地状态</th>
+                  <th scope="col" data-sort="email">别名</th>
+                  <th scope="col" data-sort="state">本地状态</th>
                   <th scope="col">目标标签</th>
-                  <th scope="col">同步状态</th>
+                  <th scope="col" data-sort="pending">同步状态</th>
                   <th scope="col">任务租约</th>
-                  <th scope="col">到期</th>
+                  <th scope="col" data-sort="expires">到期</th>
                   <th scope="col" class="actions">操作</th>
                 </tr>
               </thead>
@@ -334,13 +319,13 @@
             <table class="data-table">
               <thead>
                 <tr>
-                  <th scope="col">名称</th>
-                  <th scope="col">地区</th>
+                  <th scope="col" data-sort="name">名称</th>
+                  <th scope="col" data-sort="region">地区</th>
                   <th scope="col">出口 IP</th>
-                  <th scope="col">状态</th>
-                  <th scope="col">健康</th>
+                  <th scope="col" data-sort="status">状态</th>
+                  <th scope="col" data-sort="health">健康</th>
                   <th scope="col">地址</th>
-                  <th scope="col">检测时间</th>
+                  <th scope="col" data-sort="checked">检测时间</th>
                   <th scope="col" class="actions">操作</th>
                 </tr>
               </thead>
@@ -350,6 +335,9 @@
         </section>
         {% elif page == 'settings' %}
         <form id="settings-form" class="settings-page">
+          <div class="settings-page-tools">
+            <button class="button" type="button" id="settings-probe-all">全部检测</button>
+          </div>
           <div class="settings-columns">
             <div class="settings-column settings-column-main">
               <article class="panel service-card" data-service="sub2api">
@@ -400,6 +388,85 @@
                     <label>API Key<input name="sub2api_api_key" type="password" autocomplete="new-password" data-secret="sub2api_api_key"></label>
                     <label>管理员邮箱<input name="sub2api_admin_email" autocomplete="off"></label>
                     <label>管理员密码<input name="sub2api_admin_password" type="password" autocomplete="new-password" data-secret="sub2api_admin_password"></label>
+                  </div>
+                </div>
+              </article>
+              <article class="panel service-card" data-service="codex_rs" id="codex-rs">
+                <div class="panel-header">
+                  <div>
+                    <span class="panel-title">codex-rs</span>
+                    <p class="service-meta muted" data-service-meta="codex_rs">未检测</p>
+                  </div>
+                  <div class="panel-actions">
+                    <button class="button" type="button" data-probe="codex_rs">检测</button>
+                    <button class="button ghost" type="button" data-edit-toggle="codex_rs">编辑</button>
+                  </div>
+                </div>
+                <div class="panel-body stack">
+                  <p class="service-summary muted" data-service-summary="codex_rs">同机部署的 codex-proxy-rs。导入时带上刷新令牌，之后由 codex-rs 续期。管理 Key 留空则不修改。</p>
+                  <fieldset id="codex-rs-push-target" class="codex-rs-push-target">
+                    <legend>授权后推送到</legend>
+                    <div class="codex-rs-choice-row">
+                      <label class="check"><input type="radio" name="codex_rs_push_target" value="sub2api" checked>Sub2API</label>
+                      <label class="check"><input type="radio" name="codex_rs_push_target" value="codex_rs">codex-rs</label>
+                    </div>
+                  </fieldset>
+                  <p class="hint">只影响重新授权后的推送（账号页 / 团队授权面板、注册插件接入）；手动 / 自动轮转仍推 Sub2API；号池拉入跟随这里，自动补号固定导入 codex-rs。</p>
+                  <section class="sub2api-push-defaults stack" aria-labelledby="codex-rs-defaults-title">
+                    <div class="panel-header">
+                      <strong id="codex-rs-defaults-title">导入参数（只对首次导入的号生效）</strong>
+                      <button type="button" class="button compact" id="codex-rs-options-refresh">刷新分组</button>
+                    </div>
+                    <fieldset id="codex-rs-group-field" class="sub2api-default-groups">
+                      <legend>分组（可多选）</legend>
+                      <div id="codex-rs-groups" class="sub2api-group-options"></div>
+                    </fieldset>
+                    <label>并发上限<input name="codex_rs_concurrency" type="number" min="1" max="4294967295" step="1" placeholder="继承 codex-rs 全局设置"></label>
+                    <p class="hint">留空表示继承 codex-rs 全局设置。</p>
+                    <label>权重<input name="codex_rs_weight" type="number" min="1" max="100" step="1" value="1" required></label>
+                    <label class="check"><input type="checkbox" name="codex_rs_enabled" checked>导入后启用</label>
+                    <p id="codex-rs-proxy-status" class="hint">可用代理读取中…</p>
+                    <p id="codex-rs-options-status" class="hint" role="status">读取分组中…</p>
+                  </section>
+                  <section class="sub2api-push-defaults stack" aria-labelledby="codex-rs-reauth-title">
+                    <strong id="codex-rs-reauth-title">掉登录恢复</strong>
+                    <label class="setting-row"><span><strong>开启邮箱自动重授权</strong><span class="hint">仅恢复明确掉登录的 rs 账号</span></span><input type="checkbox" name="codex_rs_auto_reauth"></label>
+                    <p class="hint">每分钟同步 rs 状态，和自动补号独立。一次处理一个原账号，沿用账号代理（未配置时用团队母号代理），成功后更新原 rs 绑定；不踢人、不改席位、不启用已停用的账号。</p>
+                    <p class="hint">默认关闭。只处理凭据过期或失效；遇手机验证、人机验证或身份不一致停下待人工。普通失败退避重试，最多 3 次；推送未确认时保留新凭据，人工重试只推送。</p>
+                  </section>
+                  <section class="sub2api-push-defaults codex-rs-refill stack" id="codex-rs-refill" aria-labelledby="codex-rs-refill-title">
+                    <div class="panel-header">
+                      <strong id="codex-rs-refill-title">自动补号</strong>
+                      <button type="button" class="button compact" id="codex-rs-refill-refresh">刷新状态</button>
+                    </div>
+                    <label class="setting-row">
+                      <span>
+                        <strong>开启自动补号</strong>
+                        <span class="hint">每 5 分钟检查一次 codex-rs，能干活的号少于目标时，从备用号池按导入顺序取一个号，拉进勾选的团队（今日切换最少优先）并导入 codex-rs。出错的号会在 codex-rs 关调度，不踢人、不删号。</span>
+                        <span class="hint text-warn">▲ 会修改官方 Team：发送邀请、接受邀请、今日切换 +1。</span>
+                      </span>
+                      <input type="checkbox" name="codex_rs_refill_enabled">
+                    </label>
+                    <label>目标数量<input name="codex_rs_refill_target" type="number" min="1" max="50" step="1" value="6" required></label>
+                    <label>每天最多补<input name="codex_rs_refill_daily_limit" type="number" min="0" max="50" step="1" value="6" required></label>
+                    <p class="hint">0 = 不补；北京时间 0 点归零，失败也占名额。</p>
+                    <fieldset id="codex-rs-refill-workspaces" class="stack">
+                      <legend>补号目标团队</legend>
+                      <div class="toolbar">
+                        <button type="button" class="button ghost" id="codex-rs-refill-select-all">全选</button>
+                        <button type="button" class="button ghost" id="codex-rs-refill-clear">清空</button>
+                      </div>
+                      <div id="codex-rs-refill-workspace-list" class="sub2api-group-options"></div>
+                    </fieldset>
+                    <div id="codex-rs-refill-status" class="codex-rs-refill-status stack" role="status" aria-live="polite">
+                      <p class="hint">状态读取中…</p>
+                    </div>
+                  </section>
+                  <div class="service-edit" data-edit-panel="codex_rs" hidden>
+                    <label>服务地址<input name="codex_base_url" autocomplete="off" placeholder="http://host.docker.internal:8180"></label>
+                    <p class="hint">同机部署填 http://host.docker.internal:8180。更改地址时必须重新填写管理员 API Key。</p>
+                    <label>管理员 API Key<input name="codex_admin_key" type="password" autocomplete="new-password" data-secret="codex_admin_key"></label>
+                    <p class="hint">在 codex-rs 后台 系统设置 → 安全与访问 生成；留空不修改。</p>
                   </div>
                 </div>
               </article>
@@ -474,19 +541,19 @@
                   </label>
                   <label id="auto-rotation-scope">自动轮转启用范围
                     <select name="auto_rotate_scope">
-                      <option value="selected">仅选中的工作空间（小范围测试）</option>
-                      <option value="all">全部工作空间（包括以后新增的）</option>
+                      <option value="selected">仅选中的团队（小范围测试）</option>
+                      <option value="all">全部团队（包括以后新增的）</option>
                     </select>
                   </label>
                   <fieldset id="auto-rotation-workspaces" class="stack">
-                    <legend>选择一个或多个工作空间</legend>
+                    <legend>选择一个或多个团队</legend>
                     <div class="toolbar">
                       <button type="button" class="button ghost" id="auto-rotation-select-listed">全选列表</button>
                       <button type="button" class="button ghost" id="auto-rotation-clear-listed">清空选择</button>
                     </div>
                     <div id="auto-rotation-workspace-list" class="stack"></div>
                   </fieldset>
-                  <p class="hint" id="auto-rotation-scope-hint">默认关闭且不选择任何工作空间。勾选范围后，还需打开总开关并保存。</p>
+                  <p class="hint" id="auto-rotation-scope-hint">默认关闭且不选择任何团队。勾选范围后，还需打开总开关并保存。</p>
                   <label>每个团队每日最多轮转
                     <input name="auto_rotate_daily_limit" type="number" min="0" max="50" required>
                     <span class="hint">按北京时间统计已移出的次数，补位失败也计入；0 表示不轮转。同步重试不占次数。</span>
@@ -521,15 +588,47 @@
               </article>
             </div>
           </div>
-          <div class="settings-savebar" id="settings-savebar">
-            <p id="settings-status" class="muted">没有未保存的修改</p>
+          <div class="settings-savebar" id="settings-savebar" hidden>
+            <p id="settings-status" class="muted" role="status">没有未保存的修改</p>
             <div class="settings-savebar-actions">
               <button class="button ghost" type="button" id="settings-discard" hidden>放弃修改</button>
-              <button class="button" type="button" id="settings-probe-all">全部检测</button>
               <button class="button primary" type="submit" id="settings-save">保存设置</button>
             </div>
           </div>
         </form>
+        <section class="settings-runner" aria-labelledby="runner-card-title">
+          <article class="panel runner-card" id="runner-card">
+            <div class="panel-header">
+              <div>
+                <span class="panel-title" id="runner-card-title">浏览器环境</span>
+                <p class="service-meta muted" id="runner-config-meta">正在读取配置…</p>
+              </div>
+            </div>
+            <div class="panel-body stack">
+              <dl class="kv runner-config" id="runner-config">
+                <dt>轮转注册方式</dt><dd data-runner-config="signup_runner">—</dd>
+                <dt>Chromix 路径</dt><dd data-runner-config="executable">—</dd>
+                <dt>伪装平台</dt><dd data-runner-config="platform">—</dd>
+                <dt>显卡模式</dt><dd data-runner-config="gpu_mode">—</dd>
+              </dl>
+              <p class="hint">以上是只读展示，修改需改服务器 <code>.env</code> 后重启。自检会启动与轮转相同的 Chromix 浏览器和插件，打开指纹检测页并截图。</p>
+              <form class="runner-selfcheck-form" id="runner-selfcheck-form">
+                <label>出口代理（取该团队母号代理）<select name="workspace_id" id="runner-workspace"><option value="">正在读取团队…</option></select></label>
+                <label>伪装平台<select name="platform">
+                  <option value="">跟随配置</option>
+                  <option value="linux">Linux</option>
+                  <option value="windows">Windows</option>
+                </select></label>
+                <div class="settings-probe-actions">
+                  <button class="button primary" type="submit" id="runner-selfcheck-start">开始自检（不会注册或改动官方团队）</button>
+                </div>
+              </form>
+              <p class="hint" id="runner-selfcheck-status" role="status">约 2~4 分钟；进行中可在任务中心查看进度。</p>
+              <div id="runner-selfcheck-progress" hidden></div>
+              <div class="runner-result" id="runner-result" hidden></div>
+            </div>
+          </article>
+        </section>
         <form id="password-form" class="settings-security">
           <article class="panel">
             <div class="panel-header"><span class="panel-title">后台账号</span></div>
@@ -560,7 +659,7 @@
           <strong id="sheet-title">详情</strong>
           <p class="muted" id="sheet-subtitle"></p>
         </div>
-        <button type="button" class="button ghost" data-close-sheet>关掉</button>
+        <button type="button" class="button ghost" data-close-sheet>关闭</button>
       </header>
       <div class="sheet-body" id="sheet-body"></div>
     </div>
@@ -573,7 +672,7 @@
           <strong id="register-title">登记团队</strong>
           <p class="muted">用母号登录 ChatGPT 授权。团队和令牌从回调里取，不会在 OpenAI 开新团队。</p>
         </div>
-        <button type="button" class="button ghost" data-close-register>关掉</button>
+        <button type="button" class="button ghost" data-close-register>关闭</button>
       </header>
       <form id="register-form" class="sheet-body">
         <input type="hidden" name="ticket" value="">
@@ -604,7 +703,7 @@
           <strong id="reauth-title">授权</strong>
           <p class="muted" id="reauth-subtitle">点「打开授权」，用这个邮箱登录 ChatGPT。登录后会跳到 localhost:1455，把整段地址贴回来。</p>
         </div>
-        <button type="button" class="button ghost" data-close-reauth>关掉</button>
+        <button type="button" class="button ghost" data-close-reauth>关闭</button>
       </header>
       <form id="reauth-form" class="sheet-body">
         <input type="hidden" name="account_id" value="">
@@ -632,7 +731,7 @@
           <strong id="phone-import-title">导入手机号</strong>
           <p class="muted">每行一条：号码----接码链接。HME 邮箱别名仍由系统自动领取，这里只管短信号池。</p>
         </div>
-        <button type="button" class="button ghost" data-close-phone-import>关掉</button>
+        <button type="button" class="button ghost" data-close-phone-import>关闭</button>
       </header>
       <form id="phone-import-form" class="sheet-body">
         <div class="sheet-section">
@@ -689,20 +788,67 @@
       </div>
     </div>
   </div>
-  <div id="toast-region" class="toast-region" aria-live="polite" aria-atomic="true"></div>
+  <div class="sheet" id="task-center" hidden>
+    <section class="sheet-panel task-center-panel" role="dialog" aria-modal="true" aria-labelledby="task-center-title" tabindex="-1">
+      <header class="sheet-header"><h2 id="task-center-title">任务中心</h2><button type="button" class="button ghost" data-close-tasks>关闭</button></header>
+      <div class="sheet-body">
+        <p class="hint">进行中与需人工任务，以及最近 5 条已结束任务。</p>
+        <div class="task-progress-actions"><button type="button" class="button" id="task-center-refresh">刷新任务</button><a class="button" href="/operations">全部任务记录</a></div>
+        <p id="task-center-error" class="text-warning" hidden>状态更新中断，保留上次记录；可以刷新重试。</p>
+        <p id="task-center-empty" class="muted">正在读取任务…</p>
+        <div id="task-center-list"></div>
+      </div>
+    </section>
+  </div>
+  <div class="task-announcement" id="task-stage-announcement" role="status" aria-live="polite"></div>
+  {% if page == 'accounts' %}
+  <div class="sheet" id="assisted-login-sheet" hidden>
+    <section class="sheet-panel assisted-panel" role="dialog" aria-modal="true" aria-labelledby="assisted-login-title" tabindex="-1">
+      <header class="sheet-header assisted-header">
+        <div><h2 id="assisted-login-title">账号登录与安全</h2><p class="muted">用本机 Chrome 在官方页面登录，再执行所选操作。</p></div>
+        <button type="button" class="button ghost" id="assisted-login-close">关闭</button>
+      </header>
+      <div class="assisted-tabs" id="assisted-login-tabs" role="tablist" aria-label="账号工具">
+        <button type="button" class="sheet-tab-btn is-active" id="assisted-login-tab" data-assist-mode="login" role="tab" aria-selected="true" aria-controls="assisted-login-body">执行操作</button>
+        <button type="button" class="sheet-tab-btn" id="assisted-backup-tab" data-assist-mode="backup" role="tab" aria-selected="false" aria-controls="assisted-login-body" tabindex="-1">2FA 密钥</button>
+        <button type="button" class="sheet-tab-btn" id="assisted-protocol-tab" data-assist-mode="protocol" role="tab" aria-selected="false" aria-controls="assisted-login-body" tabindex="-1">协议登录（无浏览器）</button>
+      </div>
+      <div class="sheet-body assisted-body" id="assisted-login-body" role="tabpanel" aria-labelledby="assisted-login-tab"></div>
+      <p class="assisted-error error" id="assisted-login-error" role="alert" hidden></p>
+    </section>
+  </div>
+  <div class="sheet" id="credential-import-sheet" hidden>
+    <section class="sheet-panel auth-tools-panel" role="dialog" aria-modal="true" aria-labelledby="credential-import-title" tabindex="-1">
+      <header class="auth-tools-header">
+        <div><h2 id="credential-import-title">导入授权凭据</h2><p class="muted" id="credential-import-subtitle"></p></div>
+        <button type="button" class="button ghost" id="credential-import-close">关闭</button>
+      </header>
+      <div class="sheet-body auth-tools-body" id="credential-import-body"></div>
+      <p class="auth-tools-error error" id="credential-import-error" role="alert" hidden></p>
+    </section>
+  </div>
+  {% endif %}
+  <div id="toast-region" class="toast-region"></div>
   <dialog class="palette" id="command-palette">
-    <input id="command-input" placeholder="去哪…">
+    <input id="command-input" aria-label="跳转到页面" placeholder="去哪…">
     <ul id="command-list"></ul>
   </dialog>
-  <script src="/static/js/formatters.js"></script>
-  <script src="/static/js/workspace-expiry.js"></script>
-  <script src="/static/js/workspace-switch-count.js"></script>
-  <script src="/static/js/polling.js"></script>
-  <script src="/static/js/accounts-view.js"></script>
-  {% if page == 'accounts' %}<script src="/static/js/auto-rotation.js"></script>{% endif %}
-  <script src="/static/js/sub2api-defaults.js"></script>
-  <script src="/static/js/sub2api-state-view.js"></script>
-  {% if page == 'overview' %}<script src="/static/js/runtime-status.js"></script>{% endif %}
-  <script src="/static/js/app.js"></script>
+  <script src="{{ static_url('js/formatters.js') }}"></script>
+  <script src="{{ static_url('js/workspace-expiry.js') }}"></script>
+  <script src="{{ static_url('js/workspace-purchase.js') }}"></script>
+  <script src="{{ static_url('js/workspace-switch-count.js') }}"></script>
+  <script src="{{ static_url('js/polling.js') }}"></script>
+  <script src="{{ static_url('js/runtime-store.js') }}"></script>
+  <script src="{{ static_url('js/task-progress.js') }}"></script>
+  {% if page == 'accounts' %}<script src="{{ static_url('js/credential-import.js') }}"></script>{% endif %}
+  {% if page == 'accounts' %}<script src="{{ static_url('js/assisted-login.js') }}"></script>{% endif %}
+  <script src="{{ static_url('js/accounts-view.js') }}"></script>
+  {% if page == 'accounts' %}<script src="{{ static_url('js/auto-rotation.js') }}"></script>{% endif %}
+  <script src="{{ static_url('js/sub2api-defaults.js') }}"></script>
+  <script src="{{ static_url('js/codex-rs-settings.js') }}"></script>
+  <script src="{{ static_url('js/sub2api-state-view.js') }}"></script>
+  {% if page == 'overview' %}<script src="{{ static_url('js/team-board.js') }}"></script>{% endif %}
+  <script src="{{ static_url('js/app.js') }}"></script>
+  {% if page == 'pool' %}<script src="{{ static_url('js/pool.js') }}"></script>{% endif %}
 </body>
 </html>

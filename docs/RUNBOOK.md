@@ -1,0 +1,124 @@
+# 运维手册
+
+## 环境一览
+
+| 环境 | 地址 | 服务器上的目录 | 访问方式 | 凭据在哪 |
+|---|---|---|---|---|
+| 生产 | `https://48team.xiaozhudf2026.foo`（Nginx → `127.0.0.1:8018` → 容器 8008） | 代码 `/opt/team48`（root 所有的 git 工作副本），数据 `/opt/team48/data` | `ssh -i ~/.ssh/sub2api-baseline/ops_ed25519 -o IdentitiesOnly=yes ops@148.163.73.236`（天理云美西 8H16G；`ops` 免密 sudo、在 docker 组；root 和密码登录已关闭） | SSH 私钥：本机 `C:\Users\Lovewell\.ssh\sub2api-baseline\ops_ed25519`；整机运维资料见 `C:/Projects/VPS/天理云-美西国际大宽带-8H16G/docs/RUNBOOK.md`；应用配置：VPS `/opt/team48/.env` |
+| 本地 | `http://127.0.0.1:8008` | 仓库根，数据 `data/` | 见 [ARCHITECTURE.md](ARCHITECTURE.md#本地运行) | 本地 `.env` |
+
+- Compose 项目 `team48`、容器 `team48-manager`；网络 `team48_net`（external，和 icloud-hme 共用）、`sub2api_sub2api-network`（容器内访问 Sub2API 用 `http://sub2api-canary:8080`）、`codex-proxy-rs_default`（`http://codex-proxy-rs:8080`）。
+- 服务器上的 `deploy/docker-compose.yml` 有一处未提交的本地改动（`team48_net` 改为 `external: true` 并加入 `codex-proxy-rs_default`），拉代码时保留，不要 `git checkout` / `reset` 掉。
+- HME 服务在同机容器 `icloud-hme`（`http://icloud-hme:8081`），部署见 `../icloud-hme/docs/RUNBOOK.md`。
+- Nginx 站点配置在仓库 `deploy/nginx-48team.conf`，独立 server_name，不写进 Sub2API 的站点文件。
+- 生产 `.env` 必须覆盖 `SECRET_KEY`、`ADMIN_PASSWORD`（代码默认值是弱占位），并设 `SESSION_COOKIE_SECURE=True`；模板 `deploy.env.example`。
+
+### 目录与端口隔离（硬约束）
+
+| 对象 | 能不能动 |
+|---|---|
+| `/opt/sub2api`（含 `source-main`、Compose、`.env`、data、postgres、redis） | 禁止 |
+| 容器 `sub2api`（8100 备）、`sub2api-canary`（8101 主）、`sub2api-postgres`、`sub2api-redis` | 禁止重启 / 重建 / 改 Nginx |
+| 端口 8100、8101、8080、8200、8317 | 不占用 |
+| `/opt/team48`、容器 `team48-manager` | 只在这里构建和启停 |
+
+禁止 `docker compose down`、`--remove-orphans`，禁止在 `/opt/sub2api` 里执行任何 compose。Sub2API 只通过 HTTP Admin API 使用。
+
+### 代码拉取
+
+GitHub 仓库是公开的，不要提交密钥、`private-config.mjs` 和数据。VPS 上的远端是 HTTPS（`https://github.com/hixz12d/48team-manager.git`），只 `git pull`，不在生产目录提交；仓库属 root，git 命令前加 `sudo`。推送只在本机（`gh` 已登录 `hixz12d`）。不要把本机 `gh` 登录态或带 repo 权限的 token 拷到 VPS。`.env`、`data/` 不进仓库。
+
+## 部署
+
+未经明确批准不部署，不在生产做真实踢人、邀请或改席位的测试。
+
+1. 本机推送 `origin/main`。 —— 确认：`git status` 干净，`git log origin/main -1` 是目标提交。
+2. 登录 VPS，确认没有进行中的任务（任务页无 running / queued，尤其是凭据写入、团队同步、轮转），且 `data/runner-runs/` 为空。宿主机没有 `sqlite3` 命令，要查库用 `sudo python3` 只读打开 `file:/opt/team48/data/team48.db?mode=ro`，任务表是 `operations`（列 `type`、`state`）。
+3. 备份（`<tag>` 用提交短 SHA；`ops` 用户执行，文件属 root 的步骤加 `sudo`）：
+   ```bash
+   cd /opt/team48
+   sudo mkdir -p -m 700 deploy/releases/<tag>
+   sudo python3 -c "import sqlite3; s=sqlite3.connect('data/team48.db'); d=sqlite3.connect('deploy/releases/<tag>/team48.db'); s.backup(d); print(d.execute('pragma integrity_check').fetchone()[0])"
+   sudo cp .env deploy/releases/<tag>/.env && sudo sh -c "chmod 600 deploy/releases/<tag>/*"
+   docker tag team48-manager:local team48-manager:rollback-<tag>
+   ```
+   —— 确认：`integrity_check` 输出 `ok`，`docker images | grep rollback-<tag>` 存在。
+4. 拉取并只重建自己：
+   ```bash
+   sudo git pull --ff-only origin main
+   sudo docker compose -p team48 -f deploy/docker-compose.yml up -d --build --no-deps team48
+   ```
+   新表 / 新列由启动时 bootstrap 自动补，无单独迁移命令。改了 `deploy/Dockerfile`（镜像带完整插件但不含 `private-config.mjs`、Xvfb、字体）时必须带 `--build`。
+5. 健康检查（见下）。 —— 确认：全部通过。
+
+涉及 Sub2API 合约的功能：两个 Sub2API 副本必须返回同一 `instance_id` 和期望 revision；认证恢复要求其迁移 249，交回刷新权要求迁移 250 且所有消费 RT 的副本已升级。Sub2API 走它自己的发布流程，本项目不动它。
+
+## 回滚
+
+1. 界面上先关闭自动轮转、自动重授权、自动额度检测，等排队中的同步 / 额度任务跑完或取消。
+2. 切回旧镜像：
+   ```bash
+   cd /opt/team48
+   docker tag team48-manager:rollback-<tag> team48-manager:local
+   sudo git checkout <上一版提交>
+   sudo docker compose -p team48 -f deploy/docker-compose.yml up -d --no-deps team48
+   ```
+3. 默认保留新增的表、列和审计记录（旧代码会忽略它们），不删库。只有数据确实被写坏时，才停容器后用 `deploy/releases/<tag>/team48.db` 覆盖 `data/team48.db`。
+4. 注意：已发生过刷新权交回的，不能直接回滚到不认识刷新归属的旧版本；回滚也撤销不了已经发生的官方授权、RT 消费或成员变动。
+
+## 健康检查
+
+- `docker compose -p team48 -f deploy/docker-compose.yml ps`：`team48-manager` 为 `running (healthy)`，只绑 `127.0.0.1:8018`。
+- `curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8018/health`（以及 `/login`、`/static/js/app.js`）：期望 200。
+- 公网 `https://48team.xiaozhudf2026.foo/login`：期望 200。
+- 登录后 `GET /api/runtime/status`：心跳新鲜；`GET /api/quota/runtime`：开关、排队数正常。
+- `docker logs team48-manager --since 3m`：无报错。
+
+## 日志与排障
+
+- 日志：`docker compose -p team48 -f deploy/docker-compose.yml logs --tail 100`；Nginx `/var/log/nginx/48team.{access,error}.log`。
+- HME 连通干跑（不开号）：`docker exec team48-manager python -c "import socket; print(socket.gethostbyname('icloud-hme'))"`、`docker logs team48-manager --since 30m | grep -i hme`。
+
+| 现象 | 原因 | 处理 |
+|---|---|---|
+| 轮转任务停在 `partial` / `manual_required` | 手机 / 人机验证、写入结果未知、旧号清理失败 | 人工处理后在团队面板或任务列表"…"菜单点"继续轮转"；不要重新发起，不要靠归档绕过 |
+| 邀请 `write_outcome_unknown` | 官方写请求超时或 5xx | 先同步成员 / 邀请核对结果，不要直接重发 |
+| 邀请 422 `not a valid SeatType` | 席位接口值错 | 设置里 `invite_seat_wire_*` 应为 `default` / `prolite` |
+| `sync_oauth_unsupported` | Sub2API revision 不在 3–5 或副本版本不一致 | 等两个副本一致，不绕过能力检查 |
+| `instance_mismatch` | Sub2API 数据库实例变了 | 核实连接和绑定后再试 |
+| `auth_recovery_unsupported` | Sub2API 无 revision 4/5 | 升级 Sub2API 并完成迁移 249 |
+| Sub2API 同步 partial / pending | 缓存或调度传播未完成 | 点"重试未完成步骤"；快照超过 120 秒先"重新核对状态" |
+| 交回刷新权卡住 / 部分完成 | 远端有在途刷新 / 清理 ack 失败 | "继续交回 Team" / "确认交接收尾"；不要删票据或归属行 |
+| `/api/ext` 返回 404 / 401 | 令牌未配置或不足 24 位 / 两端令牌不一致 | 改 `/opt/team48/.env` 的 `EXTENSION_API_TOKEN` 后重建，本机重新打包插件 |
+| `phone_verification_required` / `registration_home_not_ready` | 注册或 OAuth 需要手机 / 主页未就绪 | 保留同一账号续接，不要重新注册或领新别名 |
+| Codex 导出被拒 | 某账号缺 AT、将过期或待授权 | 先刷新或授权该账号 |
+| 团队卡"在跑"显示 — / 收入记录标"估算""未取到" | 用量同步还没跑出全程窗口 / 离队时读 Sub2API 失败 | 等下一次用量同步（5 分钟）；账本不支持手改，"估算"会在删旧远端前再读一次时更新 |
+| 总览今日 / 近 7 天收入悬停提示 Sub2API 日边界不同，日志有 `revenue daily ... day boundary ... differs from TIMEZONE` | Sub2API 的 `TZ` 与本项目 `TIMEZONE` 不一致 | 改本项目 `/opt/team48/.env` 的 `TIMEZONE` 对齐后重建；不动 Sub2API |
+| 轮转预检报 `runner_not_configured` / `proxy_auth_unsupported` / `runner_mailbox_invalid` | 运行器未装好 Chromix / 母号是带账号密码的 HTTP 代理 / Cloudflare 邮箱地址不是插件内置的 | 按"常用操作"装好 Chromix 或修正设置；代理改 SOCKS5 或无认证；临时可切回 `ROTATION_SIGNUP_RUNNER=playwright` |
+| 运行器轮转停在 `runner_oauth_required` 等待人工 | 注册或授权时出现手机 / 人机验证 | 人工授权该邮箱后点"继续轮转"，不要重新发起 |
+| 插件 / 运行器暂停 `phone_pool_empty` | 号码池没有可用号 | 在"资源 → 手机号"导入（`+1xxxxxxxxxx----接码链接`）后点继续 |
+| 暂停 `phone_limit` | 同一账号已换 3 个号仍失败 | 看资源页接码记录的失败原因；人工继续只再给 1 次，轮转"继续轮转"重新计 3 个 |
+| 暂停 `phone_back_missing` / `phone_relay_error` | 页面上找不到"换号码"入口 / 接码接口不可用、选不到 +1、已绑号无记录 | 人工回到号码输入页或手动完成手机验证后点继续；本机包提示"未启用接码接口"时检查服务端版本和 `EXTENSION_API_TOKEN` |
+| 号池拉入失败 `account_not_registered` | 该邮箱没注册过 ChatGPT，授权登录进了创建账号 / 填年龄页（也可能是 OpenAI 页面改版导致误判） | 本地先注册好再"继续"；确认已注册仍报错时查 `browser/reauth.py` 的 `login_only` 判断 |
+| 号池拉入失败 `mail_missing` / 邮箱不可读 | HME 地址 / 服务 token 未配置，或别名不在 icloud-hme 已接入账号下 | 设置页配好 HME 后在号池页"重新检测" |
+| codex-rs 检测失败 `codex_unreachable` / `codex_auth_failed` | 容器连不到宿主机 8180 / 管理 Key 错 | 容器内跑 `docker exec team48-manager python -c "import urllib.request;print(urllib.request.urlopen('http://host.docker.internal:8180/healthz').status)"` 应输出 `204`，不通查 UFW 是否放行 docker 网段访问 8180；Key 错就在 codex-rs 后台重新生成后填入 |
+| 导入 codex-rs 报 `no_proxy` | codex-rs 里没有最近测试通过的代理 | 到 codex-rs 后台测试代理后再导入，不直连 |
+| 导入报 `sub2api_bound` / 推送报 `codex_rs_bound` | 一个号只能进一边 | 先在对应一边删号；从 codex-rs 换回 Sub2API 需删号后手动重新授权 |
+| 自动补号"已暂停：连续 2 次补号失败" | 两次号池拉入失败、待人工或导入 codex-rs 失败 | 到任务页看"号池拉入（自动补号）"任务原因，处理后（继续 / 换号）在设置页 codex-rs 卡片点"恢复" |
+| 自动补号"本轮未补号：…" | 号池空、没勾团队、团队忙、浏览器占用、今日上限、codex-rs 无测试通过代理或读取失败 | 按原因补号池 / 勾团队 / 测代理；忙碌类等下一轮（5 分钟）自动重试 |
+| codex-rs 绑定状态"结果不明" | 导入超时 / 5xx / 读回核对失败 | 直接再点导入（codex-rs 按身份覆盖，可安全重试） |
+
+## 常用操作
+
+- **首次启用自动轮转**：先保存 `关闭 + 仅选中团队 + 空列表`，核对后再选范围开启。
+- **切换注册流程**：`/opt/team48/.env` 改 `BROWSER_SIGNUP_FLOW=extension`（回退改 `legacy`）后重建。手动轮转不受影响，固定用 extension。
+- **启用 Chromix**：下载并按 SHA256 校验归档，解压到 `/app/data/browsers/chromix/`，设 `BROWSER_ENGINE=chromix` 和 `BROWSER_EXECUTABLE` 后重建。首次会新建档案，可能需重新登录；回退改回 `chromium` 即用旧档案。冒烟：`python -m scripts.browser_environment_smoke --engine chromix --browser-executable <path> --headed`。
+- **安装运行器用的 Chromix 153**：从 https://github.com/xiaozhou26/Chromix/releases 的 `v153.0.8010.36` 下载 `chromix-linux-x64.zip`（`lwhx/Chromix` 是 fork，没有发布包），SHA256 必须是 `8a9cdc3692a82e84ca62cbd04025b2e11b3aafd47d86fdfa9d13f48e497454ef`，解压到 `/opt/team48/data/browsers/chromix153/`（得到 `chromix/` 目录）。`.env` 设 `RUNNER_BROWSER_EXECUTABLE=/app/data/browsers/chromix153/chromix/chromix`（启动脚本，会加载包内字体；不要直接指 `chrome`），其余 `RUNNER_*` 见 `deploy.env.example`，重建生效。
+- **浏览器环境自检**：设置页"浏览器环境"卡片，选团队（取母号代理）和平台，点自检；不注册、不碰官方团队，占用全局浏览器槽。先按 linux / windows 各跑一次，按结果定 `RUNNER_FINGERPRINT_PLATFORM` / `RUNNER_GPU_MODE`（只影响新建档案）。服务器没有 GPU 时 Chromix 会强制显示真实软件渲染型号，`preset` 可能不生效（结果里 `gpu_preset_ignored`）。服务重启会把进行中的自检标失败（`runner_interrupted`），重新发起即可。
+- **切换轮转注册方式**：`/opt/team48/.env` 改 `ROTATION_SIGNUP_RUNNER=extension`（回退改 `playwright`）后重建。前提：自检通过；设置里 Cloudflare 邮箱地址必须是插件内置的 `https://apimail.xiaozhudf2026.foo`，否则报 `runner_mailbox_invalid`。运行目录 `data/runner-runs/` 结束即删；容器重启会丢失进行中的运行，任务停在待人工，按"继续轮转"处理。
+- **接入 codex-rs**：在 codex-rs 后台「系统设置 → 安全与访问」生成管理员 API Key（只显示一次），Team48 设置页 codex-rs 卡片填地址 `http://host.docker.internal:8180` 和 Key，点检测。第一次真实导入用不重要的号，导入后在 codex-rs 后台确认有账号、有 RT、代理已绑定。
+- **启用 codex-rs 自动补号**：先往备用号池导入一批已注册的 HME 邮箱，在设置页 codex-rs 卡片勾选有空位的目标团队（线上团队大多没记录席位上限，系统判断不了满员），再打开开关保存。第一次盯一轮：任务页的"号池拉入（自动补号）"走完，codex-rs 后台出现新号且已启用。
+- **启用插件接口**：`python -c "import secrets; print(secrets.token_urlsafe(32))"` 生成令牌 → 写 `/opt/team48/.env` 的 `EXTENSION_API_TOKEN` → 重建 → 本机重新打包插件。
+- **打包插件（本机）**：`python scripts/build_signup_extension.py --local-config --unpack`（只用本机 `private-config.mjs`）；首次不带 `--local-config` 会经 SSH 只读 VPS 上的 Cloudflare 配置。`--team48-token <令牌>` / `--no-team48` 写入 / 移除令牌（带令牌才会接码）；`--hme-token <ICLOUD_HME_SERVICE_TOKEN> --hme-account acc_...` / `--no-hme` 让本机包改从 iCloud（经 icloud-hme）读邮件验证码 / 改回 Cloudflare。产物在 `dist/`（gitignore），重新加载后确认插件版本号。安装说明见 `extensions/chatgpt-signup/README.md`。
+- **单席位补位（本机）**：`python -m scripts.signup_one --workspace-id N --role member` 只显示预检，加 `--confirm` 才执行；短信用 `--sms-stdin` 从标准输入传，不写在命令参数里。
+- **HubStudio 本机观察**：`scripts/hubstudio_probe.py --port <CDP端口>` 只读探测；`scripts/hubstudio_record.py record|mark|stop --port <p> --out dist/hubstudio-record-<时间>` 录时间线，用 `stop` 结束，不要强杀。端口每次重新识别。

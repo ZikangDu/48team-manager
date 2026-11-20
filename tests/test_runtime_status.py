@@ -49,6 +49,20 @@ class RuntimeStatusTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("secret-", json.dumps(payload))
         self.assertNotIn("input_json", json.dumps(payload))
 
+    async def test_stuck_automatic_rotation_names_blocked_workspace(self):
+        from app.persistence.models.identity import Account, Workspace
+        owner = Account(email="owner@example.com", local_purpose="mother", operational_state="active")
+        self.db.add(owner); await self.db.flush()
+        ws = Workspace(owner_account_id=owner.id, official_workspace_id="ws-1", status="active", custom_name="Alpha")
+        self.db.add(ws); await self.db.flush()
+        row = await operation_store.create(self.db, op_type="rotate", workspace_id=ws.id, source="auto")
+        await operation_store.finish(self.db, row, {"success": False, "partial": True, "error_code": "oauth_failed"})
+        await self.db.commit()
+        rotation = (await runtime_status(self.db))["auto_rotation"]
+        self.assertEqual(rotation["blocked_workspaces"], 1)
+        self.assertEqual(rotation["blocked"], [{"workspace_id": ws.id, "workspace_name": "Alpha",
+                                                "operation_id": row.public_id, "state": "partial"}])
+
     async def test_counts_are_not_truncated_by_recent_history(self):
         await operation_store.create(self.db, op_type="workspace_sync", state="queued")
         await operation_store.create(self.db, op_type="reauth", state="manual_required")
@@ -83,6 +97,34 @@ class RuntimeStatusTests(unittest.IsolatedAsyncioTestCase):
         auth = next(p for p in payload["policies"] if p["id"] == "token_refresh")
         self.assertEqual(auth["next_run_at"], now.isoformat())
         self.assertFalse(any(p["id"] == "workspace_sync" for p in payload["policies"]))
+
+    async def test_stage_plan_matches_detail_without_leaking_log_messages(self):
+        from app.application.console_actions import get_operation_detail
+        row = await operation_store.create(self.db, op_type="onboard", workspace_id=7)
+        row.current_step = "sms_otp"
+        row.log_json = json.dumps([{"stage": "checking", "message": "secret-check"},
+                                   {"stage": "sms_otp", "message": "secret-otp"},
+                                   {"stage": "secret-stage", "message": "secret-message"}])
+        await self.db.commit()
+        await self.db.refresh(row)
+        runtime = runtime_operation(row)
+        detail = await get_operation_detail(self.db, row.public_id)
+        self.assertEqual(runtime["stage_plan"], detail["stage_plan"])
+        self.assertEqual(len(runtime["stage_plan"]), 7)
+        self.assertIn("sms_otp", runtime["stage_plan"][3]["stages"])
+        self.assertEqual(runtime["observed_stages"], ["checking", "sms_otp"])
+        self.assertNotIn("secret-", json.dumps(runtime))
+        self.assertTrue(runtime["can_cancel"])
+        row.cancel_requested = True
+        self.assertFalse(runtime_operation(row)["can_cancel"])
+
+    async def test_active_team_tracking_is_not_limited_to_eight_cards(self):
+        for i in range(12):
+            await operation_store.create(self.db, op_type="onboard", workspace_id=i + 1)
+        await self.db.commit()
+        payload = await runtime_status(self.db)
+        self.assertEqual(len(payload["active_operations"]), 12)
+        self.assertEqual(payload["active_total"], 12)
 
     async def test_wait_reasons_have_distinct_evidence(self):
         now = utcnow()

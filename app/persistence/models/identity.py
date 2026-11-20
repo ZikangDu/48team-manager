@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from datetime import date, datetime
+from decimal import Decimal
 
-from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint, event, func, inspect
+from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Index, Integer, Numeric, String, Text, UniqueConstraint, event, func, inspect
 from sqlalchemy.orm import Mapped, Session, mapped_column, relationship
 
 from app.persistence.database import Base
@@ -115,12 +116,21 @@ class Workspace(Base):
     manual_expiry_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     manual_switch_date: Mapped[date | None] = mapped_column(Date)
     manual_switch_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+    # Updated with every switch +1; teams switched before this column existed stay NULL (not backfilled).
+    last_switched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     owner_account_id: Mapped[int | None] = mapped_column(ForeignKey("accounts.id"))
     status: Mapped[str] = mapped_column(String(20), default="active", nullable=False)
     seat_limit: Mapped[int | None] = mapped_column(Integer)
     occupied_seats: Mapped[int | None] = mapped_column(Integer)
     last_official_sync_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_official_sync_state: Mapped[str | None] = mapped_column(String(20))
+    # One purchase per team (no renewals). Owner 2FA is encrypted like credentials.
+    purchase_payment_card: Mapped[str | None] = mapped_column(String(100))
+    purchase_cost: Mapped[Decimal | None] = mapped_column(Numeric(12, 2))
+    purchase_currency: Mapped[str | None] = mapped_column(String(3))
+    purchase_note: Mapped[str | None] = mapped_column(Text)
+    owner_totp_secret_encrypted: Mapped[str | None] = mapped_column(Text)
+    purchase_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     source_team_id: Mapped[int | None] = mapped_column(Integer, unique=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
@@ -153,6 +163,8 @@ class WorkspaceMembership(Base):
     local_purpose: Mapped[str] = mapped_column(String(20), nullable=False)
     joined_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     removed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Set once when this membership's first authorization was counted as a team switch.
+    switch_counted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     source_mapping_id: Mapped[int | None] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
@@ -214,6 +226,8 @@ class ExternalBinding(Base):
     verified_official_account_id: Mapped[str | None] = mapped_column(String(100))
     verified_workspace_id: Mapped[str | None] = mapped_column(String(100))
     last_observed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Time of the last confirmed credential push, taken from the remote account's updated_at.
+    last_pushed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_error: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(

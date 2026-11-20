@@ -20,10 +20,16 @@ from app.persistence.models import (  # noqa: F401
     SeatVacancyEvent,
     SystemSetting,
     Sub2ApiProxyBinding,
+    Sub2ApiRevenueDaily,
+    Sub2ApiRevenueEntry,
     Sub2ApiUsageSnapshot,
     Workspace,
     WorkspaceMembership,
     WorkspaceOfficialMemberSnapshot,
+)
+
+MEMBERSHIP_COLUMNS = (
+    ("switch_counted_at", "DATETIME"),
 )
 
 PROXY_PROFILE_COLUMNS = (
@@ -51,6 +57,7 @@ WORKSPACE_COLUMNS = (
     ("manual_expiry_updated_at", "DATETIME"),
     ("manual_switch_date", "DATE"),
     ("manual_switch_count", "INTEGER DEFAULT 0 NOT NULL"),
+    ("last_switched_at", "DATETIME"),
     ("official_name", "VARCHAR(255)"),
     ("custom_name", "VARCHAR(255)"),
     ("name_source", "VARCHAR(20) DEFAULT 'placeholder' NOT NULL"),
@@ -59,6 +66,12 @@ WORKSPACE_COLUMNS = (
     ("official_name_payload_source", "VARCHAR(80)"),
     ("occupied_seats", "INTEGER"),
     ("last_official_sync_state", "VARCHAR(20)"),
+    ("purchase_payment_card", "VARCHAR(100)"),
+    ("purchase_cost", "NUMERIC(12, 2)"),
+    ("purchase_currency", "VARCHAR(3)"),
+    ("purchase_note", "TEXT"),
+    ("owner_totp_secret_encrypted", "TEXT"),
+    ("purchase_updated_at", "DATETIME"),
 )
 
 QUOTA_COLUMNS = (
@@ -75,6 +88,7 @@ QUOTA_COLUMNS = (
 
 BINDING_COLUMNS = (
     ("workspace_id", "INTEGER"),
+    ("last_pushed_at", "DATETIME"),
 )
 
 ACCOUNT_COLUMNS = (
@@ -89,6 +103,12 @@ ACCOUNT_COLUMNS = (
     ("mailbox_method", "VARCHAR(20)"),
     ("auto_reauth_opt_in", "BOOLEAN DEFAULT 0 NOT NULL"),
     ("credential_revision", "INTEGER DEFAULT 1 NOT NULL"),
+)
+
+CODEX_BINDING_COLUMNS = (
+    ("remote_enabled", "BOOLEAN"),
+    ("official_workspace_id", "VARCHAR(100)"),
+    ("last_pulled_at", "DATETIME"),
 )
 
 
@@ -134,6 +154,7 @@ async def _rebuild_external_bindings(conn) -> None:
             verified_official_account_id VARCHAR(100),
             verified_workspace_id VARCHAR(100),
             last_observed_at DATETIME,
+            last_pushed_at DATETIME,
             last_error TEXT,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -145,17 +166,19 @@ async def _rebuild_external_bindings(conn) -> None:
         """
     ))
     workspace_select = "workspace_id" if has_workspace else "NULL AS workspace_id"
+    # Every column the model has must be carried over, or a rebuild silently drops it.
+    pushed_select = "last_pushed_at" if "last_pushed_at" in existing else "NULL AS last_pushed_at"
     await conn.execute(text(
         f"""
         INSERT INTO external_bindings_v2 (
             id, provider, local_account_id, remote_account_id, workspace_id,
             binding_state, verified_email, verified_official_account_id, verified_workspace_id,
-            last_observed_at, last_error, created_at, updated_at
+            last_observed_at, last_pushed_at, last_error, created_at, updated_at
         )
         SELECT
             id, provider, local_account_id, remote_account_id, {workspace_select},
             binding_state, verified_email, verified_official_account_id, verified_workspace_id,
-            last_observed_at, last_error, created_at, updated_at
+            last_observed_at, {pushed_select}, last_error, created_at, updated_at
         FROM external_bindings
         """
     ))
@@ -182,9 +205,20 @@ async def bootstrap_schema(engine: AsyncEngine) -> None:
         await _ensure_sqlite_columns(conn, "workspace_official_member_snapshots", SNAPSHOT_COLUMNS)
         await _ensure_sqlite_columns(conn, "operations", OPERATION_COLUMNS)
         await _ensure_sqlite_columns(conn, "workspaces", WORKSPACE_COLUMNS)
+        membership_existing = {str(row[1]) for row in (await conn.execute(text("PRAGMA table_info(workspace_memberships)"))).fetchall()}
+        await _ensure_sqlite_columns(conn, "workspace_memberships", MEMBERSHIP_COLUMNS)
+        if membership_existing and "switch_counted_at" not in membership_existing:
+            # Members already authorized before automatic counting are treated as counted;
+            # linked-but-unauthorized members still count once when first authorized.
+            await conn.execute(text(
+                "UPDATE workspace_memberships SET switch_counted_at = strftime('%Y-%m-%d %H:%M:%S.000000', 'now') "
+                "WHERE account_id IN (SELECT id FROM accounts WHERE access_token_encrypted IS NOT NULL "
+                "OR refresh_token_encrypted IS NOT NULL)"
+            ))
         await _ensure_sqlite_columns(conn, "quota_snapshots", QUOTA_COLUMNS)
         await _ensure_sqlite_columns(conn, "external_bindings", BINDING_COLUMNS)
         await _ensure_sqlite_columns(conn, "accounts", ACCOUNT_COLUMNS)
+        await _ensure_sqlite_columns(conn, "codex_bindings", CODEX_BINDING_COLUMNS)
         await _rebuild_external_bindings(conn)
         await conn.execute(text(
             "CREATE INDEX IF NOT EXISTS idx_operations_archived_finished "

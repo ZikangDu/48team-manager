@@ -317,6 +317,7 @@ class WorkspaceSyncService:
             for collection in (members, invites)
         )
         removed_memberships = 0
+        departed_account_ids: list[int] = []
         remote_rows = self._merge_remote_rows(members, invites)
 
         await db.execute(delete(WorkspaceOfficialMemberSnapshot).where(WorkspaceOfficialMemberSnapshot.workspace_id == workspace.id))
@@ -352,6 +353,7 @@ class WorkspaceSyncService:
                     membership.membership_state = MEMBERSHIP_STATE_REMOVED
                     membership.removed_at = stamp
                     removed_memberships += 1
+                    departed_account_ids.append(account.id)
                 continue
             membership.official_role = normalize_official_role(remote.get("role")) or membership.official_role
             membership.official_user_id = remote.get("user_id") or membership.official_user_id
@@ -445,7 +447,32 @@ class WorkspaceSyncService:
         await operation_store.mark_step(db, operation, "commit_snapshot", state="success", result=result)
         await operation_store.finish(db, operation, result)
         await db.commit()
-        return {"ok": True, "operation_id": operation.public_id, **result}
+        # Plain values: a rollback below would expire the ORM rows.
+        local_workspace_id = workspace.id
+        official_workspace_id = workspace.official_workspace_id
+        operation_public_id = operation.public_id
+        if departed_account_ids:
+            # Book after the snapshot commit so the Sub2API read never holds the SQLite write lock.
+            from app.application.revenue_ledger import revenue_ledger
+            from app.application import codex_publish
+
+            for account_id in departed_account_ids:
+                await revenue_ledger.settle_departure(
+                    db, workspace_id=local_workspace_id, account_id=account_id, source="sync_departure",
+                    operation_id=operation_public_id,
+                )
+                await db.commit()
+                # Disable (never delete) the codex-rs copy; failures never fail the sync.
+                try:
+                    disabled = await codex_publish.disable_on_departure(db, account_id, official_workspace_id)
+                    await db.commit()
+                except Exception as exc:  # noqa: BLE001
+                    await db.rollback()
+                    disabled = {"ok": False, "skipped": False, "error_code": "codex_rs_disable_failed", "message": str(exc)}
+                if not disabled.get("ok") and not disabled.get("skipped"):
+                    logger.warning("codex-rs 停用失败 account_id=%s error=%s", account_id,
+                                   disabled.get("error_code") or disabled.get("message"))
+        return {"ok": True, "operation_id": operation_public_id, **result}
 
     async def _read_only_collection(self, db, workspace, owner, kind):
         from app.application.tokens import decrypt_secret

@@ -5,7 +5,11 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Any
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from app.persistence.models.operations import Operation
+from app.persistence.models.oauth import OAuthSession
+from app.persistence.models.revenue import Sub2ApiRevenueEntry
 
 from app.application.queries.identity import (
     HIDDEN_ACCOUNT_STATES,
@@ -13,9 +17,11 @@ from app.application.queries.identity import (
     workspaces_query,
 )
 from app.application.quota import quota_service
+from app.application.revenue_daily import revenue_daily
+from app.application.revenue_ledger import revenue_ledger
 from app.application.sub2api_usage import sub2api_usage_service
 from app.application import sub2api_status
-from app.application.presenters import build_auth_status
+from app.application.presenters import build_auth_status, account_attention
 from app.core.proxy import mask_proxy_url
 from app.core.time import isoformat
 from app.domain.identity import MEMBERSHIP_STATE_INVITED, MEMBERSHIP_STATE_JOINED, MEMBERSHIP_STATE_REMOVED
@@ -63,11 +69,45 @@ def _quota_risk(quota: dict[str, Any] | None) -> str | None:
     return "ok"
 
 
-def _account_card(item: dict[str, Any], *, kind: str) -> dict[str, Any]:
+async def _last_authorized(db: AsyncSession) -> dict[int, Any]:
+    """Latest successful OAuth per account (plugin, manual and automatic flows all consume a session)."""
+    from sqlalchemy import func
+
+    rows = await db.execute(
+        select(OAuthSession.account_id, func.max(OAuthSession.consumed_at))
+        .where(OAuthSession.account_id.is_not(None), OAuthSession.status == "consumed",
+               OAuthSession.consumed_at.is_not(None))
+        .group_by(OAuthSession.account_id)
+    )
+    return {int(account_id): consumed for account_id, consumed in rows.all()}
+
+
+async def _revenue_counts(db: AsyncSession) -> dict[int, int]:
+    from sqlalchemy import func
+
+    rows = await db.execute(
+        select(Sub2ApiRevenueEntry.workspace_id, func.count(Sub2ApiRevenueEntry.id))
+        .group_by(Sub2ApiRevenueEntry.workspace_id)
+    )
+    return {int(workspace_id): int(count) for workspace_id, count in rows.all()}
+
+
+def _account_card(item: dict[str, Any], *, kind: str, last_authorized: dict[int, Any] | None = None) -> dict[str, Any]:
     quota = item.get("quota") or {}
     auth_status = build_auth_status(item)
+    rs = (item.get("codex_rs") or {}).get("health")
+    if rs and kind not in {"history", "mother"}:
+        item = dict(item)
+        item["official_health"] = item.get("health")
+        code = "auth_required" if rs["needs_auth"] else {"normal": "healthy", "quota_exhausted": "quota_exhausted",
+            "rate_limited": "rate_limited", "disabled": "disabled"}.get(rs["state"], "temporary_failure")
+        if rs["stale"]:
+            code = "temporary_failure"
+        item["health"] = {"code": code, "label": f"rs · {rs['label']}" + (" · 待核对" if rs["stale"] else ""),
+                          "severity": rs["severity"], "needs_auth": rs["needs_auth"], "action": "details"}
     return {
         **item,
+        "last_authorized_at": isoformat((last_authorized or {}).get(item.get("id"))),
         **auth_status,
         **({"needs_auth": item["health"]["needs_auth"], "auth_action": item.get("auth_action")} if item.get("health") else {}),
         "kind": kind,
@@ -90,6 +130,9 @@ async def portfolio_query(db: AsyncSession) -> dict[str, Any]:
     accounts_by_id = {item["id"]: item for item in accounts_payload.get("items") or []}
     usage_by_context = await sub2api_usage_service.payloads_by_context(db)
     remote_by_context, remote_summary = await sub2api_status.payloads(db)
+    last_authorized = await _last_authorized(db)
+    revenue_totals = await revenue_ledger.totals(db)
+    revenue_counts = await _revenue_counts(db)
 
     def remote_for(account_id, workspace_id):
         exact = remote_by_context.get((account_id, workspace_id))
@@ -181,7 +224,7 @@ async def portfolio_query(db: AsyncSession) -> dict[str, Any]:
                 membership_state = remote["state"]
             kind = "mother" if is_owner else ("history" if membership_state == MEMBERSHIP_STATE_REMOVED else ("invited" if membership_state == MEMBERSHIP_STATE_INVITED else "child"))
             card = _account_card(
-                {
+                last_authorized=last_authorized, item={
                     **account,
                     "workspace_id": ws_id,
                     "official_role": (remote or {}).get("role") or row.official_role,
@@ -210,7 +253,7 @@ async def portfolio_query(db: AsyncSession) -> dict[str, Any]:
                 assigned_ids.add(owner_item["id"])
                 health = read_health(accounts_raw[owner_item["id"]], ws_id)
                 mother = _account_card(
-                    {
+                    last_authorized=last_authorized, item={
                         **owner_item,
                         "workspace_id": ws_id,
                         "official_role": owner_item.get("official_role") or "owner",
@@ -293,6 +336,10 @@ async def portfolio_query(db: AsyncSession) -> dict[str, Any]:
                 },
                 "quota_risk": "danger" if "danger" in risks else ("warning" if "warning" in risks else ("ok" if risks else None)),
                 "usage": workspace_usage,
+                "revenue": {
+                    "settled": revenue_totals["by_workspace"].get(int(ws_id), "0"),
+                    "count": revenue_counts.get(int(ws_id), 0),
+                },
                 "usage_note": "Workspace 计费按已验证 Binding 的本地快照聚合。" if (workspace_usage or {}).get("available") else "尚无可聚合的 Sub2API 用量快照。",
             }
         )
@@ -306,7 +353,7 @@ async def portfolio_query(db: AsyncSession) -> dict[str, Any]:
         item["usage"] = usage_for(item["id"], None)
         item["remote_status"] = remote_for(item["id"], None)
         item.update(read_health(accounts_raw[item["id"]], None))
-        unassigned.append(_account_card(item, kind="unassigned"))
+        unassigned.append(_account_card(item, kind="unassigned", last_authorized=last_authorized))
 
     unique = {}
     for group in groups:
@@ -333,19 +380,52 @@ async def portfolio_query(db: AsyncSession) -> dict[str, Any]:
                         "severity": "warning" if bad else "success", "action": "details", "needs_auth": needs},
                 needs_auth=needs, auth_action="reauthorize" if needs else None)
     account_items = list(unique.values())
+    latest_onboarding = {}
+    for op in await db.scalars(select(Operation).where(Operation.archived_at.is_(None),
+                              Operation.op_type.in_(("onboard", "replenish")), Operation.account_id.in_([item["id"] for item in account_items]))
+                              .order_by(Operation.id.desc())):
+        latest_onboarding.setdefault((op.account_id, op.workspace_id), op)
+    failed_syncs = {group["id"] for group in groups if (group.get("last_sync_operation") or {}).get("state") in {"failed", "partial", "manual_required"}}
+    for item in account_items:
+        reasons = account_attention(item)
+        interrupted = next((latest_onboarding.get((item["id"], context.get("workspace_id"))) for context in item.get("contexts") or [item]
+                            if latest_onboarding.get((item["id"], context.get("workspace_id"))) is not None
+                            and latest_onboarding[(item["id"], context.get("workspace_id"))].state in {"failed", "partial", "manual_required"}), None)
+        if interrupted is not None:
+            reasons.append({"code": "onboarding", "label": "入组中断"})
+            item["interrupted_operation_id"] = interrupted.public_id
+        if any(context.get("workspace_id") in failed_syncs for context in item.get("contexts") or [item]):
+            reasons.append({"code": "sync", "label": "团队同步未完成"})
+        item["attention_reasons"] = reasons
+        item["needs_attention"] = bool(reasons)
     def has_state(item, codes):
         return any(c.get("health", {}).get("code") in codes for c in item.get("contexts") or [item])
     summary = {"teams": len(groups), "accounts": len(account_items),
                "needs_auth": sum(bool(item.get("needs_auth")) for item in account_items),
                "retry": sum(has_state(item, {"rate_limited", "temporary_failure", "parse_error"}) for item in account_items),
-               "attention": sum(item["health"]["code"] not in {"healthy", "disabled"} for item in account_items)}
+               "attention": sum(item["needs_attention"] for item in account_items)}
+    attention_breakdown = {code: sum(any(reason["code"] == code for reason in item["attention_reasons"]) for item in account_items)
+                           for code in ("auth", "onboarding", "quota", "check", "remote", "identity", "sync")}
+    by_id = {item["id"]: item for item in account_items}
+    for group in groups:
+        for member in group["members"]:
+            source = by_id.get(member.get("id"))
+            if source:
+                for key in ("needs_attention", "attention_reasons", "interrupted_operation_id"):
+                    if key in source:
+                        member[key] = source[key]
+    revenue_overview = await revenue_daily.overview_totals(db, groups)
     return {
         "accounts": account_items,
         "summary": summary,
+        "attention_breakdown": attention_breakdown,
         "probe_runtime": await quota_service.runtime_summary(db),
         "groups": groups,
         "unassigned": unassigned,
+        "revenue_totals": {"total": revenue_totals["total"], "month": revenue_totals["month"]},
+        "revenue_overview": revenue_overview,
         "usage_available": any(item.get("available") for item in usage_by_context.values()),
         "sub2api_status": remote_summary,
+        "codex_rs_status": {"bindings": sum(bool(item.get("codex_rs")) for item in account_items)},
         "usage_note": "Sub2API 用量仅来自后台同步的本地快照；缺失和失败不会显示为 0。",
     }

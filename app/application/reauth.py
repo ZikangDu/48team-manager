@@ -6,7 +6,7 @@ import logging
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import case, func, or_, select
+from sqlalchemy import case, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
@@ -64,10 +64,13 @@ async def load_cf_config(db: AsyncSession) -> dict[str, str]:
 
 async def _remote_refresh_guard(db, account_id):
     from app.persistence.models.sub2api import Sub2ApiRefreshAuthority
-    from app.application.refresh_ownership import remote_refresh_owner
+    from app.application.refresh_ownership import remote_refresh_owner, codex_refresh_owner
     if await remote_refresh_owner(db, account_id):
         return {"success": False, "skipped": True, "allow_oauth": False, "error_code": "remote_refresh_owned",
                 "error": "账号已委托 Sub2API 刷新，请人工核对后再重新授权", "status": "skipped"}
+    if await codex_refresh_owner(db, account_id):
+        return {"success": False, "skipped": True, "allow_oauth": False, "error_code": "remote_refresh_owned",
+                "error": "账号由 codex-rs 续期，请人工核对后再重新授权", "status": "skipped"}
     return None
 
 
@@ -486,6 +489,7 @@ class ReauthService:
             role=role,
             mode="manual",
             proxy=str(account.proxy or ""),
+            proxy_source=str(account.proxy_source or ""),
             password="",
         )
         oauth_sessions.mark_session(
@@ -550,15 +554,28 @@ class ReauthService:
                 "error_code": "credential_revision_conflict",
             }
         context = oauth_session_store.exchange_context(stored)
-        exchanger = client or chatgpt_client
-        exchanged = await exchanger.exchange_oauth_code(
-            code=parsed["code"],
-            client_id=context["client_id"] or DEFAULT_OAUTH_CLIENT_ID,
-            redirect_uri=context["redirect_uri"] or OAUTH_REDIRECT_URI,
-            code_verifier=context["code_verifier"],
-            db_session=db,
-            identifier=account.email,
-        )
+        from app.application.workspace_proxy import POLICY, WorkspaceProxyClient
+        from app.core.proxy import normalize_proxy_url
+        pinned = stored.proxy_source == POLICY
+        if pinned and (not context["proxy"] or account.proxy_source != POLICY
+                       or normalize_proxy_url(account.proxy) != context["proxy"]):
+            await oauth_session_store.finish(db, stored, success=False)
+            await db.commit()
+            return {"ok": False, "success": False, "error_code": "oauth_proxy_changed",
+                    "error": "账号代理在授权期间发生变化，请核对后重新接入"}
+        exchanger = client or (WorkspaceProxyClient(context["proxy"]) if pinned else chatgpt_client)
+        try:
+            exchanged = await exchanger.exchange_oauth_code(
+                code=parsed["code"],
+                client_id=context["client_id"] or DEFAULT_OAUTH_CLIENT_ID,
+                redirect_uri=context["redirect_uri"] or OAUTH_REDIRECT_URI,
+                code_verifier=context["code_verifier"],
+                db_session=db,
+                identifier=account.email,
+            )
+        finally:
+            if pinned and client is None:
+                await exchanger.clear_session(account.email)
         if not exchanged.get("success") or not exchanged.get("access_token"):
             await oauth_session_store.finish(db, stored, success=False)
             await db.commit()
@@ -578,6 +595,15 @@ class ReauthService:
                 "error": f"登录邮箱是 {token_email}，和账号 {account.email} 不一致",
                 "error_code": "token_identity_mismatch",
             }
+        if pinned:
+            await db.execute(update(Account).where(Account.id == account.id).values(version=Account.version))
+            await db.refresh(account)
+            if (account.credential_revision != stored.credential_revision or account.proxy_source != POLICY
+                    or normalize_proxy_url(account.proxy) != context["proxy"]):
+                await oauth_session_store.finish(db, stored, success=False)
+                await db.commit()
+                return {"ok": False, "success": False, "error_code": "oauth_proxy_changed",
+                        "error": "授权期间账号配置已变化，未覆盖当前凭据，请人工核对"}
         await auth_service.apply_tokens(account, exchanged)
         await self.mark_outcome(db, account, success=True)
         await oauth_session_store.finish(db, stored, success=True)

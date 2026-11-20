@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -18,8 +19,11 @@ from app.integrations.sub2api.client import sub2api_client
 from app.persistence.models.identity import ExternalBinding
 from app.persistence.models.sub2api import Sub2ApiUsageSnapshot
 
-WINDOW_KINDS = ("five_hour", "today", "seven_day")
+WINDOW_KINDS = ("five_hour", "today", "seven_day", "lifetime")
 USAGE_STALE_AFTER = timedelta(minutes=30)
+LIFETIME_MAX_DAYS = 90
+
+logger = logging.getLogger(__name__)
 
 
 def _safe_error(exc: BaseException | str) -> str:
@@ -71,13 +75,37 @@ def _money_text(value: Decimal | None) -> str | None:
     return format(value, "f")
 
 
+def lifetime_window(bound_at: datetime | None, now: datetime | None = None) -> tuple[int, bool]:
+    """Days to query for a binding's lifetime (local calendar days, 1..90) and whether 90 capped it."""
+    local_zone = zone(load_settings().timezone)
+    today = as_utc(now or utcnow()).astimezone(local_zone).date()
+    bound = as_utc(bound_at)
+    if bound is None:
+        return 1, False
+    days = (today - bound.astimezone(local_zone).date()).days + 1
+    if days > LIFETIME_MAX_DAYS:
+        return LIFETIME_MAX_DAYS, True
+    return max(1, days), False
+
+
+def lifetime_start(days: int, now: datetime | None = None) -> datetime:
+    """UTC start of a lifetime window spanning `days` local calendar days ending today."""
+    local_zone = zone(load_settings().timezone)
+    local_now = as_utc(now or utcnow()).astimezone(local_zone)
+    start_local = local_now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=max(1, days) - 1)
+    return start_local.astimezone(timezone.utc)
+
+
 class Sub2ApiUsageService:
     def _window_bounds(
-        self, kind: str, payload: dict[str, Any], now: datetime
+        self, kind: str, payload: dict[str, Any], now: datetime, *, bound_at: datetime | None = None
     ) -> tuple[datetime | None, datetime]:
         if kind == "five_hour":
             reset_at = _parse_remote_time(payload.get("resets_at"))
             return (reset_at - timedelta(hours=5) if reset_at else None, now)
+        if kind == "lifetime":
+            days, _capped = lifetime_window(bound_at, now)
+            return lifetime_start(days, now), now
         local_zone = zone(load_settings().timezone)
         local_now = now.astimezone(local_zone)
         start_local = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -89,7 +117,7 @@ class Sub2ApiUsageService:
         source = payload.get("window_stats") if kind == "five_hour" else payload
         if not isinstance(source, dict):
             raise ValueError(f"Sub2API did not return {kind} billing statistics")
-        if kind == "seven_day":
+        if kind in ("seven_day", "lifetime"):
             return {
                 "request_count": _integer(source.get("total_requests")),
                 "total_tokens": _integer(source.get("total_tokens")),
@@ -132,7 +160,7 @@ class Sub2ApiUsageService:
             row = Sub2ApiUsageSnapshot(binding_id=binding.id, window_kind=kind)
             db.add(row)
         metrics = self._metrics(kind, payload)
-        start_at, end_at = self._window_bounds(kind, payload, now)
+        start_at, end_at = self._window_bounds(kind, payload, now, bound_at=binding.created_at)
         row.local_account_id = binding.local_account_id
         row.workspace_id = binding.workspace_id
         row.remote_account_id = str(binding.remote_account_id)
@@ -150,6 +178,34 @@ class Sub2ApiUsageService:
         row.updated_at = now
         await db.flush()
         return row
+
+    async def _record_daily(
+        self, db: AsyncSession, binding: ExternalBinding, row: Sub2ApiUsageSnapshot, now: datetime
+    ) -> None:
+        """Copy a fresh `today` snapshot into the daily revenue record; failures only log."""
+        from app.application.revenue_daily import revenue_daily
+        from app.persistence.models.identity import Account
+
+        try:
+            start = as_utc(row.window_start_at)
+            if start is None or row.user_cost is None:
+                return
+            # Day from the snapshot window, not a new clock read, so a sync straddling midnight stays on one day.
+            day = start.astimezone(zone(load_settings().timezone)).date()
+            account = await db.get(Account, binding.local_account_id) if binding.local_account_id else None
+            await revenue_daily.record_day(
+                db,
+                remote_account_id=str(binding.remote_account_id),
+                day=day,
+                user_cost=row.user_cost,
+                source="sync",
+                workspace_id=binding.workspace_id,
+                account_id=binding.local_account_id,
+                email=(account.email if account else None) or binding.verified_email,
+                now=now,
+            )
+        except Exception as exc:
+            logger.warning("revenue daily: sync record failed for binding %s: %s", binding.id, _safe_error(exc))
 
     async def _record_failure(
         self,
@@ -252,9 +308,12 @@ class Sub2ApiUsageService:
                 failed += 1
 
         remote_ids = [remote_id for _binding, remote_id in usable]
+        lifetime_days = {
+            remote_id: lifetime_window(binding.created_at, now)[0] for binding, remote_id in usable
+        }
         try:
             windows = await sub2api_client.fetch_billing_windows(
-                db, remote_ids, force_usage=force_usage
+                db, remote_ids, force_usage=force_usage, lifetime_days=lifetime_days
             )
         except Exception as exc:
             error = _safe_error(exc)
@@ -288,8 +347,10 @@ class Sub2ApiUsageService:
                 item = windows.get(kind, {}).get(key)
                 if isinstance(item, dict):
                     try:
-                        await self._record_success(db, binding, kind, item, now)
+                        row = await self._record_success(db, binding, kind, item, now)
                         updated += 1
+                        if kind == "today":
+                            await self._record_daily(db, binding, row, now)
                         continue
                     except Exception as exc:
                         remote_errors = {**remote_errors, kind: _safe_error(exc)}

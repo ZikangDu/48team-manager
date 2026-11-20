@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from sqlalchemy import func, select
+import json
 
 from app.application.jobs import browser, scheduler as scheduling
 from app.application.jobs.dispatcher import reauth_dispatcher
-from app.application.presenters import BUSINESS_STEP_LABELS, OPERATION_TYPE_LABELS
+from app.application.presenters import BUSINESS_STEP_LABELS, OPERATION_TYPE_LABELS, operation_stage_plan
 from app.application.quota import quota_service
 from app.application.reauth import reauth_service
 from app.application.rotate import rotate_service
@@ -27,10 +28,12 @@ SAFE_ERRORS = {
     "cancelled": "已取消",
     "http_429": "请求受限，等待重试",
 }
-SOURCE_LABELS = {"manual": "手动", "scheduled": "定时", "retry": "重试", "oauth_callback": "授权后续", "automatic": "自动", "auto": "自动轮转", "auto_sync": "同步重试"}
+SOURCE_LABELS = {"manual": "手动", "scheduled": "定时", "retry": "重试", "oauth_callback": "授权后续", "automatic": "自动", "auto": "自动轮转", "auto_sync": "同步重试", "extension": "插件", "manual_rotation": "手动轮转", "codex_refill": "自动补号"}
 
 
 def runtime_operation(row, *, workspace_name=None, now=None, next_retry_at=None):
+    from app.application.manual_rotation import can_continue
+
     stamp = now or utcnow()
     state = row.state
     if state == "manual_required":
@@ -45,13 +48,27 @@ def runtime_operation(row, *, workspace_name=None, now=None, next_retry_at=None)
         display_state, reason = state, None
     start = as_utc(row.started_at) if row.started_at else None
     error_code = row.error_code if row.error_code in SAFE_ERRORS else ("operation_failed" if row.error_code else None)
+    # Only allowlisted stage codes, never log messages or inputs.
+    try:
+        logs = json.loads(row.log_json or "[]")
+    except (TypeError, ValueError):
+        logs = []
+    plan = operation_stage_plan(row.op_type, row.source)
+    known = set(BUSINESS_STEP_LABELS) | {code for stage in plan for code in stage["stages"]}
+    observed = list(dict.fromkeys(item.get("stage") for item in logs
+                                 if isinstance(item, dict) and isinstance(item.get("stage"), str)
+                                 and item["stage"] in known)) if isinstance(logs, list) else []
     return {
         "id": row.public_id, "operation_id": row.public_id,
         "kind": row.op_type if row.op_type in OPERATION_TYPE_LABELS else "other",
         "operation_label": OPERATION_TYPE_LABELS.get(row.op_type, "后台任务"),
         "state": state, "status": display_state, "wait_reason": reason,
         "stage_label": BUSINESS_STEP_LABELS.get(row.current_step, "执行中" if state == "running" else "等待状态更新"),
-        "stage_code": row.current_step if row.current_step in BUSINESS_STEP_LABELS else None,
+        "stage_code": row.current_step if row.current_step in known else None,
+        "stage_plan": plan, "observed_stages": observed,
+        "cancel_requested": bool(row.cancel_requested),
+        "can_cancel": state in {"queued", "running", "waiting"} and not row.cancel_requested,
+        "can_continue_rotation": can_continue(row),
         "target": {"kind": "workspace" if row.workspace_id else ("account" if row.account_id else "system"),
                    "id": row.workspace_id or row.account_id},
         "target_label": workspace_name or (f"工作区 #{row.workspace_id}" if row.workspace_id else (f"账号 #{row.account_id}" if row.account_id else "系统")),
@@ -86,7 +103,7 @@ async def runtime_status(db, *, now=None):
     ).group_by(Operation.state))).all())
     active = list(await db.scalars(select(Operation).where(
         Operation.archived_at.is_(None), Operation.state.in_(active_states),
-    ).order_by((Operation.state == "running").desc(), Operation.created_at, Operation.id).limit(8)))
+    ).order_by((Operation.state == "running").desc(), Operation.created_at, Operation.id).limit(200)))
     recent = list(await db.scalars(select(Operation).where(
         Operation.archived_at.is_(None), Operation.state.in_(TERMINAL_STATES),
     ).order_by(Operation.finished_at.desc(), Operation.id.desc()).limit(5)))
@@ -126,10 +143,22 @@ async def runtime_status(db, *, now=None):
     last_scan = {key: value for key, value in last_scan.items() if key in {
         "state", "started_at", "finished_at", "scanned", "rotated", "kicked_only", "skipped", "failed", "capped", "conflict", "error_code",
     }}
-    rotation_blocked = list(await db.scalars(select(Operation.workspace_id).where(
+    # Each unarchived partial/manual automatic rotation stops further automatic swaps in its team.
+    blocking_rows = list(await db.scalars(select(Operation).where(
         Operation.op_type == "rotate", Operation.source == "auto", Operation.archived_at.is_(None),
         Operation.state.in_(("partial", "manual_required")),
-    ).distinct()))
+    ).order_by(Operation.updated_at.desc(), Operation.id.desc())))
+    rotation_blocked = {}
+    for row in blocking_rows:
+        rotation_blocked.setdefault(row.workspace_id, row)
+    missing = {value for value in rotation_blocked if value and value not in names}
+    if missing:
+        for row in await db.scalars(select(Workspace).where(Workspace.id.in_(missing))):
+            names[row.id] = row.custom_name or row.official_name or row.name or f"工作区 #{row.id}"
+    blocked = [{"workspace_id": workspace_id,
+                "workspace_name": names.get(workspace_id) or f"工作区 #{workspace_id}",
+                "operation_id": row.public_id, "state": row.state}
+               for workspace_id, row in rotation_blocked.items()]
     last_rotation = await db.scalar(select(Operation).where(
         Operation.op_type == "rotate", Operation.source.in_(("auto", "auto_sync")),
         Operation.archived_at.is_(None),
@@ -138,7 +167,7 @@ async def runtime_status(db, *, now=None):
         "auto_rotation": {
             "enabled": rotate["auto_rotate_enabled"], "daily_limit": rotate["auto_rotate_daily_limit"],
             "scope": rotate["auto_rotate_scope"], "workspace_ids": rotate["auto_rotate_workspace_ids"],
-            "scan_seconds": 60, "blocked_workspaces": len(rotation_blocked), "last_scan": last_scan,
+            "scan_seconds": 60, "blocked_workspaces": len(rotation_blocked), "blocked": blocked, "last_scan": last_scan,
             "last_operation": runtime_operation(last_rotation, now=stamp) if last_rotation else None,
         },
         "generated_at": isoformat(stamp),

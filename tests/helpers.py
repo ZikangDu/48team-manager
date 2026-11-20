@@ -22,6 +22,9 @@ def make_settings(tmp_path: Path, **overrides) -> Settings:
         "auto_reauth_enabled": False,
         "auto_rotate_enabled": False,
         "force_refill": False,
+        # Tests never spawn the bundled Node bridge or touch the network.
+        "auth_bridge_enabled": False,
+        "auth_bridge_managed": False,
     }
     payload.update(overrides)
     return Settings(**payload)

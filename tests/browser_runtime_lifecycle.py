@@ -90,26 +90,36 @@ def main():
         page = context.new_page()
         page.on("pageerror", lambda err: errors.append(str(err)))
         page.goto(BASE + "/accounts")
-        page.wait_for_selector('[data-workspace-sync="1"]')
+        def open_sync(team_id):
+            page.locator(f'[data-focus-key="team-menu:{team_id}"]').click()
+            return page.locator(f'#action-menu [data-workspace-sync="{team_id}"]')
+        page.wait_for_selector('[data-focus-key="team-menu:1"]')
         page.evaluate('window.otherTeam = document.querySelector("[data-workspace=\\"2\\"]")')
-        page.locator('[data-workspace-sync="1"]').click()
-        page.wait_for_function('document.querySelector("[data-workspace-sync=\\"1\\"]").disabled')
+        open_sync(1).click()
+        page.locator('[data-workspace="1"] .group-sync-outcome').wait_for()
+        assert open_sync(1).is_disabled()
         assert page.evaluate('window.otherTeam === document.querySelector("[data-workspace=\\"2\\"]")')
-        assert not page.locator('[data-workspace-sync="2"]').is_disabled()
+        assert not open_sync(2).is_disabled()
+        page.keyboard.press('Escape')
         assert [w["path"] for w in writes] == ["/api/workspaces/1/sync"]
         page.reload()
-        page.wait_for_selector('[data-workspace-sync="1"][aria-busy="true"]')
+        assert open_sync(1).is_disabled()
+        page.keyboard.press('Escape')
         assert len(writes) == 1
         control["sync"] = None
         control["last"] = {**op, "state": "failed", "status": "failed"}
         page.evaluate("window.Team48Accounts.refresh()")
-        page.wait_for_function('!document.querySelector("[data-workspace-sync=\\"1\\"]").disabled')
-        assert "最近同步失败" in page.locator('[data-workspace="1"] .group-sync-outcome').inner_text()
+        page.locator('[data-workspace="1"] .group-sync-outcome').filter(has_text='最近同步未完成').wait_for()
+        assert not open_sync(1).is_disabled()
+        page.keyboard.press('Escape')
         page.screenshot(path=str(OUT / "sync-failed-1440.png"), full_page=True)
-        page.locator('[data-workspace-sync="2"]').click()
+        open_sync(2).click()
         page.get_by_text("缺少母号访问凭据，请先手动授权。", exact=True).wait_for()
-        assert not page.locator('[data-workspace-sync="2"]').is_disabled()
+        assert not open_sync(2).is_disabled()
+        page.keyboard.press('Escape')
+        page.locator('.management-more-filters > summary').click()
         page.locator('[data-action-page="workspace-sync-all"]').click()
+        page.locator('.management-more-filters > summary').click()
         page.wait_for_timeout(250)
         assert writes[-1]["path"] == "/api/workspaces/sync"
         assert "团队 #2" in page.locator("#management-sync-status").inner_text()
@@ -120,14 +130,16 @@ def main():
         page.locator('[data-focus-key="team:1"]').click()
         row = page.locator(f'.team-member-row[data-member-email="{email}"]')
         row.locator("summary").click()
-        page.on("dialog", lambda dialog: dialog.accept())
         row.get_by_role("button", name="移出官方团队").click()
-        page.locator(".team-former-members").wait_for()
-        page.locator(".team-former-members").get_by_role("button", name="重新邀请").click()
-        assert page.locator(".team-reinvite-form select").input_value() == "member"
+        page.wait_for_selector("#confirm-sheet:not([hidden]) #confirm-submit")
+        page.click("#confirm-submit")
+        page.wait_for_selector("#confirm-sheet", state="hidden")
+        row.get_by_role('button', name='重新邀请').wait_for()
+        row.get_by_role('button', name='重新邀请').click()
+        assert page.locator('.team-reinvite-form select[name="role"]').input_value() == "member"
         page.locator(".team-reinvite-form").get_by_role("button", name="发送邀请").click()
         page.wait_for_function('!document.querySelector(".team-reinvite-form [role=alert]").hidden')
-        assert page.locator(".team-reinvite-form select").input_value() == "member"
+        assert page.locator('.team-reinvite-form select[name="role"]').input_value() == "member"
         page.wait_for_timeout(5000)
         for width in (1440, 390):
             page.set_viewport_size({"width": width, "height": 1000 if width > 500 else 844})
@@ -136,27 +148,30 @@ def main():
             assert page.locator(".team-reinvite-form").evaluate("n => {const r=n.getBoundingClientRect(); return r.right<=innerWidth && r.bottom<=innerHeight;}")
             page.screenshot(path=str(OUT / f"reinvite-{width}.png"))
         page.locator(".team-reinvite-form").get_by_role("button", name="发送邀请").click()
-        page.wait_for_function('!document.querySelector(".team-former-members")')
+        row.get_by_text('等待接受邀请', exact=True).wait_for()
         assert "等待接受邀请" in page.locator(f'.team-member-row[data-member-email="{email}"]').inner_text()
-        assert writes[-1]["body"] == {"email": email, "role": "member"}
+        assert writes[-1]["body"] == {"email": email, "role": "member", "seat_intent": "workspace_default"}
         assert not any("onboard" in w["path"] or "reauth" in w["path"] or "sub2api" in w["path"] for w in writes)
         page.goto(BASE + "/")
-        page.wait_for_selector(".runtime-operation")
         page.wait_for_function('document.querySelector("[data-summary=accounts]").textContent.trim() !== "—"')
-        assert page.locator("#runtime-counts").inner_text() == "运行 1 · 排队 1 · 等待 1"
-        assert "等待浏览器槽位" in page.locator("#runtime-active").inner_text()
+        page.wait_for_selector(".board-team")
+        assert page.locator("#runtime-status").count() == 0
+        assert page.locator(".board-table").first.locator("th").all_inner_texts() == ["子号", "Sub2API", "上次授权"]
+        assert "母号" not in page.locator("#team-board-root").inner_text()
+        page.set_viewport_size({"width": 1440, "height": 1000})
+        tops = page.locator(".board-team").evaluate_all("ns => ns.slice(0, 2).map(n => Math.round(n.getBoundingClientRect().top))")
+        assert len(tops) < 2 or tops[0] == tops[1], tops
+        page.wait_for_function('document.querySelector("#task-center-open").textContent.includes("1 个需处理")')
         for width in (1440, 1024, 768, 390):
             page.set_viewport_size({"width": width, "height": 1000 if width > 500 else 844})
             assert page.evaluate("document.documentElement.scrollWidth <= innerWidth"), width
-            assert page.locator("#runtime-status").evaluate("n => n.getBoundingClientRect().right <= innerWidth"), width
-            page.screenshot(path=str(OUT / f"runtime-{width}.png"), full_page=True)
+            page.screenshot(path=str(OUT / f"overview-{width}.png"), full_page=True)
         control["runtime_fail"] = True
         page.evaluate("window.Team48Runtime.refresh()")
-        page.wait_for_function('!document.querySelector("#runtime-error").hidden')
-        assert page.locator(".runtime-operation").count() == 3
+        page.wait_for_function('document.querySelector("#task-center-open").textContent.includes("状态更新中断")')
         control["runtime_fail"] = False
         page.evaluate("window.Team48Runtime.refresh()")
-        page.wait_for_function('document.querySelector("#runtime-error").hidden')
+        page.wait_for_function('!document.querySelector("#task-center-open").textContent.includes("状态更新中断")')
         assert not errors, errors
         print(json.dumps({"screenshots": str(OUT), "page_errors": errors, "intercepted_writes": writes, "checks": "single-team scope, reload recovery, group DOM preserved, explicit batch endpoint, remove/reinvite failure/retry, no onboarding, runtime/error recovery, responsive layouts"}))
         browser.close()

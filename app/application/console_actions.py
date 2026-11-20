@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from sqlalchemy import select
@@ -62,6 +63,8 @@ UNSAFE_RETRY_TYPES = {
     "revoke_invite",
     "invite_child",
     "update_member_role",
+    "pool_join",
+    "codex_reauth",
 }
 
 
@@ -100,6 +103,9 @@ async def get_operation_detail(db: AsyncSession, public_id: str) -> dict[str, An
         else ("" if payload["can_cancel"] else f"state={row.state} is not cancellable")
     )
     payload["can_retry"] = row.state in {"failed", "cancelled"} and row.op_type in SAFE_RETRY_TYPES
+    from app.application.manual_rotation import can_continue
+
+    payload["can_continue_rotation"] = can_continue(row)
     if row.op_type in UNSAFE_RETRY_TYPES:
         payload["retry_reason"] = "destructive browser/workspace action cannot be blindly retried"
     elif not payload["can_retry"]:
@@ -435,16 +441,46 @@ async def account_reauth_complete(
     *,
     ticket: str,
     callback_url: str,
+    workspace_id: int | None = None,
+    push_sub2api: bool = False,
+    count_switch: bool = False,
+    push_target: str = "sub2api",
 ) -> dict[str, Any]:
     account = await db.get(Account, int(account_id))
     if account is None:
         return {"ok": False, "error": "account not found", "error_code": "account_not_found"}
-    return await reauth_service.complete_manual_reauth(
+    result = await reauth_service.complete_manual_reauth(
         db,
         account,
         ticket=ticket,
         callback_url=callback_url,
     )
+    if result.get("ok") and (push_sub2api or count_switch):
+        from app.application.member_handoff import finish_after_authorization
+
+        result["followups"] = await finish_after_authorization(
+            db,
+            account.id,
+            workspace_id=workspace_id,
+            token_sync=result.get("sub2api_token_sync"),
+            push_sub2api=push_sub2api,
+            count_switch=count_switch,
+            push_target=push_target,
+        )
+    if result.get("ok"):
+        from app.application import manual_rotation
+
+        pending = await manual_rotation.unresolved_for_replacement(db, account.email)
+        if pending is not None:
+            # The rotation stopped only for this authorization; finish it without another click.
+            resumed = await continue_manual_rotation(db, pending.public_id, background=True)
+            result["rotation_continue"] = {
+                "ok": bool(resumed.get("ok")), "operation_id": pending.public_id,
+                "error": resumed.get("error"),
+                "message": "已自动继续原轮转（推送、清理旧号、计数）" if resumed.get("ok")
+                else f"原轮转未能自动继续：{resumed.get('error') or '请到任务里点继续轮转'}",
+            }
+    return result
 
 
 async def account_sub2api_sync(db: AsyncSession, account_id: int) -> dict[str, Any]:
@@ -577,6 +613,33 @@ def _ok_result(result: dict[str, Any], *, operation_id: str | None = None) -> di
     return payload
 
 
+async def _run_command(db: AsyncSession, operation, command, *, background: bool) -> dict[str, Any]:
+    """Run a locked workspace command inline, or hand it to the runner and return its id.
+
+    The command gets its own session in background mode, so it must only close
+    over plain values (ids, strings), never ORM rows from the request session.
+    """
+    from app.application.jobs.commands import command_runner
+
+    if background and command_runner.ready:
+        command_runner.spawn(operation.public_id, command)
+        return {
+            "ok": True,
+            "accepted": True,
+            "status": "running",
+            "state": "running",
+            "operation": operation.op_type,
+            "operation_id": operation.public_id,
+            "workspace_id": operation.workspace_id,
+            "account_id": operation.account_id,
+            "email": operation.email or "",
+        }
+    result = await command(db)
+    await operation_store.finish(db, operation, result)
+    await db.commit()
+    return _ok_result(result, operation_id=operation.public_id)
+
+
 async def start_workspace_onboard(
     db: AsyncSession,
     workspace_id: int,
@@ -592,6 +655,7 @@ async def start_workspace_onboard(
     seat_intent: str = "workspace_default",
     oauth_signup: bool = False,
     browser_executable: str = "",
+    background: bool = False,
 ) -> dict[str, Any]:
     seat_intent = parse_invite_seat_intent(seat_intent).value
     workspace = await db.get(Workspace, int(workspace_id))
@@ -642,28 +706,30 @@ async def start_workspace_onboard(
         return {"ok": False, "error_code": "operation_conflict",
                 "error": "工作区已有变更任务", "operation_id": blocker.public_id}
     await db.commit()
-    result = await onboard_service.invite_and_onboard(
-        db,
-        workspace_id=workspace.id,
-        email_line=email_line,
-        phone_line=phone_line,
-        proxy=proxy_value,
-        proxy_source=proxy_source,
-        sub2api_proxy_id=sub2api_proxy_id,
-        proxy_instance_key=proxy_instance_key,
-        password=password,
-        force=force,
-        skip_invite=skip_invite,
-        role=role,
-        seat_intent=seat_intent,
-        job_id=operation.public_id,
-        in_test=False,
-        oauth_signup=oauth_signup,
-        browser_executable=browser_executable,
-    )
-    await operation_store.finish(db, operation, result)
-    await db.commit()
-    return _ok_result(result, operation_id=operation.public_id)
+    target_id, job_id = workspace.id, operation.public_id
+
+    async def command(session: AsyncSession) -> dict[str, Any]:
+        return await onboard_service.invite_and_onboard(
+            session,
+            workspace_id=target_id,
+            email_line=email_line,
+            phone_line=phone_line,
+            proxy=proxy_value,
+            proxy_source=proxy_source,
+            sub2api_proxy_id=sub2api_proxy_id,
+            proxy_instance_key=proxy_instance_key,
+            password=password,
+            force=force,
+            skip_invite=skip_invite,
+            role=role,
+            seat_intent=seat_intent,
+            job_id=job_id,
+            in_test=False,
+            oauth_signup=oauth_signup,
+            browser_executable=browser_executable,
+        )
+
+    return await _run_command(db, operation, command, background=background)
 
 
 async def start_workspace_replenish(
@@ -673,6 +739,7 @@ async def start_workspace_replenish(
     role: str = "owner",
     phone_line: str = "",
     seat_intent: str = "workspace_default",
+    background: bool = False,
 ) -> dict[str, Any]:
     seat_intent = parse_invite_seat_intent(seat_intent).value
     workspace = await db.get(Workspace, int(workspace_id))
@@ -695,18 +762,20 @@ async def start_workspace_replenish(
         return {"ok": False, "error_code": "operation_conflict",
                 "error": "工作区已有变更任务", "operation_id": blocker.public_id}
     await db.commit()
-    result = await replenish_service.run(
-        db,
-        workspace_id=workspace.id,
-        job_id=operation.public_id,
-        role=role,
-        phone_line=phone_line,
-        seat_intent=seat_intent,
-        in_test=False,
-    )
-    await operation_store.finish(db, operation, result)
-    await db.commit()
-    return _ok_result(result, operation_id=operation.public_id)
+    target_id, job_id = workspace.id, operation.public_id
+
+    async def command(session: AsyncSession) -> dict[str, Any]:
+        return await replenish_service.run(
+            session,
+            workspace_id=target_id,
+            job_id=job_id,
+            role=role,
+            phone_line=phone_line,
+            seat_intent=seat_intent,
+            in_test=False,
+        )
+
+    return await _run_command(db, operation, command, background=background)
 
 
 async def start_controlled_rotate(
@@ -714,59 +783,264 @@ async def start_controlled_rotate(
     workspace_id: int,
     *,
     email: str,
-    email_line: str = "",
-    phone_line: str = "",
-    proxy: str = "",
-    force_refill: bool = False,
-    reason: str = "console",
-    role: str = "owner",
+    replacement_email: str = "",
+    confirm_vacancy: bool = False,
+    background: bool = False,
 ) -> dict[str, Any]:
-    workspace = await db.get(Workspace, int(workspace_id))
-    if workspace is None:
-        return {"ok": False, "error": "workspace not found", "error_code": "not_found"}
-    target = normalize_email(email)
-    if not target:
-        return {"ok": False, "error": "email required", "error_code": "email_required"}
-    child = (
-        await db.execute(select(Account).where(Account.email == normalize_email(target)))
-    ).scalar_one_or_none()
+    """Manual one-for-one rotation; role and seat are read live from the old member."""
+    from app.application import manual_rotation
+
+    operation, blocked = await manual_rotation.open_rotation(
+        db, workspace_id, email=email, replacement_email=replacement_email,
+    )
+    if blocked is not None:
+        return blocked
+    job_id = operation.public_id
+
+    async def command(session: AsyncSession) -> dict[str, Any]:
+        return await manual_rotation.run_manual_rotation(session, job_id, confirm_vacancy=confirm_vacancy)
+
+    return await _run_command(db, operation, command, background=background)
+
+
+SELFCHECK_OP_TYPE = "runner_selfcheck"
+_SELFCHECK_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_SELFCHECK_SHOT = re.compile(r"^[a-z0-9_-]{1,40}\.png$")
+_SELFCHECK_LABELS = {"browserscan": "BrowserScan", "creepjs": "CreepJS", "browserleaks_webrtc": "BrowserLeaks WebRTC"}
+
+
+def _runner_config_view() -> dict[str, Any]:
+    """Read-only runner configuration for the settings card; never exposes paths beyond set / exists."""
+    from pathlib import Path
+
+    from app.application.extension_runner import validate_runner_configuration
+    from app.core.config import load_settings
+    from app.integrations.openai.browser.environment import BrowserEnvironmentError
+
+    settings = load_settings()
+    executable = str(settings.runner_browser_executable or "").strip()
+    try:
+        validate_runner_configuration()
+        config_error, config_code = "", ""
+    except BrowserEnvironmentError as exc:
+        config_error, config_code = str(exc), getattr(exc, "error_code", "runner_not_configured")
+    return {
+        "signup_runner": settings.rotation_signup_runner,
+        "executable_set": bool(executable),
+        "executable_exists": bool(executable) and Path(executable).is_file(),
+        "platform": settings.runner_fingerprint_platform,
+        "gpu_mode": settings.runner_gpu_mode,
+        "ready": not config_error,
+        "error": config_error,
+        "error_code": config_code,
+    }
+
+
+async def _selfcheck_workspaces(db: AsyncSession) -> list[dict[str, Any]]:
+    rows = list(await db.scalars(select(Workspace).where(Workspace.status == "active").order_by(Workspace.id)))
+    owner_ids = {row.owner_account_id for row in rows if row.owner_account_id}
+    owners = {item.id: item for item in await db.scalars(select(Account).where(Account.id.in_(owner_ids)))} if owner_ids else {}
+    items = []
+    for row in rows:
+        owner = owners.get(row.owner_account_id)
+        items.append({
+            "id": row.id,
+            "name": row.custom_name or row.official_name or row.name or f"工作区 #{row.id}",
+            "proxy_set": bool(owner and str(owner.proxy or "").strip()),
+        })
+    return items
+
+
+def _selfcheck_shots(public_id: str, paths: list[Any]) -> list[dict[str, str]]:
+    shots = []
+    for raw in paths or []:
+        name = str(raw or "").rsplit("/", 1)[-1]
+        if not _SELFCHECK_SHOT.fullmatch(name):
+            continue
+        stem = name[:-4]
+        shots.append({"name": stem, "label": _SELFCHECK_LABELS.get(stem, stem),
+                      "url": f"/api/runner/selfcheck/{public_id}/screenshots/{name}"})
+    return shots
+
+
+def _selfcheck_diagnostics(diagnostics: Any) -> dict[str, Any]:
+    """Keep the operation row small: summary fields, not the full plugin report."""
+    data = diagnostics if isinstance(diagnostics, dict) else {}
+    plugin = data.get("plugin") if isinstance(data.get("plugin"), dict) else {}
+    return {
+        "duration_seconds": data.get("duration_seconds"),
+        "last": data.get("last"),
+        "event_count": data.get("event_count"),
+        "plugin_version": plugin.get("version"),
+        "browser_log": list(data.get("browser_log") or [])[-20:],
+    }
+
+
+def _selfcheck_result(public_id: str, workspace_name: str, outcome: dict[str, Any]) -> dict[str, Any]:
+    findings = [item for item in outcome.get("findings") or [] if isinstance(item, dict)]
+    errors = sum(1 for item in findings if item.get("level") == "error")
+    warnings = len(findings) - errors
+    completed = bool(outcome.get("completed"))
+    error_code = str(outcome.get("error_code") or "")
+    # The task succeeds when the probe ran to the end; environment problems are reported as findings.
+    success = completed and not error_code
+    if not success:
+        message = f"自检未完成：{outcome.get('error') or error_code or '插件没有报告完成'}"
+    elif errors or warnings:
+        message = f"自检完成：{errors} 个问题、{warnings} 个提醒"
+    else:
+        message = "自检完成：未发现问题"
+    return {
+        "success": success,
+        "ok": success,
+        "status": "success" if success else "failed",
+        "passed": bool(outcome.get("ok")),
+        "completed": completed,
+        "error_code": error_code,
+        "error": str(outcome.get("error") or "") if not success else "",
+        "message": message,
+        "workspace_name": workspace_name,
+        "summary": outcome.get("summary") or "",
+        "platform": outcome.get("platform") or "",
+        "exit": outcome.get("exit"),
+        "signals": outcome.get("signals"),
+        "findings": findings,
+        "screenshots": _selfcheck_shots(public_id, outcome.get("screenshots") or []),
+        "probe_status": outcome.get("probe_status") or {},
+        "diagnostics": _selfcheck_diagnostics(outcome.get("diagnostics")),
+    }
+
+
+async def runner_selfcheck_overview(db: AsyncSession) -> dict[str, Any]:
+    """Settings card: runner configuration, teams whose mother proxy can be used, last self-check."""
+    from app.persistence.models.operations import Operation
+
+    latest = await db.scalar(select(Operation).where(Operation.op_type == SELFCHECK_OP_TYPE)
+                             .order_by(Operation.id.desc()).limit(1))
+    return {
+        "config": _runner_config_view(),
+        "workspaces": await _selfcheck_workspaces(db),
+        "latest": serialize_operation(latest) if latest is not None else None,
+    }
+
+
+async def start_runner_selfcheck(
+    db: AsyncSession,
+    *,
+    platform: str | None,
+    workspace_id: int | None = None,
+    background: bool = False,
+) -> dict[str, Any]:
+    """Launch Chromix + the extension against fingerprint pages. No signup, no official team change."""
+    from app.application.extension_runner import check_runner_proxy, validate_runner_configuration
+    from app.integrations.openai.browser.environment import BrowserEnvironmentError
+
+    chosen = str(platform or "").strip().lower() or None
+    if chosen not in {None, "linux", "windows"}:
+        return {"ok": False, "error_code": "invalid_platform", "error": "伪装平台只能是 linux 或 windows"}
+    try:
+        validate_runner_configuration()
+    except BrowserEnvironmentError as exc:
+        return {"ok": False, "error_code": getattr(exc, "error_code", "runner_not_configured"), "error": str(exc)}
+
+    if workspace_id:
+        workspace = await db.get(Workspace, int(workspace_id))
+        if workspace is None or workspace.status != "active":
+            return {"ok": False, "error_code": "not_found", "error": "团队不存在或未启用"}
+    else:
+        candidates = [item for item in await _selfcheck_workspaces(db) if item["proxy_set"]]
+        workspace = await db.get(Workspace, candidates[0]["id"]) if candidates else None
+        if workspace is None:
+            return {"ok": False, "error_code": "proxy_missing", "error": "没有已配置母号代理的启用团队"}
+    owner = await db.get(Account, workspace.owner_account_id) if workspace.owner_account_id else None
+    proxy_url = str(owner.proxy or "").strip() if owner else ""
+    try:
+        await check_runner_proxy(proxy_url)
+    except BrowserEnvironmentError as exc:
+        return {"ok": False, "error_code": getattr(exc, "error_code", "proxy_missing"), "error": str(exc)}
+    busy = await operation_store.browser_busy(db)
+    if busy is not None:
+        return {"ok": False, "error_code": "browser_busy", "error": "浏览器正在执行其他任务，请等它结束后再自检",
+                "operation_id": busy.public_id}
+
+    workspace_name = workspace.custom_name or workspace.official_name or workspace.name or f"工作区 #{workspace.id}"
     operation = await operation_store.create(
         db,
-        op_type="rotate",
+        op_type=SELFCHECK_OP_TYPE,
         workspace_id=workspace.id,
-        account_id=child.id if child else None,
-        email=target,
-        phone=str(phone_line or "").strip(),
-        input_payload={
-            "workspace_id": workspace.id,
-            "email": target,
-            "force_refill": bool(force_refill),
-            "reason": reason,
-            "source": "manual",
-            "confirmed": True,
-            "requested_role": parse_invite_role(role),
-        },
-        source="manual",
+        input_payload={"workspace_id": workspace.id, "platform": chosen},
+        resolved_proxy=proxy_url,
     )
     await db.commit()
-    result = await rotate_service.run_rotate_saga(
-        db,
-        job_id=operation.public_id,
-        workspace_id=workspace.id,
-        email=target,
-        reason=reason or "console",
-        force_refill=force_refill,
-        email_line=email_line,
-        phone_line=phone_line,
-        proxy=proxy,
-        child_id=child.id if child else None,
-        skip_confirm=True,
-        role=role,
-        in_test=False,
-    )
-    await operation_store.finish(db, operation, result)
-    await db.commit()
-    return _ok_result(result, operation_id=operation.public_id)
+    job_id = operation.public_id
+
+    async def command(session: AsyncSession) -> dict[str, Any]:
+        from app.application.extension_runner import run_selfcheck
+        from app.application.jobs.browser import InvitedBrowserSession
+
+        slot = InvitedBrowserSession()
+        try:
+            if not await slot.try_reserve():
+                return {"success": False, "status": "failed", "error_code": "browser_busy",
+                        "error": "浏览器正在执行其他任务，请等它结束后再自检"}
+            outcome = await run_selfcheck(session, proxy_url=proxy_url, platform=chosen, job_id=job_id)
+        finally:
+            await slot.close()
+        return _selfcheck_result(job_id, workspace_name, outcome)
+
+    return await _run_command(db, operation, command, background=background)
+
+
+def selfcheck_screenshot_path(public_id: str, name: str):
+    """Only ``data/selfcheck/<public_id>/<[a-z0-9_-]+>.png``; ``None`` for anything else."""
+    from app.application.extension_runner import SELFCHECK_ROOT
+
+    if not _SELFCHECK_ID.fullmatch(str(public_id or "")) or not _SELFCHECK_SHOT.fullmatch(str(name or "")):
+        return None
+    root = SELFCHECK_ROOT.resolve()
+    path = (root / public_id / name).resolve()
+    if path.parent.parent != root or not path.is_file():
+        return None
+    return path
+
+
+async def recover_runner_selfchecks(db: AsyncSession) -> int:
+    """A self-check only runs inside this process; after a restart it can never finish."""
+    from app.domain.automation import ACTIVE_STATES
+    from app.persistence.models.operations import Operation
+
+    rows = list(await db.scalars(select(Operation).where(
+        Operation.op_type == SELFCHECK_OP_TYPE, Operation.state.in_(ACTIVE_STATES),
+    )))
+    for row in rows:
+        await operation_store.finish(db, row, {
+            "success": False, "status": "failed", "error_code": "runner_interrupted",
+            "error": "服务重启，自检中断；可重新发起，不影响任何团队",
+        })
+    if rows:
+        await db.commit()
+    return len(rows)
+
+
+async def continue_manual_rotation(
+    db: AsyncSession,
+    public_id: str,
+    *,
+    confirm_vacancy: bool = False,
+    background: bool = False,
+) -> dict[str, Any]:
+    """Resume only the unconfirmed stages of one manual rotation; never restart it."""
+    from app.application import manual_rotation
+
+    operation, blocked = await manual_rotation.reopen_rotation(db, public_id)
+    if blocked is not None:
+        return blocked
+    job_id = operation.public_id
+
+    async def command(session: AsyncSession) -> dict[str, Any]:
+        return await manual_rotation.run_manual_rotation(session, job_id, confirm_vacancy=confirm_vacancy)
+
+    return await _run_command(db, operation, command, background=background)
 
 
 async def kick_member_to_standby(
@@ -777,6 +1051,7 @@ async def kick_member_to_standby(
     user_id: str | None = None,
     reason: str = "console_kick",
     unbind_sub2api: bool = False,
+    background: bool = False,
 ) -> dict[str, Any]:
     workspace = await db.get(Workspace, int(workspace_id))
     if workspace is None:
@@ -810,18 +1085,20 @@ async def kick_member_to_standby(
             "operation_id": blocker.public_id,
         }
     await db.commit()
-    result = await rotate_service.kick_to_standby(
-        db,
-        workspace_id=workspace.id,
-        email=target,
-        user_id=user_id,
-        reason=reason,
-        unbind_sub2api=unbind_sub2api,
-        job_id=operation.public_id,
-    )
-    await operation_store.finish(db, operation, result)
-    await db.commit()
-    return _ok_result(result, operation_id=operation.public_id)
+    target_id, job_id = workspace.id, operation.public_id
+
+    async def command(session: AsyncSession) -> dict[str, Any]:
+        return await rotate_service.kick_to_standby(
+            session,
+            workspace_id=target_id,
+            email=target,
+            user_id=user_id,
+            reason=reason,
+            unbind_sub2api=unbind_sub2api,
+            job_id=job_id,
+        )
+
+    return await _run_command(db, operation, command, background=background)
 
 
 async def purge_workspace_child(

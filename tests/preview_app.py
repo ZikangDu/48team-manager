@@ -1,6 +1,7 @@
 """Isolated local preview with example identities. External/write actions are disabled."""
 from __future__ import annotations
 
+import re
 from decimal import Decimal
 from contextlib import asynccontextmanager
 from datetime import timedelta
@@ -17,8 +18,11 @@ from app.persistence.models.identity import Account, Workspace, WorkspaceMembers
 from app.persistence.models.quota import QuotaSnapshot
 from app.persistence.models.identity import ExternalBinding
 from app.persistence.models.sub2api import Sub2ApiUsageSnapshot
+from app.persistence.models.revenue import Sub2ApiRevenueDaily, Sub2ApiRevenueEntry
 from app.persistence.models.settings import SystemSetting
 from app.application.jobs import scheduler
+from app.application.revenue_daily import local_today
+from app.application.sub2api_usage import sub2api_usage_service
 
 scheduler.in_test_process = lambda: True
 settings = Settings(_env_file=None,
@@ -91,6 +95,51 @@ async def preview_lifespan(app):
                 if membership is None:
                     db.add(WorkspaceMembership(workspace_id=first_team.id, account_id=standby.id,
                                               membership_state="removed", official_role="member", local_purpose="child", removed_at=utcnow()))
+            now = utcnow()
+            snapshots = list(await db.scalars(select(Sub2ApiUsageSnapshot)))
+            has_lifetime = {row.binding_id for row in snapshots if row.window_kind == "lifetime"}
+            has_today = {row.binding_id for row in snapshots if row.window_kind == "today"}
+            for row in snapshots:
+                if row.window_kind == "seven_day":
+                    # Natural 7-day window (today and the 6 days before) so the overview counts it as synced.
+                    row.window_start_at, row.window_end_at = sub2api_usage_service._window_bounds("seven_day", {}, now)
+                    row.last_success_at = row.last_attempt_at = now
+                if row.window_kind == "seven_day" and row.binding_id not in has_today:
+                    today_cost = ((row.user_cost or Decimal("0")) / Decimal("5")).quantize(Decimal("0.0000000001"))
+                    start, end = sub2api_usage_service._window_bounds("today", {}, now)
+                    db.add(Sub2ApiUsageSnapshot(binding_id=row.binding_id, local_account_id=row.local_account_id, workspace_id=row.workspace_id,
+                        remote_account_id=row.remote_account_id, window_kind="today", window_start_at=start, window_end_at=end,
+                        user_cost=today_cost, account_cost=today_cost*Decimal("0.7"), standard_cost=today_cost,
+                        sync_status="success", last_success_at=now, last_attempt_at=now))
+                if row.window_kind == "seven_day" and row.binding_id not in has_lifetime:
+                    lifetime_cost = (row.user_cost or Decimal("0")) * Decimal("3")
+                    db.add(Sub2ApiUsageSnapshot(binding_id=row.binding_id, local_account_id=row.local_account_id, workspace_id=row.workspace_id,
+                        remote_account_id=row.remote_account_id, window_kind="lifetime", window_start_at=now-timedelta(days=21), window_end_at=now,
+                        user_cost=lifetime_cost, account_cost=lifetime_cost*Decimal("0.7"), standard_cost=lifetime_cost,
+                        sync_status="success", last_success_at=now, last_attempt_at=now))
+            if first_team and not (await db.execute(select(Sub2ApiRevenueEntry.id).limit(1))).first():
+                team_name = first_team.custom_name or first_team.name
+                for i, (email, cost, source, departure, days) in enumerate([
+                    ("former.alpha@example.com", "42.18", "lifetime", "manual_rotation", 23),
+                    ("former.beta@example.com", "7.5", "cache_seven_day", "kick", 7),
+                    ("standby.new@example.com", "0", "missing", "auto_rotation", None),
+                ]):
+                    db.add(Sub2ApiRevenueEntry(workspace_id=first_team.id, workspace_name=team_name, email=email,
+                        remote_account_id=str(900 + i), user_cost=Decimal(cost), amount_source=source, window_days=days,
+                        departure_source=departure, bound_at=now - timedelta(days=30), settled_at=now - timedelta(days=i * 20 + 1), updated_at=now))
+            # Daily revenue of departed example accounts (remote 900 = former.alpha): today and 3 days ago.
+            today = local_today(now)
+            for remote_id, email, days_ago, cost in [
+                ("900", "former.alpha@example.com", 0, "1.84"),
+                ("900", "former.alpha@example.com", 3, "5.62"),
+                ("901", "former.beta@example.com", 5, "2.4"),
+            ]:
+                day = today - timedelta(days=days_ago)
+                exists = await db.scalar(select(Sub2ApiRevenueDaily.id).where(
+                    Sub2ApiRevenueDaily.remote_account_id == remote_id, Sub2ApiRevenueDaily.day == day))
+                if exists is None:
+                    db.add(Sub2ApiRevenueDaily(remote_account_id=remote_id, day=day, workspace_id=first_team.id if first_team else None,
+                        email=email, user_cost=Decimal(cost), source="settle" if days_ago == 0 else "backfill", updated_at=now))
             await db.commit()
         yield
 
@@ -101,7 +150,7 @@ app.router.lifespan_context = preview_lifespan
 @app.middleware("http")
 async def preview_write_guard(request, call_next):
     local_reads = {"/api/accounts", "/api/accounts/portfolio", "/api/workspaces", "/api/overview", "/api/quota/runtime", "/api/runtime/status"}
-    blocked_read = request.url.path.startswith("/api/") and request.url.path not in local_reads
+    blocked_read = request.url.path.startswith("/api/") and request.url.path not in local_reads and not re.fullmatch(r"/api/workspaces/\d+/revenue", request.url.path)
     blocked_write = request.method not in {"GET", "HEAD", "OPTIONS"} and request.url.path not in {"/auth/login", "/auth/logout"}
     if blocked_read or blocked_write:
         return JSONResponse({"detail": {"message": "隔离预览不执行账号操作", "error_code": "preview_readonly"}}, status_code=409)

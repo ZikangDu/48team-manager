@@ -1,0 +1,4773 @@
+import { splitPasswordTotpLine } from './login-account-format.js';
+import { initializeTeamCheckout } from './team-checkout.js';
+import { initializeModelEvaluation } from './model-evaluation.js';
+import { evaluationAccountOwner } from './evaluation-accounts.js';
+import { projectLoginAccounts, sharedAccountKey, healthCredentialKey, mergeSharedAccounts, loginCredentialLines } from './account-workspace.js';
+import { validationFailureHint, validationFailureFields, validationFailureLabel } from './validation-failure.js';
+import { OPERATION_SCHEMA_VERSION, validatePushResults, validateOperationEvent } from './operation-contract.js';
+
+(async () => {
+  let taskConcurrency = null;
+  function selectedTaskConcurrency() {
+    return taskConcurrency ?? '服务端设置';
+  }
+  const pageFetch = (url, options = {}) => fetch(url, {
+    ...options,
+    ...(typeof window !== 'undefined' && window.browserWorkspace ? { signal: options.signal
+      ? AbortSignal.any([options.signal, window.browserWorkspace.signal]) : window.browserWorkspace.signal } : {}),
+  });
+  const OUTPUT_LABELS = {
+    sub2api: "sub2api",
+    cpa: "CPA",
+    cockpit: "Cockpit",
+    "9router": "9router",
+    codex: "Codex",
+    axonhub: "AxonHub",
+    codexmanager: "Codex-Manager",
+    "sub2api-tools": "sub2api 工具",
+    "protocol-login": "协议登录 / RT",
+    "team-checkout": "生成Team长链接",
+    "model-evaluation": "模型测试",
+  };
+
+  const createWorkspaceState = () => ({
+    format: "sub2api",
+    sessions: [],
+    conversionAt: '',
+    converted: [],
+    skipped: [],
+    outputText: "",
+    health: [],
+    healthRun: 0,
+    toolResult: null,
+    toolParsed: null,
+    toolRecords: [],
+    browserAccounts: [],
+    linkedAccountKeys: [],
+    browserSettings: {},
+    cpaSettings: {},
+    pushRetry: null,
+    pushResults: [],
+    pushOperations: [],
+    activePushOperationId: '',
+    operationHistory: [],
+    loginLastAccounts: [],
+    loginLastIds: [],
+    loginSessionIds: [],
+    loginPersonalIds: [],
+    loginBusinessIds: [],
+    logoutInProgress: false,
+    logoutResults: [],
+    logoutLog: [],
+    logoutRun: 0,
+    loginLastResponse: null,
+    loginLastRtKind: "all",
+    // The next protocol/RT run can target only accounts that failed in the
+    // previous run. Keep IDs and public identity only; credentials remain in
+    // the encrypted input field/browser account snapshot.
+    loginRetry: null,
+    accountActionRetries: {},
+    loginProgress: new Map(),
+    loginSensitiveValues: [],
+    loginRenderFrame: 0,
+    loginSub2Loaded: false,
+    loginSub2KeyConfigured: false,
+    loginSub2SelectedGroupIds: [],
+    loginSub2AvailableGroups: [],
+    loginSub2AvailableProxies: [],
+    loginSub2ProxyId: '',
+    loginProxyMode: "direct",
+    loginProxyLocalPort: 7890,
+    loginProxyPool: "",
+    monitorLastCheckAt: 0,
+    monitorRetries: {},
+    monitorEnabled: false,
+    monitorOwner: '',
+    monitorStopped: {},
+  });
+  const state = createWorkspaceState();
+  let pushBusy = false;
+  let pushToastTimer;
+  let monitorTimer;
+  let monitorController;
+  let monitorNextAt = Date.now() + 60_000;
+  let monitorBusy = false;
+  let monitorPaused = false;
+  let monitorLastSummary = '';
+  let selfLeaveBusy = false;
+  let protocolLogoutBusy = false;
+  let evaluationLogoutBusy = false;
+  let healthController;
+  let evaluationEligibility = { accounts: [], total: 0, pending: false };
+  const sharedHealth = new Map();
+  const freshHealth = new Set();
+  const knownHealthPlans = new Map();
+
+  let browserStorageReady = false;
+  let browserStorageAvailable = false;
+  let browserStorageCleared = false;
+  let browserSaveTimer;
+  let browserSaveInFlight = null;
+  let workspaceGeneration = 0;
+  let clearingBrowserData = false;
+  function workspaceTaskIsCurrent(signal) {
+    const generation = workspaceGeneration;
+    return () => generation === workspaceGeneration && !browserStorageCleared && !signal?.aborted;
+  }
+  function requireCurrentWorkspace(isCurrent) {
+    if (!isCurrent()) throw Object.assign(new Error('本地数据已清空或由其他标签页更新'), { name: 'AbortError' });
+  }
+  function browserRequestBody(body = {}) {
+    const ids = Array.isArray(body.ids) ? new Set(body.ids.map(String)) : null;
+    return { ...body, browserState: {
+      accounts: ids ? state.browserAccounts.filter(account => ids.has(String(account.id))) : state.browserAccounts,
+      settings: Object.fromEntries(Object.entries(state.browserSettings).map(([key, value]) => {
+        if (key !== 'sub2apiSettings') return [key, value];
+        const { baseUrl, adminApiKey, groupIds, legacyGroupName, ...exportSettings } = value;
+        return [key, exportSettings];
+      })),
+    } };
+  }
+  async function acceptBrowserState(snapshot) {
+    if (!snapshot || browserStorageCleared) return;
+    const isCurrent = workspaceTaskIsCurrent();
+    const previousSources = JSON.stringify(projectLoginAccounts(state.browserAccounts));
+    const accounts = new Map(state.browserAccounts.map(account => [String(account.id), account]));
+    for (const account of snapshot.accounts || []) accounts.set(String(account.id), account);
+    state.browserAccounts = [...accounts.values()];
+    for (const [key, value] of Object.entries(snapshot.settings || {})) {
+      state.browserSettings[key] = { ...state.browserSettings[key], ...value };
+    }
+    if (snapshot.settings?.sub2apiSettings) restoreSub2apiAccountConfig();
+    rememberLoginAccountKeys();
+    renderTotpResetRecovery();
+    // Credentials are a durable boundary even when they arrive as a partial SSE
+    // snapshot. The caller waits before displaying completion or sending work.
+    await persistBrowserWorkspace(true, true);
+    if (isCurrent() && previousSources !== JSON.stringify(projectLoginAccounts(state.browserAccounts))) scheduleConvert();
+  }
+  function browserFields() {
+    return [...document.querySelectorAll('input, textarea, select')]
+      .filter(node => node.type !== 'file' && !node.readOnly && !node.hasAttribute('data-private') && (node.id || node.name))
+      .map(node => ({ id: node.id, name: node.name, type: node.type, value: node.value, checked: node.checked }));
+  }
+  function restoreBrowserFields(fields = []) {
+    for (const field of fields) {
+      const node = field.id ? document.getElementById(field.id)
+        : [...document.querySelectorAll('input[type="radio"]')].find(node => node.name === field.name && node.value === field.value);
+      if (!node || node.type === 'file' || node.hasAttribute('data-private') || field.id === 'login-concurrency') continue;
+      node.value = field.value;
+      if (typeof field.checked === 'boolean') node.checked = field.checked;
+    }
+  }
+  function settingsOnlyWorkspace() {
+    const retained = createWorkspaceState();
+    for (const key of ['format', 'cpaSettings', 'loginProxyMode', 'loginProxyLocalPort', 'loginProxyPool', 'monitorEnabled',
+      'loginSub2Loaded', 'loginSub2KeyConfigured', 'loginSub2SelectedGroupIds', 'loginSub2AvailableGroups', 'loginSub2AvailableProxies', 'loginSub2ProxyId']) {
+      retained[key] = structuredClone(state[key]);
+    }
+    retained.browserSettings = Object.fromEntries(['protocolSettings', 'sub2apiSettings']
+      .filter(key => state.browserSettings[key]).map(key => [key, structuredClone(state.browserSettings[key])]));
+    retained.loginProgress = [];
+    const ids = new Set(['login-proxy-local-port', 'login-proxy-pool', 'sub2api-models', 'sub2api-concurrency',
+      'sub2api-load-factor', 'sub2api-priority', 'sub2api-fingerprint-mode', 'download-scope', 'health-filter',
+      'usage-filter', 'sub2api-operation', 'split-scope', 'converter-skip-free', 'login-require-non-personal']);
+    const names = new Set(['push-target', 'login-proxy-mode', 'login-workspace-mode', 'session-monitor']);
+    const fields = browserFields().filter(field => ids.has(field.id) || names.has(field.name)
+      || (field.id && document.getElementById(field.id)?.closest('.push-config')));
+    return workspaceSchema.serialize({ state: retained, fields, resetCredentials: '' });
+  }
+  function persistBrowserWorkspace(immediate = false, required = false) {
+    if (!browserStorageReady || browserStorageCleared) {
+      if (required) throw new Error('浏览器加密存储不可用，请使用 HTTPS 或 localhost，并允许站点存储');
+      return;
+    }
+    clearTimeout(browserSaveTimer);
+    const isCurrent = workspaceTaskIsCurrent();
+    const save = () => {
+      browserSaveTimer = null;
+      if (!isCurrent()) return;
+      // Wait before building another full snapshot. Required saves bypass this
+      // gate and keep their exact position in the store's commit queue.
+      if (immediate !== true && !required && browserSaveInFlight) {
+        const active = browserSaveInFlight;
+        return active.then(() => {
+          if (isCurrent() && !browserSaveTimer) persistBrowserWorkspace();
+        });
+      }
+      const fields = browserFields();
+      const snapshot = workspaceSchema.serialize({ state: { ...state, loginProgress: [...state.loginProgress] }, fields,
+        resetCredentials: elements.loginResetCredentials.textContent });
+      const pending = window.browserWorkspace.save(snapshot, { barrier: required }).then(() => {
+          if (isCurrent()) {
+            document.querySelector('#browser-storage-status').textContent = '数据仅保存在此浏览器';
+            scheduleSessionMonitor();
+          }
+        }).catch((error) => {
+          if (!isCurrent()) { if (required) throw error; return; }
+          document.querySelector('#browser-storage-status').textContent = error.code === 'WORKSPACE_CONFLICT' ? error.message : '浏览器保存失败，请及时下载结果';
+          if (required) throw error;
+        });
+      if (required) return pending;
+      browserSaveInFlight = pending;
+      return pending.finally(() => {
+        if (browserSaveInFlight === pending) browserSaveInFlight = null;
+      });
+    };
+    if (immediate === true || required) return save();
+    else browserSaveTimer = setTimeout(save, 250);
+  }
+
+  let loginModalReturnFocus = null;
+  let loginModalPreviousOverflow = "";
+
+  const elements = {
+    accountBody: document.querySelector("#account-body"),
+    clearInput: document.querySelector("#clear-input"),
+    copyOutput: document.querySelector("#copy-output"),
+    cpaNotice: document.querySelector("#cpa-notice"),
+    downloadOutput: document.querySelector("#download-output"),
+    downloadMatched: document.querySelector("#download-matched"),
+    downloadUnmatched: document.querySelector("#download-unmatched"),
+    converterActions: document.querySelector("#converter-actions"),
+    formatList: document.querySelector("#format-list"),
+    converterWorkspace: document.querySelector("#converter-workspace"),
+    loginWorkbench: document.querySelector("#login-workbench"),
+    loginAccounts: document.querySelector("#login-accounts"),
+    importLoginFile: document.querySelector('#import-login-file'),
+    loginFileInput: document.querySelector('#login-file-input'),
+    resetLoginTotp: document.querySelector("#reset-login-totp"),
+    protocolLogoutAll: document.querySelector('#protocol-logout-all'),
+    selfLeaveWorkspaces: document.querySelector('#self-leave-workspaces'),
+    loginResetOutput: document.querySelector("#login-reset-output"),
+    loginResetCredentials: document.querySelector("#login-reset-credentials"),
+    copyLoginResetOutput: document.querySelector("#copy-login-reset-output"),
+    loginAccountCount: document.querySelector("#login-account-count"),
+    taskConcurrencyValue: document.querySelector("#task-concurrency-value"),
+    loginWorkspaceMode: document.querySelector("#login-workspace-mode"),
+    loginProxyMode: document.querySelector("#login-proxy-mode"),
+    loginProxyLocalWrap: document.querySelector("#login-proxy-local-wrap"),
+    loginProxyLocalPort: document.querySelector("#login-proxy-local-port"),
+    loginProxyCustomWrap: document.querySelector("#login-proxy-custom-wrap"),
+    loginProxyPool: document.querySelector("#login-proxy-pool"),
+    loginProxyStatus: document.querySelector("#login-proxy-status"),
+    loginStepList: document.querySelector("#login-step-list"),
+    loginProgressList: document.querySelector("#login-progress-list"),
+    loginProgressSummary: document.querySelector("#login-progress-summary"),
+    loginCompletedCount: document.querySelector("#login-completed-count"),
+    loginOverallPercent: document.querySelector("#login-overall-percent"),
+    loginOverallBar: document.querySelector("#login-overall-bar"),
+    startProtocolLogin: document.querySelector("#start-protocol-login"),
+    exportLoginSessions: document.querySelector("#export-login-sessions"),
+    exportLoginPersonal: document.querySelector("#export-login-personal"),
+    exportLoginBusiness: document.querySelector("#export-login-business"),
+    copyLoginSuccess: document.querySelector("#copy-login-success"),
+    copyLoginFailed: document.querySelector("#copy-login-failed"),
+    pushControls: document.querySelector('#push-controls'),
+    pushTarget: document.querySelector('#push-target'),
+    pushConverted: document.querySelector('#push-converted'),
+    converterSkipFree: document.querySelector('#converter-skip-free'),
+    loginRequireNonPersonal: document.querySelector('#login-require-non-personal'),
+    loginNonPersonalFilter: document.querySelector('#login-non-personal-filter'),
+    converterFreeFilter: document.querySelector('#converter-free-filter'),
+    converterFreeCount: document.querySelector('#converter-free-count'),
+    retryPush: document.querySelector('#retry-push'),
+    reconcilePush: document.querySelector('#reconcile-push'),
+    pushOperationHistory: document.querySelector('#push-operation-history'),
+    pushStatus: document.querySelector('#push-status'),
+    pushToast: document.querySelector('#push-toast'),
+    pushHint: document.querySelector('#push-hint'),
+    pushFeedback: document.querySelector('#push-feedback'),
+    loginPushSlot: document.querySelector('#login-push-slot'),
+    converterPushSlot: document.querySelector('#converter-push-slot'),
+    loginPushFeedbackSlot: document.querySelector('#login-push-feedback-slot'),
+    converterPushFeedbackSlot: document.querySelector('#converter-push-feedback-slot'),
+    evaluationPushFeedbackSlot: document.querySelector('#evaluation-push-feedback-slot'),
+    formatToolbar: document.querySelector('#format-toolbar'),
+    pushResults: document.querySelector('#push-results'),
+    pushResultDetails: document.querySelector('#push-result-details'),
+    sub2PushDialog: document.querySelector('#sub2-push-dialog'),
+    cpaPushDialog: document.querySelector('#cpa-push-dialog'),
+    cpaBaseUrl: document.querySelector('#cpa-base-url'),
+    cpaManagementKey: document.querySelector('#cpa-management-key'),
+    cpaConfigStatus: document.querySelector('#cpa-config-status'),
+    loginStatus: document.querySelector("#login-status"),
+    loginSub2BaseUrl: document.querySelector("#login-sub2-base-url"),
+    loginSub2AdminKey: document.querySelector("#login-sub2-admin-key"),
+    loginSub2Groups: document.querySelector("#login-sub2-groups"),
+    loginSub2GroupCount: document.querySelector("#login-sub2-group-count"),
+    loginSub2UseProxy: document.querySelector("#login-sub2-use-proxy"),
+    loginSub2ProxyWrap: document.querySelector("#login-sub2-proxy-wrap"),
+    loginSub2Proxy: document.querySelector("#login-sub2-proxy"),
+    loginSub2Concurrency: document.querySelector("#login-sub2-concurrency"),
+    loginSub2Priority: document.querySelector("#login-sub2-priority"),
+    loginSub2LoadFactor: document.querySelector("#login-sub2-load-factor"),
+    loginSub2FingerprintMode: document.querySelector("#login-sub2-fingerprint-mode"),
+    loginSub2Models: document.querySelector("#login-sub2-models"),
+    loginSub2Status: document.querySelector("#login-sub2-status"),
+    loadLoginSub2Groups: document.querySelector("#load-login-sub2-groups"),
+    saveLoginSub2Config: document.querySelector("#save-login-sub2-config"),
+    toggleLoginSub2Key: document.querySelector("#toggle-login-sub2-key"),
+    loginModal: document.querySelector("#login-modal"),
+    loginModalMessage: document.querySelector("#login-modal-message"),
+    closeLoginModal: document.querySelector("#close-login-modal"),
+    downloadScope: document.querySelector("#download-scope"),
+    fileInput: document.querySelector("#file-input"),
+    formatButtons: Array.from(document.querySelectorAll("[data-format]")),
+    formatRail: document.querySelector("#format-rail"),
+    input: document.querySelector("#session-input"),
+    inputDropzone: document.querySelector("#input-dropzone"),
+    inputSubtitle: document.querySelector("#input-subtitle"),
+    inputStatus: document.querySelector("#input-status"),
+    inputTitle: document.querySelector("#input-title"),
+    issues: document.querySelector("#issues"),
+    loadExample: document.querySelector("#load-example"),
+    mailInput: document.querySelector("#mail-input"),
+    mailInputLabel: document.querySelector("#mail-input-label"),
+    mailFileInput: document.querySelector("#mail-file-input"),
+    output: document.querySelector("#output"),
+    outputStatus: document.querySelector("#output-status"),
+    outputSubtitle: document.querySelector("#output-subtitle"),
+    pickFiles: document.querySelector("#pick-files"),
+    pickMailFile: document.querySelector("#pick-mail-file"),
+    statCount: document.querySelector("#stat-count"),
+    statErrors: document.querySelector("#stat-errors"),
+    statFormat: document.querySelector("#stat-format"),
+    sub2apiOperation: document.querySelector("#sub2api-operation"),
+    toolOperationButtons: document.querySelector("#tool-operation-buttons"),
+    operationButtons: Array.from(document.querySelectorAll("[data-operation]")),
+    sub2apiOutputConfig: document.querySelector("#sub2api-output-config"),
+    sub2apiModels: document.querySelector("#sub2api-models"),
+    sub2apiConcurrency: document.querySelector("#sub2api-concurrency"),
+    sub2apiLoadFactor: document.querySelector("#sub2api-load-factor"),
+    sub2apiPriority: document.querySelector("#sub2api-priority"),
+    sub2apiFingerprintMode: document.querySelector("#sub2api-fingerprint-mode"),
+    sub2apiToolConfig: document.querySelector("#sub2api-tool-config"),
+    splitScope: document.querySelector("#split-scope"),
+    splitScopeLabel: document.querySelector("#split-scope-label"),
+    splitDownloads: document.querySelector("#split-downloads"),
+    sessionGuide: document.querySelector("#session-guide"),
+    healthStatus: document.querySelector("#health-status"),
+    healthBody: document.querySelector("#health-body"),
+    healthFilter: document.querySelector("#health-filter"),
+    healthFilterLabel: document.querySelector("#health-filter-label"),
+    usageFilter: document.querySelector("#usage-filter"),
+    usageFilterLabel: document.querySelector("#usage-filter-label"),
+    healthTable: document.querySelector("#health-table"),
+    logoutAllSessions: document.querySelector("#logout-all-sessions"),
+    logoutProgress: document.querySelector("#logout-progress"),
+  };
+
+  const exampleSession = {
+    user: {
+      id: "user-example",
+      email: "mark@example.com",
+    },
+    expires: "2026-08-06T14:29:36.155Z",
+    account: {
+      id: "00000000-0000-4000-9000-000000000000",
+      planType: "plus",
+    },
+    accessToken: "paste-real-access-token-here",
+    sessionToken: "paste-real-session-token-here",
+    authProvider: "openai",
+  };
+
+  const AXONHUB_PLACEHOLDER_REFRESH_TOKEN = "__missing_refresh_token__";
+
+  function isPlainObject(value) {
+    return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+  }
+
+  function firstNonEmpty(...values) {
+    for (const value of values) {
+      if (typeof value === "string" && value.trim() !== "") {
+        return value.trim();
+      }
+    }
+    return undefined;
+  }
+
+  function escapeHtml(value) {
+    return String(value ?? "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#039;");
+  }
+
+  function decodeBase64Url(value) {
+    const normalized = value.replace(/-/g, "+").replace(/_/g, "/");
+    const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, "=");
+    const binary = atob(padded);
+    const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+    return new TextDecoder().decode(bytes);
+  }
+
+  function bytesToBase64Url(bytes) {
+    let binary = "";
+    for (let index = 0; index < bytes.length; index += 0x8000) {
+      binary += String.fromCharCode(...bytes.subarray(index, index + 0x8000));
+    }
+    return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+  }
+
+  function encodeBase64UrlJson(value) {
+    return bytesToBase64Url(new TextEncoder().encode(JSON.stringify(value)));
+  }
+
+  function parseJwtPayload(token) {
+    if (typeof token !== "string" || token.trim() === "") {
+      return undefined;
+    }
+
+    const segments = token.split(".");
+    if (segments.length < 2) {
+      return undefined;
+    }
+
+    try {
+      return JSON.parse(decodeBase64Url(segments[1]));
+    } catch {
+      return undefined;
+    }
+  }
+
+  function getOpenAIAuthSection(payload) {
+    if (!isPlainObject(payload)) {
+      return {};
+    }
+
+    const auth = payload["https://api.openai.com/auth"];
+    return isPlainObject(auth) ? auth : {};
+  }
+
+  function getOpenAIProfileSection(payload) {
+    if (!isPlainObject(payload)) {
+      return {};
+    }
+
+    const profile = payload["https://api.openai.com/profile"];
+    return isPlainObject(profile) ? profile : {};
+  }
+
+  function normalizeTimestamp(value) {
+    if (value instanceof Date && !Number.isNaN(value.getTime())) {
+      return value.toISOString();
+    }
+
+    if (typeof value === "number" && Number.isFinite(value)) {
+      const milliseconds = value > 1e11 ? value : value * 1000;
+      const date = new Date(milliseconds);
+      return Number.isNaN(date.getTime()) ? undefined : date.toISOString();
+    }
+
+    if (typeof value !== "string" || value.trim() === "") {
+      return undefined;
+    }
+
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? undefined : date.toISOString();
+  }
+
+  function timestampFromUnixSeconds(value) {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric)) {
+      return undefined;
+    }
+
+    const date = new Date(numeric * 1000);
+    return Number.isNaN(date.getTime()) ? undefined : date.toISOString();
+  }
+
+  function unixSecondsFromJwtExp(value) {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric) || numeric <= 0) {
+      return undefined;
+    }
+
+    return Math.trunc(numeric);
+  }
+
+  function epochSecondsFromValue(value) {
+    if (value === undefined || value === null || value === "") {
+      return 0;
+    }
+
+    const numeric = Number(value);
+    if (Number.isFinite(numeric)) {
+      return Math.trunc(numeric > 1e11 ? numeric / 1000 : numeric);
+    }
+
+    const parsed = Date.parse(String(value));
+    return Number.isFinite(parsed) ? Math.trunc(parsed / 1000) : 0;
+  }
+
+  function buildSyntheticCodexIdToken(email, accountId, planType, userId, expiresAt) {
+    if (!accountId) {
+      return undefined;
+    }
+
+    const now = Math.trunc(Date.now() / 1000);
+    const authInfo = { chatgpt_account_id: accountId };
+    const expires = epochSecondsFromValue(expiresAt) || now + 90 * 24 * 60 * 60;
+
+    if (planType) {
+      authInfo.chatgpt_plan_type = planType;
+    }
+
+    if (userId) {
+      authInfo.chatgpt_user_id = userId;
+      authInfo.user_id = userId;
+    }
+
+    const payload = {
+      iat: now,
+      exp: expires,
+      "https://api.openai.com/auth": authInfo,
+    };
+
+    if (email) {
+      payload.email = email;
+    }
+
+    return `${encodeBase64UrlJson({ alg: "none", typ: "JWT", cpa_synthetic: true })}.${encodeBase64UrlJson(payload)}.synthetic`;
+  }
+
+  function getExpiresIn(expiresAt, now = new Date()) {
+    if (!expiresAt) {
+      return undefined;
+    }
+
+    const expiresMs = new Date(expiresAt).getTime();
+    if (Number.isNaN(expiresMs)) {
+      return undefined;
+    }
+
+    return Math.max(0, Math.floor((expiresMs - now.getTime()) / 1000));
+  }
+
+  function getAxonHubLastRefresh(expiresAt, now = new Date()) {
+    const expiresMs = expiresAt ? new Date(expiresAt).getTime() : NaN;
+    if (Number.isNaN(expiresMs)) {
+      return normalizeTimestamp(now);
+    }
+
+    return new Date(expiresMs - 60 * 60 * 1000).toISOString();
+  }
+
+  function stripUnavailable(value) {
+    if (Array.isArray(value)) {
+      return value.map(stripUnavailable).filter((item) => item !== undefined);
+    }
+
+    if (isPlainObject(value)) {
+      const entries = Object.entries(value)
+        .map(([key, item]) => [key, stripUnavailable(item)])
+        .filter(([, item]) => item !== undefined);
+      return entries.length ? Object.fromEntries(entries) : undefined;
+    }
+
+    if (value === undefined || value === null || value === "") {
+      return undefined;
+    }
+
+    return value;
+  }
+
+  function toEmailKey(email) {
+    if (typeof email !== "string") {
+      return undefined;
+    }
+
+    return email
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "_")
+      .replace(/^_+|_+$/g, "");
+  }
+
+  function sanitizeFileToken(value, fallback = "chatgpt-session") {
+    const base = firstNonEmpty(value, fallback) || fallback;
+    return base
+      .replace(/\.[^.]+$/u, "")
+      .replace(/[\\/:*?"<>|]+/g, "-")
+      .replace(/\s+/g, "-")
+      .replace(/-+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .toLowerCase()
+      .slice(0, 80) || fallback;
+  }
+
+  function getTimestampToken(date = new Date()) {
+    const pad = (value) => String(value).padStart(2, "0");
+    return [
+      date.getFullYear(),
+      pad(date.getMonth() + 1),
+      pad(date.getDate()),
+    ].join("-") + "_" + [
+      pad(date.getHours()),
+      pad(date.getMinutes()),
+      pad(date.getSeconds()),
+    ].join("-");
+  }
+
+  function formatDisplayDate(value) {
+    if (!value) {
+      return "";
+    }
+
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) {
+      return value;
+    }
+
+    const pad = (item) => String(item).padStart(2, "0");
+    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+  }
+
+  function collectSessionLikeObjects(value, sourceName = "pasted-json") {
+    const found = [];
+    const visited = new WeakSet();
+
+    function visit(item, path) {
+      if (!isPlainObject(item) && !Array.isArray(item)) {
+        return;
+      }
+
+      if (isPlainObject(item)) {
+        if (visited.has(item)) {
+          return;
+        }
+        visited.add(item);
+
+        if (item.session_access_token || item.session_json || item.openai_access_token || item.business_openai_access_token || item.business_workspace_credentials?.length) {
+          found.push(...projectLoginAccounts([item]).map(source => ({ ...source, sourceName, path })));
+          return;
+        }
+
+        const token = firstNonEmpty(
+          item.accessToken,
+          item.access_token,
+          item.tokens?.accessToken,
+          item.tokens?.access_token,
+          item.token?.accessToken,
+          item.token?.access_token,
+          item.credentials?.accessToken,
+          item.credentials?.access_token,
+        );
+        const hasIdentity = isPlainObject(item.user) || firstNonEmpty(
+          item.email,
+          item.name,
+          item.label,
+          item.meta?.label,
+          item.tokens?.accountId,
+          item.tokens?.account_id,
+          item.tokens?.chatgptAccountId,
+          item.tokens?.chatgpt_account_id,
+          item.providerSpecificData?.chatgptAccountId,
+          item.providerSpecificData?.chatgpt_account_id,
+          item.id,
+        );
+        if (token && hasIdentity) {
+          found.push({ value: item, sourceName, path });
+          return;
+        }
+
+        for (const [key, child] of Object.entries(item)) {
+          if (key === "accessToken" || key === "access_token" || key === "sessionToken") {
+            continue;
+          }
+          visit(child, `${path}.${key}`);
+        }
+        return;
+      }
+
+      item.forEach((child, index) => visit(child, `${path}[${index}]`));
+    }
+
+    visit(value, "$");
+    return found;
+  }
+
+  function skipJsonWhitespace(text, index) {
+    while (index < text.length && /[\s\uFEFF]/.test(text[index])) {
+      index += 1;
+    }
+    return index;
+  }
+
+  function findJsonValueEnd(text, start) {
+    const first = text[start];
+    if (first !== "{" && first !== "[") {
+      if (first === '"') {
+        let escaped = false;
+        for (let index = start + 1; index < text.length; index += 1) {
+          const character = text[index];
+          if (escaped) {
+            escaped = false;
+          } else if (character === "\\") {
+            escaped = true;
+          } else if (character === '"') {
+            return index + 1;
+          }
+        }
+        throw new Error("JSON 字符串未闭合");
+      }
+
+      let index = start;
+      while (index < text.length && !/[\s\uFEFF]/.test(text[index])) {
+        index += 1;
+      }
+      return index;
+    }
+
+    const stack = [];
+    let inString = false;
+    let escaped = false;
+    for (let index = start; index < text.length; index += 1) {
+      const character = text[index];
+      if (inString) {
+        if (escaped) {
+          escaped = false;
+        } else if (character === "\\") {
+          escaped = true;
+        } else if (character === '"') {
+          inString = false;
+        }
+        continue;
+      }
+      if (character === '"') {
+        inString = true;
+      } else if (character === "{" || character === "[") {
+        stack.push(character);
+      } else if (character === "}" || character === "]") {
+        stack.pop();
+        if (stack.length === 0) {
+          return index + 1;
+        }
+      }
+    }
+    throw new Error("JSON 对象未闭合");
+  }
+
+  function parseJsonValues(text) {
+    if (typeof text !== "string" || text.trim() === "") {
+      return [];
+    }
+
+    const values = [];
+    let index = 0;
+    let firstError = null;
+    while ((index = skipJsonWhitespace(text, index)) < text.length) {
+      if (text[index] !== "{" && text[index] !== "[") {
+        const offset = text.slice(index).search(/[\[{]/);
+        if (offset < 0) break;
+        index += offset;
+      }
+
+      let end = null;
+      try {
+        const end = findJsonValueEnd(text, index);
+        values.push(JSON.parse(text.slice(index, end)));
+        index = end;
+      } catch (error) {
+        if (!firstError) firstError = error;
+        // A balanced but invalid candidate may contain nested braces.
+        // Skip the whole candidate so nested fragments are not imported.
+        try {
+          end = findJsonValueEnd(text, index);
+        } catch {
+          end = index + 1;
+        }
+        index = end;
+      }
+    }
+    if (!values.length && firstError) throw new Error(`JSON 解析失败：${firstError.message}`);
+    return values;
+  }
+
+  function parseInputDocuments(text) {
+    return parseJsonValues(text).flatMap((parsed) => collectSessionLikeObjects(parsed));
+  }
+
+  function sub2apiAccountEmail(account, index) {
+    const candidates = [
+      account?.credentials?.email,
+      account?.extra?.email,
+      account?.email,
+      account?.name,
+      account?.extra?.email_key,
+    ];
+    const email = candidates.find((value) => typeof value === "string" && value.trim());
+    if (!email) {
+      throw new Error(`accounts 第 ${index} 项缺少邮箱字段`);
+    }
+    return email.trim().toLocaleLowerCase();
+  }
+
+  function parseSub2apiRecords(text) {
+    const values = parseJsonValues(text);
+    const records = [];
+    const proxies = [];
+    let firstDocument = null;
+
+    values.forEach((value, valueIndex) => {
+      if (!isPlainObject(value)) {
+        throw new Error(`第 ${valueIndex + 1} 个顶层 JSON 必须是对象`);
+      }
+      if (value.type != null && value.type !== "sub2api-data") {
+        throw new Error(`第 ${valueIndex + 1} 个 JSON 的 type 必须是 sub2api-data`);
+      }
+      if (!Array.isArray(value.accounts)) {
+        throw new Error(`第 ${valueIndex + 1} 个 JSON 必须包含 accounts 数组`);
+      }
+      if (value.proxies != null && !Array.isArray(value.proxies)) {
+        throw new Error(`第 ${valueIndex + 1} 个 JSON 的 proxies 必须是数组`);
+      }
+      if (!firstDocument) {
+        firstDocument = value;
+      } else if ((value.version ?? 1) !== (firstDocument.version ?? 1)) {
+        throw new Error(`第 ${valueIndex + 1} 个 JSON 的 version 与首条记录不一致`);
+      }
+      proxies.push(...(value.proxies || []));
+      value.accounts.forEach((account, accountIndex) => {
+        if (!isPlainObject(account)) {
+          throw new Error(`第 ${valueIndex + 1} 个 JSON 的 accounts 第 ${accountIndex + 1} 项必须是对象`);
+        }
+        records.push({
+          account,
+          type: value.type || "sub2api-data",
+          version: value.version ?? 1,
+          exportedAt: value.exported_at ?? null,
+          proxies: value.proxies || [],
+        });
+      });
+    });
+
+    if (!firstDocument) {
+      throw new Error("没有可处理的 sub2api JSON");
+    }
+    return { firstDocument, records, proxies };
+  }
+
+  function reorderSub2apiRecords(records) {
+    const groups = new Map();
+    records.forEach((record, index) => {
+      const email = sub2apiAccountEmail(record.account, index + 1);
+      if (!groups.has(email)) groups.set(email, []);
+      groups.get(email).push(record);
+    });
+    if (!groups.size) return [];
+
+    const maxRounds = Math.max(...Array.from(groups.values(), (items) => items.length));
+    const ordered = [];
+    let previousEmail = null;
+    for (let round = 0; round < maxRounds; round += 1) {
+      const roundEmails = Array.from(groups).filter(([, items]) => round < items.length).map(([email]) => email);
+      const nextRoundEmails = Array.from(groups).filter(([, items]) => round + 1 < items.length).map(([email]) => email);
+      if (roundEmails[0] === previousEmail && roundEmails.length > 1) {
+        const replacement = roundEmails.findIndex((email) => email !== previousEmail);
+        roundEmails.unshift(roundEmails.splice(replacement, 1)[0]);
+      }
+      if (nextRoundEmails.length === 1 && roundEmails.length > 1 && roundEmails.at(-1) === nextRoundEmails[0]) {
+        for (let index = roundEmails.length - 2; index >= 0; index -= 1) {
+          const firstAfterSwap = index === 0 ? roundEmails.at(-1) : roundEmails[0];
+          if (roundEmails[index] !== nextRoundEmails[0] && firstAfterSwap !== previousEmail) {
+            [roundEmails[index], roundEmails[roundEmails.length - 1]] = [roundEmails.at(-1), roundEmails[index]];
+            break;
+          }
+        }
+      }
+      roundEmails.forEach((email) => {
+        ordered.push(groups.get(email)[round]);
+        previousEmail = email;
+      });
+    }
+    for (let index = 1; index < ordered.length; index += 1) {
+      if (sub2apiAccountEmail(ordered[index - 1].account, index) === sub2apiAccountEmail(ordered[index].account, index + 1)) {
+        throw new Error("无法保证相邻账号邮箱不重复");
+      }
+    }
+    return ordered;
+  }
+
+  function compactSub2apiLine(record) {
+    return JSON.stringify({
+      type: record.type,
+      version: record.version,
+      exported_at: record.exportedAt,
+      proxies: record.proxies,
+      accounts: [applySub2apiOutputConfig(record.account)],
+    });
+  }
+
+  function applySub2apiOutputConfig(account) {
+    const settings = normalizeSub2apiAccountConfig(state.browserSettings.sub2apiSettings);
+    return {
+      ...account,
+      concurrency: settings.accountConcurrency,
+      load_factor: settings.loadFactor,
+      priority: settings.priority,
+      credentials: {
+        ...(account?.credentials || {}),
+        model_mapping: Object.fromEntries(settings.models.map((model) => [model, model])),
+      },
+      extra: {
+        ...(account?.extra || {}),
+        codex_fingerprint_mode: settings.fingerprintMode,
+      },
+    };
+  }
+
+  function extractEmails(value) {
+    if (typeof value !== "string") return [];
+    const normalized = value
+      .normalize("NFKC")
+      .replace(/[\u0000\u200B-\u200D\u2060\uFEFF]/g, "")
+      .replace(/-{2,}/g, " ");
+    return (normalized.match(/[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+/gi) || [])
+      .map((email) => email.toLocaleLowerCase());
+  }
+
+  function parseMailCsv(text) {
+    return new Set(extractEmails(String(text || "")));
+  }
+
+  function sub2apiRecordEmails(record) {
+    const account = record.account;
+    const candidates = [
+      account?.name,
+      account?.email,
+      account?.mail,
+      account?.username,
+      account?.user?.email,
+      account?.credentials?.email,
+      account?.credentials?.mail,
+      account?.credentials?.username,
+      account?.credentials?.user?.email,
+      account?.extra?.email,
+      account?.extra?.mail,
+      account?.extra?.email_address,
+    ];
+    return new Set(candidates.flatMap(extractEmails));
+  }
+
+  function buildSub2apiToolResult(text, recordsOverride = null, parsedInput = null) {
+    const parsed = { ...(parsedInput || parseSub2apiRecords(text)) };
+    if (recordsOverride) parsed.records = recordsOverride;
+    const operation = elements.sub2apiOperation.value || "json-to-txt";
+    const records = operation === "json-to-txt" ? reorderSub2apiRecords(parsed.records) : parsed.records;
+    if (operation === "split") {
+      const emails = parseMailCsv(elements.mailInput.value);
+      if (!emails.size) throw new Error("mail.csv 中没有有效邮箱");
+      const matched = [];
+      const unmatched = [];
+      records.forEach((record) => {
+        const line = compactSub2apiLine(record);
+        const isMatch = Array.from(sub2apiRecordEmails(record)).some((email) => emails.has(email));
+        (isMatch ? matched : unmatched).push(line);
+      });
+      return {
+        accountCount: records.length,
+        extension: "txt",
+        matchedCount: matched.length,
+        unmatchedCount: unmatched.length,
+        matchedText: matched.join("\n") + (matched.length ? "\n" : ""),
+        unmatchedText: unmatched.join("\n") + (unmatched.length ? "\n" : ""),
+      };
+    }
+
+    if (operation === "txt-to-json") {
+      const accounts = records.map((record) => applySub2apiOutputConfig(record.account));
+      const version = parsed.firstDocument?.version ?? 1;
+      const proxies = [...new Set(parsed.proxies || [])];
+      return {
+        accountCount: accounts.length,
+        extension: "json",
+        outputText: JSON.stringify({
+          type: parsed.firstDocument?.type || "sub2api-data",
+          version,
+          exported_at: parsed.firstDocument?.exported_at || new Date().toISOString(),
+          proxies,
+          accounts,
+        }, null, 2),
+      };
+    }
+    const lines = records.map(compactSub2apiLine);
+    return {
+      accountCount: records.length,
+      extension: "txt",
+      outputText: lines.join("\n") + (lines.length ? "\n" : ""),
+    };
+  }
+
+  function convertSession(record, options = {}) {
+    if (!isPlainObject(record)) {
+      throw new Error("session 不是 JSON 对象");
+    }
+
+    const accessToken = firstNonEmpty(
+      record.accessToken,
+      record.access_token,
+      record.tokens?.accessToken,
+      record.tokens?.access_token,
+      record.token?.accessToken,
+      record.token?.access_token,
+      record.credentials?.accessToken,
+      record.credentials?.access_token,
+    );
+    if (!accessToken) {
+      throw new Error("缺少 accessToken");
+    }
+    const sessionToken = firstNonEmpty(
+      record.sessionToken,
+      record.session_token,
+      record.tokens?.sessionToken,
+      record.tokens?.session_token,
+      record.token?.sessionToken,
+      record.token?.session_token,
+      record.credentials?.session_token,
+    );
+    const refreshToken = firstNonEmpty(
+      record.refreshToken,
+      record.refresh_token,
+      record.tokens?.refreshToken,
+      record.tokens?.refresh_token,
+      record.token?.refreshToken,
+      record.token?.refresh_token,
+      record.credentials?.refresh_token,
+    );
+    const inputIdToken = firstNonEmpty(
+      record.idToken,
+      record.id_token,
+      record.tokens?.idToken,
+      record.tokens?.id_token,
+      record.token?.idToken,
+      record.token?.id_token,
+      record.credentials?.id_token,
+    );
+
+    const payload = parseJwtPayload(accessToken);
+    const idPayload = parseJwtPayload(inputIdToken);
+    const auth = getOpenAIAuthSection(payload);
+    const idAuth = getOpenAIAuthSection(idPayload);
+    const profile = getOpenAIProfileSection(payload);
+    const hasRefreshToken = Boolean(refreshToken);
+    const accessTokenExpiresAt = hasRefreshToken ? undefined : unixSecondsFromJwtExp(payload?.exp);
+    const expiresAt = hasRefreshToken ? undefined : firstNonEmpty(
+      payload ? timestampFromUnixSeconds(payload.exp) : undefined,
+      normalizeTimestamp(record.expires),
+      normalizeTimestamp(record.expiresAt),
+      normalizeTimestamp(record.expired),
+      normalizeTimestamp(record.expires_at),
+    );
+    const email = firstNonEmpty(
+      record.user?.email,
+      record.email,
+      record.meta?.label,
+      record.label,
+      record.credentials?.email,
+      record.providerSpecificData?.email,
+      profile.email,
+      idPayload?.email,
+      payload?.email,
+    );
+    const accountId = firstNonEmpty(
+      record.account?.id,
+      record.account_id,
+      record.tokens?.accountId,
+      record.tokens?.account_id,
+      record.chatgptAccountId,
+      record.chatgpt_account_id,
+      record.meta?.chatgptAccountId,
+      record.meta?.chatgpt_account_id,
+      record.tokens?.chatgptAccountId,
+      record.tokens?.chatgpt_account_id,
+      record.providerSpecificData?.chatgptAccountId,
+      record.providerSpecificData?.chatgpt_account_id,
+      record.credentials?.chatgpt_account_id,
+      record.credentials?.account_id,
+      auth.chatgpt_account_id,
+      idAuth.chatgpt_account_id,
+      record.provider === "codex" ? record.id : undefined,
+    );
+    const chatgptAccountId = firstNonEmpty(
+      record.chatgptAccountId,
+      record.chatgpt_account_id,
+      record.meta?.chatgptAccountId,
+      record.meta?.chatgpt_account_id,
+      record.tokens?.chatgptAccountId,
+      record.tokens?.chatgpt_account_id,
+      record.providerSpecificData?.chatgptAccountId,
+      record.providerSpecificData?.chatgpt_account_id,
+      record.credentials?.chatgpt_account_id,
+      auth.chatgpt_account_id,
+      idAuth.chatgpt_account_id,
+    );
+    const workspaceId = firstNonEmpty(
+      record.account?.workspaceId,
+      record.account?.workspace_id,
+      record.workspaceId,
+      record.workspace_id,
+      record.meta?.workspaceId,
+      record.meta?.workspace_id,
+      record.providerSpecificData?.workspaceId,
+      record.providerSpecificData?.workspace_id,
+      record.credentials?.workspace_id,
+      payload?.workspace_id,
+      idPayload?.workspace_id,
+    );
+    const userId = firstNonEmpty(
+      record.user?.id,
+      record.user_id,
+      record.chatgptUserId,
+      record.providerSpecificData?.chatgptUserId,
+      record.providerSpecificData?.chatgpt_user_id,
+      auth.chatgpt_user_id,
+      auth.user_id,
+      idAuth.chatgpt_user_id,
+      idAuth.user_id,
+    );
+    const planType = firstNonEmpty(
+      record.account?.planType,
+      record.account?.plan_type,
+      record.planType,
+      record.plan_type,
+      record.providerSpecificData?.chatgptPlanType,
+      record.providerSpecificData?.chatgpt_plan_type,
+      record.credentials?.plan_type,
+      auth.chatgpt_plan_type,
+      idAuth.chatgpt_plan_type,
+    );
+    const exportedAt = normalizeTimestamp(options.now || new Date());
+    const expiresIn = getExpiresIn(expiresAt, options.now || new Date());
+    const sourceName = firstNonEmpty(options.sourceName, "pasted-json");
+    const sourceType = record.provider === "codex" && record.authType === "oauth" ? "9router" : "chatgpt_web_session";
+    const name = firstNonEmpty(email, sourceName, "ChatGPT Account");
+    const syntheticIdToken = !inputIdToken
+      ? buildSyntheticCodexIdToken(email, accountId, planType, userId, expiresAt)
+      : undefined;
+    const idToken = firstNonEmpty(inputIdToken, syntheticIdToken);
+
+    const cpa = Object.fromEntries(Object.entries({
+      type: "codex",
+      account_id: accountId,
+      chatgpt_account_id: accountId,
+      email,
+      name,
+      plan_type: planType,
+      chatgpt_plan_type: planType,
+      id_token: idToken,
+      id_token_synthetic: Boolean(syntheticIdToken) || undefined,
+      access_token: accessToken,
+      refresh_token: refreshToken || "",
+      session_token: sessionToken,
+      last_refresh: exportedAt,
+      expired: expiresAt,
+      disabled: Boolean(record.disabled) || undefined,
+    }).filter(([, value]) => value !== undefined && value !== null));
+
+    const cockpit = {
+      type: "codex",
+      id_token: idToken,
+      access_token: accessToken,
+      refresh_token: refreshToken || "",
+      account_id: accountId,
+      last_refresh: exportedAt,
+      email,
+      expired: expiresAt,
+      account_note: firstNonEmpty(record.account_note, record.accountInfo, record.account_info, record.note, record.notes, record.remark),
+    };
+
+    const sub2apiAccount = stripUnavailable({
+      name: firstNonEmpty(name, email, sourceName, "ChatGPT Account"),
+      platform: "openai",
+      type: "oauth",
+      expires_at: accessTokenExpiresAt,
+      auto_pause_on_expired: accessTokenExpiresAt ? true : undefined,
+      concurrency: 50,
+      priority: 1,
+      credentials: {
+        access_token: accessToken,
+        refresh_token: refreshToken,
+        id_token: inputIdToken,
+        chatgpt_account_id: accountId,
+        chatgpt_user_id: userId,
+        email,
+        expires_at: expiresAt,
+        expires_in: expiresIn,
+        plan_type: planType,
+        model_mapping: {
+          "gpt-5.5": "gpt-5.5",
+          "gpt-5.6-sol": "gpt-5.6-sol",
+          "gpt-5.6-terra": "gpt-5.6-terra",
+          "gpt-6-astra": "gpt-6-astra",
+        },
+      },
+      extra: {
+        email,
+        email_key: toEmailKey(email),
+        name,
+        auth_provider: firstNonEmpty(record.authProvider, record.auth_provider),
+        source: sourceType,
+        last_refresh: exportedAt,
+        codex_fingerprint_mode: "session",
+      },
+    });
+    const priority = Number.isFinite(Number(record.priority)) ? Number(record.priority) : 9;
+    const isActive = typeof record.isActive === "boolean" ? record.isActive : !Boolean(record.disabled);
+    const createdAt = normalizeTimestamp(record.createdAt) || exportedAt;
+    const updatedAt = normalizeTimestamp(record.updatedAt) || exportedAt;
+    const nineRouter = stripUnavailable({
+      accessToken,
+      refreshToken,
+      expiresAt,
+      testStatus: firstNonEmpty(record.testStatus, record.test_status, "active"),
+      expiresIn,
+      providerSpecificData: {
+        chatgptAccountId: accountId,
+        chatgptPlanType: planType,
+      },
+      id: accountId,
+      provider: "codex",
+      authType: "oauth",
+      name,
+      email,
+      priority,
+      isActive,
+      createdAt,
+      updatedAt,
+    });
+    const axonHubRefreshToken = refreshToken || AXONHUB_PLACEHOLDER_REFRESH_TOKEN;
+    const codexAuthJson = {
+      auth_mode: "chatgpt",
+      OPENAI_API_KEY: null,
+      tokens: {
+        id_token: idToken,
+        access_token: accessToken,
+        refresh_token: refreshToken || "",
+        account_id: accountId,
+      },
+      last_refresh: exportedAt,
+    };
+    const axonHub = stripUnavailable({
+      auth_mode: "chatgpt",
+      last_refresh: getAxonHubLastRefresh(expiresAt, options.now || new Date()),
+      tokens: {
+        access_token: accessToken,
+        refresh_token: axonHubRefreshToken,
+        id_token: idToken,
+      },
+      axonhub_refresh_token_placeholder: refreshToken ? undefined : true,
+      axonhub_note: refreshToken ? undefined : "refresh_token is a placeholder; access_token works only until it expires.",
+    });
+    const codexManagerTokenHints = Object.fromEntries(Object.entries({
+      account_id: accountId,
+      chatgpt_account_id: chatgptAccountId,
+    }).filter(([, value]) => value !== undefined && value !== null && value !== ""));
+    const codexManagerMeta = Object.fromEntries(Object.entries({
+      label: firstNonEmpty(name, email, sourceName, "ChatGPT Account"),
+      workspace_id: workspaceId,
+      chatgpt_account_id: chatgptAccountId,
+      note: "Imported from ChatGPT session",
+    }).filter(([, value]) => value !== undefined && value !== null && value !== ""));
+    const codexManager = {
+      tokens: {
+        access_token: accessToken,
+        refresh_token: refreshToken || "",
+        id_token: inputIdToken || "",
+        ...codexManagerTokenHints,
+      },
+      meta: codexManagerMeta,
+    };
+
+    return {
+      sourceName,
+      sourcePath: options.sourcePath,
+      email,
+      name,
+      expiresAt,
+      accessTokenExpiresAt,
+      cpa,
+      cockpit,
+      nineRouter,
+      codexAuthJson,
+      axonHub,
+      codexManager,
+      sub2apiAccount,
+    };
+  }
+
+  function buildSub2apiDocument(converted, now = new Date()) {
+    return {
+      exported_at: normalizeTimestamp(now),
+      proxies: [],
+      accounts: converted.map((item) => applySub2apiOutputConfig(item.sub2apiAccount)),
+    };
+  }
+
+  function buildOutputDocument(converted = state.converted) {
+    const now = new Date();
+    if (state.format === "sub2api") {
+      return buildSub2apiDocument(converted, now);
+    }
+
+    if (state.format === "cpa") {
+      return converted.length === 1 ? converted[0].cpa : converted.map((item) => item.cpa);
+    }
+
+    if (state.format === "cockpit") {
+      return converted.length === 1 ? converted[0].cockpit : converted.map((item) => item.cockpit);
+    }
+
+    if (state.format === "9router") {
+      return converted.length === 1 ? converted[0].nineRouter : converted.map((item) => item.nineRouter);
+    }
+
+    if (state.format === "codex") {
+      return converted.length === 1 ? converted[0].codexAuthJson : converted.map((item) => item.codexAuthJson);
+    }
+
+    if (state.format === "axonhub") {
+      return converted.length === 1 ? converted[0].axonHub : converted.map((item) => item.axonHub);
+    }
+
+    if (state.format === "codexmanager") {
+      return converted.length === 1 ? converted[0].codexManager : converted.map((item) => item.codexManager);
+    }
+
+    return buildSub2apiDocument(converted, now);
+  }
+
+  function healthComplete() {
+    return state.converted.length > 0 && state.health.length === state.converted.length;
+  }
+
+  function canLogoutAllSessions() {
+    return state.format === "sub2api"
+      && healthComplete()
+      && state.converted.some((item, index) => !skipFreeConverted(item) && state.health[index]?.status === 200)
+      && !state.logoutInProgress;
+  }
+
+  function resetLogoutAllSessions() {
+    state.logoutRun += 1;
+    state.logoutInProgress = false;
+    state.logoutResults = [];
+    state.logoutLog = [];
+    elements.logoutProgress.classList.add("hidden");
+    elements.logoutProgress.textContent = "";
+  }
+
+  function renderLogoutProgress() {
+    elements.logoutProgress.textContent = state.logoutLog.join("\n");
+    elements.logoutProgress.classList.toggle("hidden", !state.logoutLog.length);
+  }
+
+  function syncLogoutAllSessionsButton() {
+    const visible = state.format === "sub2api";
+    elements.logoutAllSessions.classList.toggle("hidden", !visible);
+    elements.logoutAllSessions.disabled = !canLogoutAllSessions();
+    elements.logoutAllSessions.textContent = state.logoutInProgress ? "正在退出会话..." : "退出全部会话";
+  }
+
+  async function logoutAllHealthySessions() {
+    if (monitorBusy) return;
+    const isCurrent = workspaceTaskIsCurrent();
+    if (!canLogoutAllSessions()) return;
+    const accounts = state.converted
+      .map((item, index) => ({ item, result: state.health[index], index }))
+      .filter(({ item, result }) => !skipFreeConverted(item) && result?.status === 200)
+      .map(({ item, index }) => ({
+        index,
+        email: item.email || item.name || `account-${index + 1}`,
+        accessToken: item.cpa?.access_token,
+        accountId: item.sub2apiAccount?.credentials?.chatgpt_account_id,
+      }));
+    if (!accounts.length) return;
+    if (typeof window !== "undefined" && typeof window.confirm === "function" && !window.confirm(`将退出 ${accounts.length} 个测活成功账号的全部 ChatGPT 会话，是否继续？`)) return;
+    const run = ++state.logoutRun;
+    state.logoutInProgress = true;
+    state.logoutResults = [];
+    state.logoutLog = [`开始退出 ${accounts.length} 个测活成功账号（并发 ${selectedTaskConcurrency()}）...`, ...accounts.map((account) => `${account.email}：排队中`)];
+    renderLogoutProgress();
+    syncLogoutAllSessionsButton();
+    setStatus(elements.healthStatus, `正在退出 ${accounts.length} 个账号的全部会话，并发 ${selectedTaskConcurrency()}...`);
+    try {
+      const response = await pageFetch("/api/logout-all-sessions", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: loginProxyHeaders({ "Content-Type": "application/json" }),
+        body: JSON.stringify({ accounts, concurrency: selectedTaskConcurrency() }),
+      });
+      const payload = await readJsonResponse(response);
+      if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+      if (!isCurrent() || run !== state.logoutRun) return;
+      state.logoutResults = Array.isArray(payload.results) ? payload.results : [];
+      state.logoutLog = [
+        `退出任务完成：成功 ${payload.succeeded || 0}，失败 ${payload.failed || 0}。`,
+        ...state.logoutResults.map((item) => `${item.email || `account-${item.index + 1}`}：${item.ok ? `测活 HTTP ${item.probeStatus}，退出 HTTP ${item.logoutStatus}` : (item.error || "失败")}`),
+      ];
+      renderLogoutProgress();
+      const succeeded = Number(payload.succeeded) || state.logoutResults.filter((item) => item.ok).length;
+      const failed = Number(payload.failed) || state.logoutResults.filter((item) => !item.ok).length;
+      setStatus(elements.healthStatus, `退出全部会话完成：成功 ${succeeded}，失败 ${failed}。${failed ? "可重新点击按钮重试失败账号。" : ""}`, failed ? "error" : "ok");
+    } catch (error) {
+      if (!isCurrent() || run !== state.logoutRun) return;
+      state.logoutResults = [];
+      state.logoutLog = [`退出任务失败：${error instanceof Error ? error.message : String(error)}`];
+      renderLogoutProgress();
+      setStatus(elements.healthStatus, `退出全部会话失败：${error instanceof Error ? error.message : String(error)}`, "error");
+    } finally {
+      if (isCurrent() && run === state.logoutRun) {
+        state.logoutInProgress = false;
+        syncLogoutAllSessionsButton();
+        renderHealth();
+      }
+    }
+  }
+
+  function toolHealthComplete() {
+    return state.toolRecords.length > 0 && state.health.length === state.toolRecords.length;
+  }
+
+  function recordUsage(record, result) {
+    const usage = result?.usage || usageFromExtra(record?.account?.extra);
+    if (!usage) return null;
+    const planType = firstNonEmpty(
+      usage.planType,
+      record?.account?.credentials?.plan_type,
+      record?.account?.plan_type,
+      record?.account?.extra?.plan_type,
+    );
+    return planType && !usage.planType ? { ...usage, planType } : usage;
+  }
+
+  function planIsK12(planType) {
+    const value = String(planType || "").trim().toLocaleLowerCase();
+    return value === "k12" || value === "chatgpt_k12" || value.includes("k-12");
+  }
+
+  function planHasNoFiveHourWindow(planType) {
+    const value = String(planType || "").trim();
+    return Boolean(value) && !planIsK12(value);
+  }
+
+  function usageWindowKnown(window) {
+    return window != null && Number.isFinite(Number(window.usedPercent));
+  }
+
+  function usageHasExpectedWindows(usage) {
+    if (!usageWindowKnown(usage?.sevenDay)) return false;
+    return planHasNoFiveHourWindow(usage.planType) || usageWindowKnown(usage.fiveHour);
+  }
+
+  function usageIsUnused(usage) {
+    if (!usageHasExpectedWindows(usage)) return false;
+    const sevenDayUnused = Number(usage.sevenDay.usedPercent) === 0;
+    const fiveHourUnused = planHasNoFiveHourWindow(usage.planType) || Number(usage.fiveHour.usedPercent) === 0;
+    return fiveHourUnused && sevenDayUnused;
+  }
+
+  function hasToolUsageSnapshots() {
+    return state.toolRecords.some((record, index) => !skipFreeToolRecord(record) && Boolean(recordUsage(record, state.health[index])));
+  }
+
+  function usageMatchesFilter(record, result) {
+    if (!hasToolUsageSnapshots()) return true;
+    const usage = recordUsage(record, result);
+    switch (elements.usageFilter.value) {
+      case "used":
+        return Boolean(usage && (Number(usage.fiveHour?.usedPercent) > 0 || Number(usage.sevenDay?.usedPercent) > 0));
+      case "unknown":
+        return !usageHasExpectedWindows(usage);
+      case "all":
+        return true;
+      case "unused":
+      default:
+        return usageIsUnused(usage);
+    }
+  }
+
+  function selectedToolRecords() {
+    return state.toolRecords.filter((record, index) => {
+      if (skipFreeToolRecord(record)) return false;
+      if (elements.sub2apiOperation.value === "split" || !toolHealthComplete()) return true;
+      const result = state.health[index];
+      if (elements.downloadScope.value === "non200") return result?.status !== 200;
+      return (elements.downloadScope.value === "all" || result?.status === 200) && usageMatchesFilter(record, result);
+    });
+  }
+
+  function selectedConverted() {
+    const include200 = elements.downloadScope.value !== "non200";
+    return state.converted.filter((item, index) => !skipFreeConverted(item)
+      && (!healthComplete() || elements.downloadScope.value === "all"
+        || (include200 ? state.health[index]?.status === 200 : state.health[index]?.status !== 200)));
+  }
+
+  function formatDuration(seconds) {
+    const value = Math.max(0, Number(seconds) || 0);
+    const days = Math.floor(value / 86400);
+    const hours = Math.floor((value % 86400) / 3600);
+    const minutes = Math.floor((value % 3600) / 60);
+    if (days) return `${days}天${hours}小时`;
+    if (hours) return `${hours}小时${minutes}分`;
+    return `${minutes}分钟`;
+  }
+
+  function usageFromExtra(extra) {
+    if (!extra || typeof extra !== "object") return null;
+    const makeWindow = (prefix) => {
+      const used = Number(extra[`${prefix}_used_percent`]);
+      if (!Number.isFinite(used)) return null;
+      const reset = Number(extra[`${prefix}_reset_after_seconds`]);
+      return { usedPercent: used, resetAfterSeconds: Number.isFinite(reset) ? reset : null };
+    };
+    const fiveHour = makeWindow("codex_5h");
+    const sevenDay = makeWindow("codex_7d");
+    if (!fiveHour && !sevenDay) return null;
+    return { fiveHour, sevenDay, fetchedAt: extra.codex_usage_updated_at ? Date.parse(extra.codex_usage_updated_at) : null };
+  }
+
+  function formatLoginTime(value) {
+    return typeof value === "number" && value > 0 && Number.isFinite(value) && !Number.isNaN(new Date(value).getTime())
+      ? new Date(value).toLocaleString() : "未知";
+  }
+
+  function openDeviceDetails(result, name) {
+    const dialog = document.querySelector('#device-details-dialog');
+    document.querySelector('#device-details-title').textContent = `${name || '账号'} · 在线设备`;
+    document.querySelector('#device-details-list').innerHTML = Array.isArray(result?.devices)
+      ? result.devices.map((device, index) => `<details class="device-detail">
+        <summary>${escapeHtml(device.apps?.join(' / ') || device.name || `设备 ${index + 1}`)}${device.current ? ' · 当前设备' : ''}
+          <span>${escapeHtml(device.description || [device.name, device.platform, device.osVersion].filter(Boolean).join(' · ') || '未知设备')}</span>
+          <span>${escapeHtml(formatLoginTime(device.lastLoginAt))} · ${escapeHtml(device.location || '地点未知')}</span>
+        </summary>
+        <dl><dt>会话创建时间</dt><dd>${escapeHtml(formatLoginTime(device.createdAt))}</dd>
+          <dt>最近登录时间</dt><dd>${escapeHtml(formatLoginTime(device.lastLoginAt))}</dd>
+          <dt>最近登录地点</dt><dd>${escapeHtml(device.location || '未知')}</dd>
+          <dt>系统</dt><dd>${escapeHtml([device.platform, device.osVersion].filter(Boolean).join(' ') || '未知')}</dd></dl>
+      </details>`).join('') || '<p>暂无登录设备。</p>'
+      : `<p>${escapeHtml(result?.devicesError || '暂无设备详情，请重新测活。')}</p>`;
+    dialog.showModal();
+  }
+
+  function healthRow(item, result, logout) {
+     const status = result?.status == null ? `失败：${result?.error || "未知错误"}` : `HTTP ${result.status}`;
+     const logoutText = logout?.ok ? "；已退出全部会话" : (logout && logout.error ? `；退出失败：${logout.error}` : "");
+     // Some plan payloads (notably team/plus) now include a 5-hour
+     // window again. Prefer the returned data even when the plan
+     // fallback classification says that window may be absent.
+     const formatWindow = (window, unavailable = false) => unavailable && !window ? "不适用" : (window?.usedPercent == null ? "未知" : `${window.usedPercent}%${window.resetAfterSeconds != null ? `（${formatDuration(window.resetAfterSeconds)} 后）` : ""}`);
+     const usage = result?.usage || item.usage;
+
+     return `<tr>
+       <td><div class="cell-clip" title="${escapeHtml(item.name)}">${escapeHtml(item.name || "-")}</div></td>
+       <td><div class="cell-clip" title="${escapeHtml(item.email)}">${escapeHtml(item.email || "-")}</div></td>
+       <td><div class="cell-clip" title="${escapeHtml(status + logoutText)}">${escapeHtml(status + logoutText)}</div></td>
+       <td>${escapeHtml(formatWindow(usage?.fiveHour, planHasNoFiveHourWindow(usage?.planType)))}</td>
+       <td>${escapeHtml(formatWindow(usage?.sevenDay))}</td>
+       <td title="${escapeHtml(result?.devicesError || '当前登录设备列表中的设备数量')}"><button type="button" class="device-count" data-device-index="${escapeHtml(String(result?.index ?? ""))}" aria-label="查看 ${escapeHtml(item.name || item.email || '账号')} 的在线设备详情">${Number.isInteger(result?.deviceCount) && result.deviceCount >= 0 ? result.deviceCount : '未知'}</button></td>
+       <td title="${escapeHtml(result?.trial?.error || [result?.trial?.reason, result?.trial?.warning].filter(Boolean).join('；') || '尚未检测')}">${result?.trial?.eligible === true ? '有资格' : result?.trial?.eligible === false ? '无资格' : '未知'}${result?.trial?.country ? `（${escapeHtml(result.trial.country)}）` : ''}</td>
+       <td class="login-times"><span>最早：${escapeHtml(formatLoginTime(result?.firstLoginAt))}</span><span>最近：${escapeHtml(formatLoginTime(result?.lastLoginAt))}</span></td>
+     </tr>`;
+   }
+
+  function renderHealth() {
+    if (state.format === "sub2api-tools") {
+      if (!toolHealthComplete()) {
+         elements.healthBody.innerHTML = '<tr><td colspan="8" class="empty">等待测活。</td></tr>';
+        return;
+      }
+      const show200 = elements.healthFilter.value !== "non200";
+      const filtered = state.toolRecords
+        .map((record, index) => ({ record, result: state.health[index] }))
+        .filter(({ record, result }) => {
+          if (skipFreeToolRecord(record)) return false;
+          if (!show200) return result?.status !== 200;
+          return result?.status === 200 && usageMatchesFilter(record, result);
+        });
+      elements.healthBody.innerHTML = filtered.map(({ record, result }) => healthRow({
+        name: record.account?.name,
+        email: record.account?.credentials?.email || record.account?.extra?.email,
+        sourceName: "sub2api",
+       }, { ...result, usage: recordUsage(record, result) }, state.logoutResults.find((item) => item.index === result?.index))).join("") || `<tr><td colspan="8" class="empty">没有符合当前筛选的账号。</td></tr>`;
+      return;
+    }
+    const complete = healthComplete();
+    if (!complete) {
+       elements.healthBody.innerHTML = '<tr><td colspan="8" class="empty">等待测活。</td></tr>';
+      return;
+    }
+    const show200 = elements.healthFilter.value !== "non200";
+    const filtered = state.converted
+      .map((item, index) => ({ item, result: state.health[index] }))
+      .filter(({ item, result }) => !skipFreeConverted(item) && (show200 ? result?.status === 200 : result?.status !== 200));
+    elements.healthBody.innerHTML = filtered
+      .map(({ item, result }) => healthRow(item, result, state.logoutResults.find((logout) => logout.index === result?.index)))
+       .join("") || `<tr><td colspan="8" class="empty">没有${show200 ? " HTTP 200" : "非 200"}账号。</td></tr>`;
+  }
+
+  async function readJsonResponse(response) {
+    if (typeof response.text !== "function") {
+      try { return await response.json(); }
+      catch { throw new Error(`服务返回空响应（HTTP ${response.status}）`); }
+    }
+    const text = await response.text();
+    if (!text.trim()) throw new Error(`服务返回空响应（HTTP ${response.status}）`);
+    try { return JSON.parse(text); }
+    catch { throw new Error(`服务返回非 JSON 响应（HTTP ${response.status}）`); }
+  }
+
+  function convertedHealthAccount(item) {
+    return { email: item.cpa.email, accessToken: item.cpa.access_token, accountId: item.cpa.account_id };
+  }
+
+  function convertedPlanType(item) {
+    return accountPlanType(convertedHealthAccount(item), item.cpa.plan_type);
+  }
+
+  function accountPlanType(account, fallback) {
+    const key = healthCredentialKey(account);
+    const health = sharedHealth.get(key);
+    return String(firstNonEmpty(health?.usage?.planType, knownHealthPlans.get(key), fallback) || '').trim().toLowerCase();
+  }
+
+  function skipFreeConverted(item) {
+    return elements.converterSkipFree.checked && convertedPlanType(item) === 'free';
+  }
+
+  function skipFreeToolRecord(record) {
+    return elements.converterSkipFree.checked && accountPlanType(toolHealthAccount(record), firstNonEmpty(
+      record.planType, record.account?.credentials?.plan_type, record.account?.plan_type, record.account?.extra?.plan_type,
+    )) === 'free';
+  }
+
+  function healthCandidates(includeSkipped = false) {
+    return state.toolRecords.length
+      ? state.toolRecords.filter(record => includeSkipped || !skipFreeToolRecord(record)).map(toolHealthAccount)
+      : state.converted.filter(item => includeSkipped || !skipFreeConverted(item)).map(convertedHealthAccount);
+  }
+
+  function renderHealthSummary() {
+    const accounts = healthCandidates();
+    const skipped = healthCandidates(true).length - accounts.length;
+    const skipMessage = skipped ? `已跳过 ${skipped} 个 free 账号。` : '';
+    if (!accounts.length) {
+      setStatus(elements.healthStatus, skipMessage || '等待自动测活。');
+      return;
+    }
+    const results = accounts.map(account => sharedHealth.get(healthCredentialKey(account)));
+    if (!results.every(Boolean)) return;
+    const ok = results.filter(item => item.status === 200).length;
+    const failed = results.filter(item => item.status == null).length;
+    const forbidden = results.filter(item => item.status === 403).length;
+    setStatus(elements.healthStatus, `测活完成：HTTP 200 ${ok}，非 200 ${results.length - ok}，403 拒绝 ${forbidden}，失败 ${failed}。${skipMessage}`, forbidden || failed ? 'error' : 'ok');
+  }
+
+  function toolHealthAccount(record) {
+    if (record.healthAccount) return record.healthAccount;
+    const account = record.account;
+    return { email: account?.credentials?.email || account?.email || account?.extra?.email,
+      accessToken: account?.credentials?.access_token || account?.credentials?.accessToken || account?.access_token || account?.accessToken,
+      accountId: account?.credentials?.chatgpt_account_id || account?.credentials?.account_id || account?.account_id };
+  }
+
+  function refreshSharedHealth() {
+    const converted = state.converted.map(convertedHealthAccount);
+    const isTool = state.format === 'sub2api-tools';
+    const records = isTool ? state.toolRecords : state.converted;
+    const skip = isTool ? skipFreeToolRecord : skipFreeConverted;
+    const results = records.map((record, index) => {
+      const account = isTool ? toolHealthAccount(record) : converted[index];
+      const result = sharedHealth.get(healthCredentialKey(account));
+      return result ? { ...result, index } : null;
+    });
+    // Keep source indices stable for health filters, logout and device details.
+    state.health = results.every((result, index) => result || skip(records[index])) ? results : [];
+    const testAccounts = converted.map((account, index) => ({ ...account, planType: convertedPlanType(state.converted[index]) }));
+    const isFree = account => String(account.planType || '').trim().toLowerCase() === 'free';
+    const healthy = testAccounts.filter(account => freshHealth.has(healthCredentialKey(account)) && sharedHealth.get(healthCredentialKey(account))?.status === 200);
+    evaluationEligibility = { total: converted.length,
+      healthyCount: healthy.length, skippedFree: testAccounts.filter(isFree).length,
+      pending: Boolean(healthController) && state.converted.some(item => !skipFreeConverted(item) && !freshHealth.has(healthCredentialKey(convertedHealthAccount(item)))),
+      accounts: healthy.filter(account => !isFree(account)) };
+  }
+
+  async function startHealthCheck({ force = true } = {}) {
+    cancelHealthCheck();
+    const all = healthCandidates();
+    const activeKeys = new Set(healthCandidates(true).map(healthCredentialKey));
+    const checkedKeys = new Set(all.map(healthCredentialKey));
+    // Retain plan knowledge when invalidating health, including toggles during a recheck.
+    for (const [key, result] of sharedHealth) {
+      if (result?.usage?.planType) knownHealthPlans.set(key, result.usage.planType);
+      if (!activeKeys.has(key) || (force && checkedKeys.has(key))) { sharedHealth.delete(key); freshHealth.delete(key); }
+    }
+    for (const key of knownHealthPlans.keys()) if (!activeKeys.has(key)) knownHealthPlans.delete(key);
+    const accounts = all.filter(account => !freshHealth.has(healthCredentialKey(account)));
+    if (!accounts.length) {
+      refreshSharedHealth();
+      updateOutput();
+      renderHealthSummary();
+      return;
+    }
+    const controller = new AbortController();
+    healthController = controller;
+    const isCurrent = workspaceTaskIsCurrent(controller.signal);
+    const run = state.healthRun;
+    resetLogoutAllSessions();
+    refreshSharedHealth();
+    updateOutput();
+    const concurrency = selectedTaskConcurrency();
+    setStatus(elements.healthStatus, `正在测活 ${accounts.length} 个账号，并发 ${concurrency}...`);
+    try {
+      const response = await pageFetch('/api/session-health', {
+        method: 'POST', signal: controller.signal, credentials: 'same-origin',
+        headers: loginProxyHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ includeUsage: true, includeDevices: true, includeTrial: true, concurrency, accounts }),
+      });
+      const payload = await readJsonResponse(response);
+      if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+      if (!isCurrent() || run !== state.healthRun) return;
+      if (!Array.isArray(payload.results) || payload.results.length !== accounts.length) throw new Error('测活接口返回结果不完整');
+      accounts.forEach((account, index) => {
+        const key = healthCredentialKey(account);
+        sharedHealth.set(key, payload.results[index]);
+        freshHealth.add(key);
+      });
+      renderHealthSummary();
+    } catch (error) {
+      if (!isCurrent() || run !== state.healthRun) return;
+      setStatus(elements.healthStatus, `自动测活失败：${error instanceof Error ? error.message : String(error)}`, 'error');
+    } finally {
+      if (healthController === controller) {
+        healthController = null;
+        refreshSharedHealth();
+        updateOutput();
+      }
+    }
+  }
+
+  function cancelHealthCheck() {
+    state.healthRun += 1;
+    healthController?.abort();
+    healthController = null;
+  }
+
+  function rebuildSharedAccounts(text, sourceMetadata = []) {
+    const stamp = Date.parse(state.conversionAt);
+    const now = new Date(Number.isFinite(stamp) ? stamp : Date.now());
+    let imported = [], parsed = null;
+    const skipped = [];
+    if (text.trim()) {
+      try { imported = parseInputDocuments(text).map((item, index) => ({ ...item, ...sourceMetadata[index] })); }
+      catch (error) { skipped.push({ sourceName: '输入', reason: error.message }); }
+      try { parsed = parseSub2apiRecords(text); } catch { /* Other supported account formats are converted below. */ }
+    }
+    const convert = source => {
+      try { return { source, item: convertSession(source.value, { now, sourceName: source.sourceName, sourcePath: source.path }) }; }
+      catch (error) { skipped.push({ sourceName: source.sourceName, path: source.path, reason: error.message }); return null; }
+    };
+    rememberLoginAccountKeys();
+    const linked = new Set(state.linkedAccountKeys);
+    const manual = imported.map(convert).filter(Boolean).filter(row => !linked.has(sharedAccountKey(row.item.cpa)));
+    const login = projectLoginAccounts(state.browserAccounts).map(convert).filter(Boolean);
+    const merged = mergeSharedAccounts(manual, login, row => sharedAccountKey(row.item.cpa));
+    state.sessions = merged.map(row => row.source);
+    state.converted = merged.map(row => row.item);
+    state.skipped = skipped;
+    const record = item => ({ account: item.sub2apiAccount, type: 'sub2api-data', version: 1, proxies: [] });
+    const keyOfRecord = row => {
+      try { return sharedAccountKey(convertSession(row.account, { now }).cpa); }
+      catch { return sharedAccountKey(row.account); }
+    };
+    const manualRecords = parsed ? parsed.records.filter(row => !linked.has(keyOfRecord(row))) : manual.map(row => record(row.item));
+    state.toolRecords = mergeSharedAccounts(manualRecords, login.map(row => record(row.item)), keyOfRecord);
+    for (const row of state.toolRecords) {
+      try {
+        const item = convertSession(row.account, { now });
+        row.healthAccount = convertedHealthAccount(item);
+        row.planType = item.cpa.plan_type;
+      }
+      catch { /* Non-token records remain available to the batch tools. */ }
+    }
+    state.toolParsed = { firstDocument: parsed?.firstDocument || { type: 'sub2api-data', version: 1 },
+      proxies: parsed?.proxies || [], records: state.toolRecords };
+    state.toolResult = null;
+    refreshSharedHealth();
+  }
+
+  function convertFromText(text) {
+    state.conversionAt = new Date().toISOString();
+    rebuildSharedAccounts(text);
+    updateOutput();
+    startHealthCheck({ force: false });
+  }
+
+  function rememberLoginAccountKeys() {
+    const keys = new Set(state.linkedAccountKeys);
+    for (const source of projectLoginAccounts(state.browserAccounts)) {
+      try { keys.add(sharedAccountKey(convertSession(source.value).cpa)); } catch { /* No usable credential. */ }
+    }
+    state.linkedAccountKeys = [...keys];
+  }
+
+  function restoreDerivedWorkspace(sourceMetadata = []) {
+    const savedHealth = state.health;
+    rebuildSharedAccounts(elements.input.value, sourceMetadata);
+    const visible = state.format === 'sub2api-tools' ? state.toolRecords.map(toolHealthAccount) : state.converted.map(convertedHealthAccount);
+    if (savedHealth.length === visible.length) visible.forEach((account, index) => {
+      if (savedHealth[index]) sharedHealth.set(healthCredentialKey(account), savedHealth[index]);
+    });
+    refreshSharedHealth();
+  }
+
+  function setStatus(element, text, tone = "") {
+    element.textContent = text;
+    if (element === elements.pushStatus) elements.pushFeedback.hidden = !text && !state.pushResults.length && !state.pushOperations.length;
+    element.classList.toggle("is-ok", tone === "ok");
+    element.classList.toggle("is-error", tone === "error");
+  }
+
+  function updateOutput() {
+    refreshSharedHealth();
+    modelEvaluation.refresh();
+    updatePushControls();
+    persistBrowserWorkspace();
+    const isTool = state.format === "sub2api-tools";
+    const isLogin = state.format === "protocol-login";
+    const visibleConverted = state.converted.filter(item => !skipFreeConverted(item));
+    const skippedFree = state.converted.length - visibleConverted.length;
+    const selected = selectedConverted();
+    const hasConverted = visibleConverted.length > 0;
+    let outputText = "";
+
+    if (isTool && state.toolParsed) {
+      try {
+        state.toolResult = buildSub2apiToolResult(elements.input.value, selectedToolRecords(), state.toolParsed);
+      } catch (error) {
+        state.toolResult = null;
+        setStatus(elements.inputStatus, error.message, 'error');
+      }
+    }
+    if (isTool && state.toolResult) {
+      outputText = elements.sub2apiOperation.value === "split"
+        ? (elements.splitScope.value === "unmatched" ? state.toolResult.unmatchedText : state.toolResult.matchedText)
+        : state.toolResult.outputText;
+    } else if (!isLogin && hasConverted) {
+      outputText = JSON.stringify(buildOutputDocument(selected), null, 2);
+    }
+
+    state.outputText = outputText;
+    elements.output.value = outputText;
+    elements.copyOutput.disabled = !outputText;
+    elements.downloadOutput.disabled = isLogin || !outputText || (!isTool && elements.downloadScope.value === "200" && !healthComplete());
+    elements.statCount.textContent = String(isTool ? (state.toolResult?.accountCount || 0) : (isLogin ? state.loginLastAccounts.length : visibleConverted.length));
+    elements.statErrors.textContent = String(state.skipped.length + skippedFree);
+    elements.statFormat.textContent = OUTPUT_LABELS[state.format];
+    const syncedCount = projectLoginAccounts(state.browserAccounts).length;
+    const visibleSyncedCount = state.sessions.filter((source, index) => source.path?.startsWith('login:') && !skipFreeConverted(state.converted[index])).length;
+    const healthyCount = visibleConverted.filter(item => {
+      const key = healthCredentialKey(convertedHealthAccount(item));
+      return freshHealth.has(key) && sharedHealth.get(key)?.status === 200;
+    }).length;
+    document.querySelector('#shared-account-status').textContent = `共享账号 ${visibleConverted.length} 个 · 协议登录提供 ${visibleSyncedCount} 个 · 测活通过 ${healthyCount} 个${skippedFree ? ` · 已跳过 ${skippedFree} 个 free 账号` : ''}`;
+    document.querySelector('#login-shared-status').textContent = syncedCount
+      ? `已同步 ${syncedCount} 个个人 / 工作区凭据，可直接切换到格式转换、批处理和模型测试。`
+      : '登录成功后自动同步到其他功能，无需下载再导入。';
+    elements.outputSubtitle.textContent = isTool ? "当前输出为 sub2api 批处理结果。" : (isLogin ? "协议登录完成后可导出 sub2api JSON。" : `当前输出为 ${OUTPUT_LABELS[state.format]} 导入 JSON。`);
+    elements.downloadOutput.textContent = isTool && elements.sub2apiOperation.value === "split"
+      ? "下载当前组"
+      : (isTool && state.toolResult?.extension === "txt" ? "下载 TXT" : "下载 JSON");
+    const isSplit = isTool && elements.sub2apiOperation.value === "split";
+    elements.splitDownloads.classList.toggle("hidden", !isSplit);
+    elements.downloadMatched.textContent = `下载匹配邮箱 (${state.toolResult?.matchedCount || 0})`;
+    elements.downloadUnmatched.textContent = `下载未匹配邮箱 (${state.toolResult?.unmatchedCount || 0})`;
+    elements.downloadMatched.disabled = !isSplit || !state.toolResult?.matchedText;
+    elements.downloadUnmatched.disabled = !isSplit || !state.toolResult?.unmatchedText;
+    elements.cpaNotice.style.display = ["cpa", "cockpit", "codex", "axonhub", "codexmanager"].includes(state.format) ? "block" : "none";
+    if (elements.downloadScope.parentElement) elements.downloadScope.parentElement.style.display = "";
+
+    renderAccounts();
+    renderHealth();
+    renderIssues();
+    syncLogoutAllSessionsButton();
+
+    if (isSplit && state.toolResult) {
+      setStatus(elements.outputStatus, `拆分完成：匹配 ${state.toolResult.matchedCount}，未匹配 ${state.toolResult.unmatchedCount}。`, "ok");
+    } else if (outputText) {
+      setStatus(elements.outputStatus, `已生成 ${isTool ? state.toolResult.accountCount : selected.length} 个账号。`, "ok");
+    } else {
+      setStatus(elements.outputStatus, "暂无输出。", state.skipped.length ? "error" : "");
+    }
+  }
+
+  function renderAccounts() {
+    const accounts = state.converted.filter(item => !skipFreeConverted(item));
+    if (!accounts.length) {
+      elements.accountBody.innerHTML = '<tr><td colspan="4" class="empty">暂无可转换账号。</td></tr>';
+      return;
+    }
+
+    elements.accountBody.innerHTML = accounts.map((item) => `
+      <tr>
+        <td><div class="cell-clip" title="${escapeHtml(item.name)}">${escapeHtml(item.name || "-")}</div></td>
+        <td><div class="cell-clip" title="${escapeHtml(item.email)}">${escapeHtml(item.email || "-")}</div></td>
+        <td><div class="cell-clip" title="${escapeHtml(item.expiresAt)}">${escapeHtml(formatDisplayDate(item.expiresAt) || "-")}</div></td>
+        <td><div class="cell-clip" title="${escapeHtml(item.sourceName)}">${escapeHtml(item.sourceName || "pasted-json")}</div></td>
+      </tr>
+    `).join("");
+  }
+
+  function renderIssues() {
+    if (!state.skipped.length) {
+      elements.issues.classList.remove("is-visible");
+      elements.issues.textContent = "";
+      return;
+    }
+
+    elements.issues.classList.add("is-visible");
+    elements.issues.innerHTML = state.skipped
+      .map((item) => `<div>${escapeHtml(item.sourceName || "input")} ${escapeHtml(item.path || "")}: ${escapeHtml(item.reason)}</div>`)
+      .join("");
+  }
+
+  function scheduleConvert() {
+    evaluationEligibility = { accounts: [], total: 0, pending: false };
+    if (!evaluationLogoutBusy) modelEvaluation.reset();
+    cancelHealthCheck();
+    const text = elements.input.value;
+    if (!text.trim() && !projectLoginAccounts(state.browserAccounts).length) {
+      sharedHealth.clear();
+      freshHealth.clear();
+      knownHealthPlans.clear();
+      state.healthRun += 1;
+      state.health = [];
+      resetLogoutAllSessions();
+      state.converted = [];
+      state.skipped = [];
+      state.sessions = [];
+      state.toolResult = null;
+      state.toolParsed = null;
+      state.toolRecords = [];
+      updateOutput();
+      setStatus(elements.inputStatus, "等待输入。");
+      return;
+    }
+
+    try {
+      convertFromText(text);
+      const parsedCount = state.format === "sub2api-tools" ? (state.toolResult?.accountCount || 0) : state.converted.length;
+      if (parsedCount) {
+        setStatus(elements.inputStatus, `解析完成：${parsedCount} 个账号，跳过 ${state.skipped.length} 项。`, "ok");
+      } else {
+        setStatus(elements.inputStatus, "没有可转换账号。", "error");
+      }
+    } catch (error) {
+      state.healthRun += 1;
+      state.health = [];
+      resetLogoutAllSessions();
+      state.converted = [];
+      state.toolResult = null;
+      state.toolParsed = null;
+      state.toolRecords = [];
+      state.skipped = [{
+        sourceName: "pasted-json",
+        path: "$",
+        reason: error instanceof Error ? error.message : "JSON 解析失败",
+      }];
+      state.outputText = "";
+      updateOutput();
+      setStatus(elements.inputStatus, error instanceof Error ? error.message : "JSON 解析失败", "error");
+    }
+  }
+
+  function downloadOutput() {
+    if (!state.outputText) {
+      return;
+    }
+
+    const isTool = state.format === "sub2api-tools";
+    const first = state.converted[0];
+    const base = sanitizeFileToken(first?.email || first?.name || state.format);
+    const scope = isTool
+      ? (elements.sub2apiOperation.value === "split" ? elements.splitScope.value : elements.sub2apiOperation.value)
+      : (elements.downloadScope.value === "all" ? "all" : "200");
+    const extension = isTool ? (state.toolResult?.extension || "txt") : "json";
+    const fileName = `${base}.${scope}.${getTimestampToken()}.${extension}`;
+    const blob = new Blob([state.outputText], { type: `${extension === "json" ? "application/json" : "text/plain"};charset=utf-8` });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = fileName;
+    document.body.append(anchor);
+    anchor.click();
+    anchor.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  function downloadSplitGroup(scope) {
+    if (!state.toolResult || elements.sub2apiOperation.value !== "split") return;
+    const outputText = scope === "unmatched" ? state.toolResult.unmatchedText : state.toolResult.matchedText;
+    if (!outputText) return;
+    const fileName = `sub2api.${scope}.${getTimestampToken()}.txt`;
+    const url = URL.createObjectURL(new Blob([outputText], { type: "text/plain;charset=utf-8" }));
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = fileName;
+    document.body.append(anchor);
+    anchor.click();
+    anchor.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  function splitLoginAccount(line) {
+    return splitPasswordTotpLine(line);
+  }
+
+  function parseLoginAccounts(text) {
+    const rows = String(text || "").split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+    if (!rows.length) throw new Error("请输入账号，每行一个");
+    return rows.map((line, index) => {
+      const parts = splitLoginAccount(line);
+      if (parts.length !== 3 || !parts.every(Boolean) || !parts[0].includes("@")) {
+        throw new Error(`第 ${index + 1} 行必须是 账号----密码----2fa、账号---密码---2fa 或 账号--密码--2fa`);
+      }
+      if (!/^[A-Z2-7]+=*$/i.test(parts[2].replace(/[\s-]+/g, ''))) {
+        throw new Error(`第 ${index + 1} 行的 2FA 密钥不是有效的 Base32`);
+      }
+      return line;
+    });
+  }
+
+  function useSharedLoginAccounts(showStatus) {
+    if (monitorBusy || selfLeaveBusy || protocolLogoutBusy || elements.startProtocolLogin.disabled || elements.resetLoginTotp.disabled) return;
+    const candidates = [...state.browserAccounts];
+    const visit = value => {
+      if (!value || typeof value !== 'object') return;
+      if (!Array.isArray(value)) candidates.push(value);
+      Object.values(value).forEach(child => { if (child && typeof child === 'object') visit(child); });
+    };
+    try { parseJsonValues(elements.input.value).forEach(visit); } catch { /* Keep incomplete input available for editing. */ }
+    const existing = new Set(elements.loginAccounts.value.split(/\r?\n/).filter(Boolean).map(line => loginAccountEmail(line).toLowerCase()));
+    const lines = loginCredentialLines(candidates).filter(line => !existing.has(loginAccountEmail(line).toLowerCase()));
+    if (lines.length) {
+      elements.loginAccounts.value = [elements.loginAccounts.value.trim(), ...lines].filter(Boolean).join('\n');
+      clearLoginRetry();
+      state.accountActionRetries = {};
+      updateLoginCopyActions();
+      elements.loginAccountCount.textContent = `${countLoginAccountLines()} 个账号`;
+      persistBrowserWorkspace();
+    }
+    if (showStatus) setStatus(elements.loginStatus, lines.length ? `已加入 ${lines.length} 个共享账号，可选择登录或账号操作。`
+      : '没有新增的完整登录凭据。仅含 Token 的账号可转换、测活和测试模型；协议登录需要邮箱、密码和 2FA。');
+  }
+
+  async function importLoginFiles(files) {
+    if (!files?.length || elements.importLoginFile.disabled || elements.startProtocolLogin.disabled || elements.resetLoginTotp.disabled) return;
+    const isCurrent = workspaceTaskIsCurrent();
+    elements.importLoginFile.disabled = true;
+    try {
+      const lines = [];
+      for (const file of Array.from(files)) {
+        if (file.size > 5 * 1024 * 1024) throw new Error('单个账号文件不能超过 5 MB');
+        const content = await file.text();
+        requireCurrentWorkspace(isCurrent);
+        lines.push(...parseLoginAccounts(content));
+      }
+      // A login may have started while the file was being read.
+      if (monitorBusy || selfLeaveBusy || protocolLogoutBusy || elements.startProtocolLogin.disabled || elements.resetLoginTotp.disabled) {
+        throw new Error('当前账号任务正在执行，请完成后重新导入');
+      }
+      elements.loginAccounts.value = [elements.loginAccounts.value.trim(), ...lines].filter(Boolean).join('\n');
+      elements.loginAccountCount.textContent = `${countLoginAccountLines()} 个账号`;
+      await persistBrowserWorkspace(true, true);
+      requireCurrentWorkspace(isCurrent);
+      setStatus(elements.loginStatus, `已导入 ${lines.length} 个账号到输入框，选择功能后执行。`, 'ok');
+    } catch (error) {
+      if (isCurrent()) setStatus(elements.loginStatus, error.message, 'error');
+    } finally {
+      if (isCurrent()) elements.importLoginFile.disabled = elements.startProtocolLogin.disabled || elements.resetLoginTotp.disabled;
+    }
+  }
+
+  const LOGIN_STAGES = ["连接 Codex", "输入账号", "验证密码", "验证 2FA", "获取首个 RT", "授权工作区", "完成"];
+  const SESSION_LOGIN_STAGES = ["连接 ChatGPT", "输入账号", "验证密码", "验证 2FA", "获取 Session"];
+  const ACCOUNT_ACTION_STAGES = ["准备账号操作", "输入账号", "验证密码", "验证 2FA", "建立会话", "处理工作区", "完成"];
+  function loginStagesForMode(mode) {
+    return mode === 'session' ? SESSION_LOGIN_STAGES : mode === 'action' ? ACCOUNT_ACTION_STAGES : LOGIN_STAGES;
+  }
+  // DOM references stay outside the persisted browser state.
+  const loginProgressNodes = new Map();
+  const dirtyLoginRecords = new Set();
+  const LOGIN_TIMING_LABELS = Object.freeze({
+    queue: '排队', total: '账号执行', proxy_preflight: '出口检测', http_queue: 'HTTP 排队', http_request: 'HTTP 请求',
+    sentinel: '辅助验证', browser_queue: '浏览器排队', browser_start: '浏览器启动', browser_context: '创建隔离环境',
+    browser_navigation: '验证页加载', browser_verify: '浏览器验证', browser_cleanup: '环境清理',
+    oauth_start: '登录准备', username: '提交账号', password: '密码验证', totp: '2FA 验证', workspace: '工作区授权',
+    token_exchange: '获取 RT', session: '获取 Session',
+  });
+
+  function updateLoginTimings(record, timings) {
+    if (!record) return;
+    record.timings ||= {};
+    for (const [stage, timing] of Object.entries(timings || {})) {
+      if (!Object.hasOwn(LOGIN_TIMING_LABELS, stage) || !Number.isFinite(timing?.durationMs) || timing.durationMs < 0) continue;
+      record.timings[stage] = { durationMs: timing.durationMs, calls: Number(timing.calls) || 1 };
+    }
+    scheduleLoginProgressRender(record);
+  }
+
+  function loginAccountEmail(line) {
+    return splitLoginAccount(line)[0] || "";
+  }
+
+  function loginProgressRecord(data = {}) {
+    const id = String(data.id || data.accountId || "").trim();
+    const email = String(data.email || "").trim().toLowerCase();
+    const byEmail = email && state.loginProgress.get(email);
+    if (byEmail) return byEmail;
+    if (!id) return null;
+    for (const record of state.loginProgress.values()) {
+      if (record.id === id) return record;
+    }
+    return null;
+  }
+
+  function ensureLoginProgressRecord(data = {}, order = 0) {
+    const existing = loginProgressRecord(data);
+    if (existing) return existing;
+    const id = String(data.id || data.accountId || '').trim();
+    const email = String(data.email || '').trim();
+    if (!id && !email) return null;
+    const record = { id, email: email || id, stage: 0, status: 'waiting', logs: [], order };
+    state.loginProgress.set(record.email.toLowerCase(), record);
+    return record;
+  }
+
+  function sanitizeLoginLog(message) {
+    let text = String(message || "");
+    state.loginSensitiveValues.forEach((value) => {
+      if (value) text = text.split(value).join("[已隐藏]");
+    });
+    return text
+      .replace(/((?:password|密码)\s*[=:：]\s*)\S+/gi, "$1[已隐藏]")
+      .replace(/((?:totp|2fa|验证码|secret)\s*[=:：]\s*)[A-Z0-9]{6,}/gi, "$1[已隐藏]");
+  }
+
+  function loginLogTime(value) {
+    const date = value ? new Date(value) : new Date();
+    return Number.isNaN(date.getTime()) ? new Date().toLocaleTimeString("zh-CN", { hour12: false }) : date.toLocaleTimeString("zh-CN", { hour12: false });
+  }
+
+  function inferLoginStage(message, fallback = 0, phase = '') {
+    const text = String(message || "");
+    if (/交换.*(?:code|token)|转为?\s*RT|RT\s*(?:完成|成功|已获取|已就绪)/i.test(text)) return phase === 'codex' ? 4 : 6;
+    if (/Business|workspace|工作区/i.test(text)) return phase === 'codex' ? 4 : 5;
+    if (/登录完成|登录成功|Session\s*(?:已获取|已入库|有效)|accessToken/i.test(text)) return 4;
+    if (/提交\s*(?:TOTP|2FA)|准备\s*2FA\s*验证|2FA\/MFA|MFA\s*(?:验证|挑战)|输入\s*2FA/i.test(text)) return 3;
+    if (/提交账号密码|准备密码验证|PasswordVerify|输入密码/i.test(text)) return 2;
+    if (/提交登录邮箱|提交注册邮箱|输入账号|输入邮箱/i.test(text)) return 1;
+    if (/打开官网|开始.*(?:登录|转换)|OAuth|authorize|ChatGPT Web/i.test(text)) return 0;
+    return fallback;
+  }
+
+  function conciseLoginLog(message, level = 'info') {
+    const text = sanitizeLoginLog(message).trim();
+    // Warnings and failures keep their diagnostic details, even when the
+    // corresponding successful request is normally hidden.
+    if (/^(?:warn|warning|error)$/i.test(level) || /失败|异常|错误|未找到|无法|重试|重新.*验证/i.test(text)) return text;
+    if (/密码\+2FA 账号，直接 Codex 登录/.test(text)) return '直接进行 Codex OAuth 登录，验证账号、密码和 2FA';
+    if (/(?:预生成|复用已有)注册资料|零元.*试用|协议隔离环境|独立Cookie\/设备|账号已有本地 TOTP 密钥|清理旧 Session|协议重登第\s*\d+\//i.test(text)) return '';
+    if (/准备检测代理连通性|OAuth 落点|Cookie 诊断|工作区授权页|密码\+2FA 账号|账号已注册，跳过注册|Codex OAuth[：:]|授权.*(?:跳转|落点)/i.test(text)) return '';
+    if (/等待.*队列调度/.test(text)) return '已加入队列，等待执行';
+    if (/代理连通性检测开始/.test(text)) return '正在检测代理连通性';
+    if (/代理连通性检测通过/.test(text)) return text.replace(/，开始正式流程.*$/, '');
+    if (/准备.*辅助验证/.test(text)) return text;
+    if (/提交\s*TOTP\s*2FA/.test(text)) return '提交 2FA 验证码';
+    if (/选择默认工作区/.test(text)) return '授权默认工作区';
+    return text.replace(/\s*\(factor=[^)]+\)/gi, '');
+  }
+
+  function appendLoginProgress(record, message, options = {}) {
+    if (!record) return;
+    const clean = conciseLoginLog(message, options.level);
+    let changed = false;
+    if (clean) {
+      const eventAt = Number.isFinite(Date.parse(options.time || "")) ? Date.parse(options.time) : Date.now();
+      const key = clean.replace(/\s+/g, " ").trim();
+      const previous = record.logs.at(-1);
+      const duplicate = previous?.key === key && previous.level === (options.level || 'info');
+      if (!duplicate) {
+        record.logs.push({ time: loginLogTime(options.time), eventAt, key, level: options.level || "info", message: clean });
+        changed = true;
+      }
+      if (record.logs.length > 50) record.logs.splice(0, record.logs.length - 50);
+    }
+    if (Number.isInteger(options.stage) && options.stage > record.stage) { record.stage = options.stage; changed = true; }
+    if (options.status && options.status !== record.status) { record.status = options.status; changed = true; }
+    if (changed) scheduleLoginProgressRender(record);
+  }
+
+  function scheduleLoginProgressRender(record) {
+    if (record) dirtyLoginRecords.add(record.email.toLowerCase());
+    persistBrowserWorkspace();
+    if (state.loginRenderFrame) return;
+    state.loginRenderFrame = requestAnimationFrame(() => {
+      state.loginRenderFrame = 0;
+      renderLoginProgress(false);
+    });
+  }
+
+  function initializeLoginProgress(lines, { preserveExports = false, workspaceMode = 'action' } = {}) {
+    state.loginProgress = new Map();
+    state.loginSensitiveValues = [];
+    state.loginLastAccounts = [];
+    state.loginLastIds = [];
+    if (!preserveExports) {
+      state.loginSessionIds = [];
+      state.loginPersonalIds = [];
+      state.loginBusinessIds = [];
+    }
+    state.loginLastRtKind = "all";
+    lines.forEach((line, order) => {
+      const parts = splitLoginAccount(line);
+      const email = parts[0];
+      state.loginSensitiveValues.push(parts[1], parts[2]);
+      state.loginProgress.set(email.toLowerCase(), {
+        id: "",
+        email,
+        workspaceMode,
+        stage: 0,
+        status: "waiting",
+        logs: [],
+        order,
+      });
+    });
+    renderLoginProgress();
+  }
+
+  function getLoginWorkspaceMode() {
+    return elements.loginWorkspaceMode.querySelector('input[name="login-workspace-mode"]:checked')?.value === "session" ? "session" : "all";
+  }
+
+  function updateLoginExportActions() {
+    document.querySelector('#login-mode-description').textContent = (getLoginWorkspaceMode() === 'session'
+      ? '登录 ChatGPT Web 并获取 Session，完成后结束。'
+      : '直接使用 Codex OAuth 验证账号、密码和 2FA，复用本次登录获取全部可用工作区 RT。')
+      + (elements.loginRequireNonPersonal.checked ? ' 仅选择非个人工作区，未获取到时自动重新登录，最多尝试三次。' : ' 没有个人工作区时直接使用其他工作区。');
+    for (const [key, button, label] of [
+      ['selfLeave', elements.selfLeaveWorkspaces, '自踢'],
+      ['logoutAll', elements.protocolLogoutAll, '退出全部会话'],
+    ]) {
+      const count = state.accountActionRetries[key]?.emails?.length || 0;
+      if (button) button.textContent = count ? `${label}：重试失败账号 (${count})` : label;
+    }
+    const retryCount = Number(state.loginRetry?.ids?.length || 0);
+    elements.startProtocolLogin.textContent = retryCount
+      ? `重试失败账号 (${retryCount})`
+      : (getLoginWorkspaceMode() === "session" ? "开始协议登录" : "开始获取全部 RT");
+    elements.exportLoginPersonal.disabled = state.loginPersonalIds.length === 0;
+    elements.exportLoginBusiness.disabled = state.loginBusinessIds.length === 0 || getLoginWorkspaceMode() !== "all";
+    updatePushControls();
+  }
+
+  function loginInputIdentity(lines) {
+    return [...new Set(lines.map(line => loginAccountEmail(line).toLowerCase()).filter(Boolean))].sort();
+  }
+
+  function clearLoginRetry() {
+    if (!state.loginRetry) return;
+    state.loginRetry = null;
+    updateLoginExportActions();
+    persistBrowserWorkspace();
+  }
+
+  function pendingLoginRetry(lines, workspaceMode) {
+    const retry = state.loginRetry;
+    if (!retry || !Array.isArray(retry.ids) || !retry.ids.length) return null;
+    if (retry.workspaceMode !== workspaceMode || Boolean(retry.requireNonPersonal) !== elements.loginRequireNonPersonal.checked) {
+      clearLoginRetry();
+      return null;
+    }
+    const currentEmails = new Set(loginInputIdentity(lines));
+    const sourceEmails = Array.isArray(retry.inputEmails) ? retry.inputEmails : [];
+    // Editing the account list starts a new batch. Proxy controls can still be
+    // changed between attempts without invalidating the failed-account set.
+    if (sourceEmails.length && (sourceEmails.length !== currentEmails.size || sourceEmails.some(email => !currentEmails.has(email)))) {
+      clearLoginRetry();
+      return null;
+    }
+    const accounts = (retry.accounts || []).filter(item => item?.id && (!item.email || currentEmails.has(String(item.email).toLowerCase())));
+    const ids = [...new Set(accounts.map(item => String(item.id)).filter(Boolean))];
+    if (!ids.length) {
+      clearLoginRetry();
+      return null;
+    }
+    return { ...retry, accounts, ids };
+  }
+
+  function setLoginRetry(results, lines, workspaceMode) {
+    const failed = (Array.isArray(results) ? results : [])
+      .filter(item => isRetryableLoginFailure(item))
+      .map(item => ({ id: String(item.id), email: String(item.email || '').trim() }))
+      .filter((item, index, rows) => rows.findIndex(other => other.id === item.id) === index);
+    state.loginRetry = failed.length
+      ? { ids: failed.map(item => item.id), accounts: failed, workspaceMode, requireNonPersonal: elements.loginRequireNonPersonal.checked, inputEmails: loginInputIdentity(lines) }
+      : null;
+    updateLoginExportActions();
+  }
+
+  function setLoginRetryFromProgress(lines, workspaceMode) {
+    const failed = [...state.loginProgress.values()]
+      .filter(record => record.id && record.status === 'error' && isRetryableLoginFailure({
+        id: record.id,
+        terminalReason: record.terminalReason,
+        error: record.error || record.logs?.at(-1)?.message || '',
+      }))
+      .map(record => ({ id: String(record.id), email: String(record.email || '').trim() }))
+      .filter((item, index, rows) => rows.findIndex(other => other.id === item.id) === index);
+    state.loginRetry = failed.length
+      ? { ids: failed.map(item => item.id), accounts: failed, workspaceMode, inputEmails: loginInputIdentity(lines) }
+      : null;
+    updateLoginExportActions();
+  }
+
+  function isRetryableLoginFailure(item = {}) {
+    if (!item?.id || item.ok || item.terminalReason) return false;
+    const text = String(item.error || item.detail || item.healthLabel || item.message || '').toLowerCase();
+    return !/invalid[_ -]?(?:username|email|password)|incorrect|wrong password|password(?: is| was)? (?:invalid|incorrect|wrong|rejected)|密码.{0,16}(?:错误|不正确|无效|拒绝)|(?:invalid|incorrect|wrong)[_ -]?(?:otp|totp|mfa|2fa)|(?:otp|totp|mfa|2fa|验证码).{0,24}(?:错误|不正确|无效|拒绝)|account[_ -]?(?:deactivated|deleted|not[_ -]?found|banned|suspended|disabled|locked)|user[_ -]?(?:deleted|not[_ -]?found|banned|suspended|disabled)|account (?:has been |is )?(?:deleted|deactivated|banned|suspended|disabled|locked)|账号.{0,8}(?:停用|封禁|删除|不存在|冻结)|账户.{0,8}(?:删除|停用|不存在|封禁|冻结)/i.test(text);
+  }
+
+  function pipelineRtIds(results = []) {
+    return [...new Set((Array.isArray(results) ? results : [])
+      .filter(item => item?.ok || item?.personalOk || Number(item?.businessSuccess) > 0)
+      .map(item => String(item.id || '').trim())
+      .filter(Boolean))];
+  }
+
+  function updateLoginStageRail(records) {
+    const stages = loginStagesForMode(records[0]?.workspaceMode || getLoginWorkspaceMode());
+    elements.loginStepList.dataset.stepCount = String(stages.length);
+    Array.from(elements.loginStepList.querySelectorAll("[data-login-stage]")).forEach((item) => {
+      const index = Number(item.dataset.loginStage);
+      item.hidden = index >= stages.length;
+      item.classList.toggle('is-last-step', index === stages.length - 1);
+      item.querySelector('.login-step-label').textContent = stages[index] || '';
+      const active = records.some((record) => record.status === "running" && record.stage === index);
+      const done = records.length > 0 && records.every((record) => record.status === "success" || record.stage > index);
+      const failed = records.some((record) => record.status === "error" && record.stage === index);
+      item.classList.toggle("is-active", active);
+      item.classList.toggle("is-done", done);
+      item.classList.toggle("is-error", failed);
+      const marker = item.querySelector(".login-step-marker");
+      marker.textContent = done ? "✓" : (failed ? "!" : String(index + 1));
+    });
+  }
+
+  function renderLoginProgress(full = true) {
+    updateLoginCopyActions();
+    const records = Array.from(state.loginProgress.values());
+    const counts = { waiting: 0, running: 0, success: 0, error: 0 };
+    records.forEach((record) => { counts[record.status] = (counts[record.status] || 0) + 1; });
+    const completed = counts.success + counts.error;
+    const progressUnits = records.reduce((total, record) => total + (record.status === "success" || record.status === "error" ? 1
+      : record.status === "waiting" ? 0 : Math.min(1, (record.stage + 1) / loginStagesForMode(record.workspaceMode).length)), 0);
+    const overallPercent = records.length ? Math.round((progressUnits / records.length) * 100) : 0;
+    elements.loginAccountCount.textContent = `${records.length || countLoginAccountLines()} 个账号`;
+    elements.loginProgressSummary.textContent = `等待 ${counts.waiting} · 进行中 ${counts.running} · 成功 ${counts.success} · 失败 ${counts.error}`;
+    elements.loginCompletedCount.textContent = `已完成 ${completed}/${records.length}`;
+    elements.loginOverallPercent.textContent = `${overallPercent}%`;
+    elements.loginOverallBar.style.width = `${overallPercent}%`;
+    updateLoginStageRail(records);
+    if (!records.length) {
+      loginProgressNodes.clear();
+      dirtyLoginRecords.clear();
+      elements.loginProgressList.innerHTML = '<div class="login-progress-empty">输入账号并开始后，这里将显示每个账号的实时进度。</div>';
+      return;
+    }
+    if (!loginProgressNodes.size) elements.loginProgressList.innerHTML = '';
+    if (full) {
+      const keys = new Set(records.map(record => record.email.toLowerCase()));
+      for (const [key, node] of loginProgressNodes) {
+        if (!keys.has(key)) { node.article.remove(); loginProgressNodes.delete(key); }
+      }
+    }
+    const displayRecords = full ? [...records].sort((left, right) => left.order - right.order)
+      : [...dirtyLoginRecords].map(key => state.loginProgress.get(key)).filter(Boolean);
+    for (const record of displayRecords) {
+      const key = record.email.toLowerCase();
+      let node = loginProgressNodes.get(key);
+      if (node && !full && !dirtyLoginRecords.has(key)) continue;
+      if (!node) {
+        const article = document.createElement('article');
+        article.innerHTML = '<div class="login-account-progress-head"><div class="login-account-email"></div><div class="login-account-stage"></div></div>'
+          + '<div class="login-progress-track"><div class="login-progress-bar"></div></div><pre class="login-account-log"></pre>'
+          + '<details class="login-account-timing"><summary>阶段耗时</summary><div></div></details>';
+        node = { article, email: article.querySelector('.login-account-email'), stage: article.querySelector('.login-account-stage'),
+          track: article.querySelector('.login-progress-track'), bar: article.querySelector('.login-progress-bar'),
+          log: article.querySelector('.login-account-log'), timing: article.querySelector('.login-account-timing'),
+          durations: article.querySelector('.login-account-timing div') };
+        node.timing.title = '单个阶段可能包含其他子阶段；各项耗时不可直接相加。账号执行不含排队。';
+        loginProgressNodes.set(key, node);
+        elements.loginProgressList.append(article);
+      }
+      if (full) elements.loginProgressList.append(node.article);
+      const stages = loginStagesForMode(record.workspaceMode);
+      const stage = stages[Math.min(record.stage, stages.length - 1)];
+      const label = record.status === "waiting" ? "等待开始" : (record.status === "success" ? "已完成" : (record.status === "error" ? (validationFailureLabel(record) || `${stage}失败`) : stage));
+      const progress = record.status === "success" ? 100 : Math.max(5, Math.min(100, Math.round(((record.stage + 1) / stages.length) * 100)));
+      const log = record.logs.length
+        ? record.logs.map((item) => `[${item.time}] ${item.level === "error" ? "失败 · " : (/^warn/.test(item.level) ? "注意 · " : "")}${item.message}`).join("\n")
+        : "等待执行...";
+      node.article.className = `login-account-progress is-${record.status}`;
+      node.email.textContent = record.email;
+      node.email.title = record.email;
+      node.stage.textContent = label;
+      node.track.setAttribute('aria-label', `${record.email} ${progress}%`);
+      node.bar.style.width = `${progress}%`;
+      node.log.dataset.account = record.email;
+      if (node.log.textContent !== log) {
+        const top = node.log.scrollTop;
+        const follow = node.log.scrollHeight - node.log.clientHeight - top < 8;
+        node.log.textContent = log;
+        node.log.scrollTop = follow ? node.log.scrollHeight : top;
+      }
+      const durations = Object.entries(LOGIN_TIMING_LABELS).filter(([stage]) => record.timings?.[stage]);
+      node.timing.hidden = !durations.length;
+      const timingText = durations.map(([stage, label]) => `${label} ${(record.timings[stage].durationMs / 1000).toFixed(2)}s`).join(' · ');
+      if (node.durations.textContent !== timingText) node.durations.textContent = timingText;
+    }
+    dirtyLoginRecords.clear();
+  }
+
+  function countLoginAccountLines() {
+    return String(elements.loginAccounts.value || "").split(/\r?\n/).filter((line) => line.trim()).length;
+  }
+
+  function updateLoginProxySessionState(authorized, message = "") {
+    const node = elements.loginProxySessionState;
+    if (!node) return;
+    node.textContent = authorized ? "会话已授权" : (message || "需要重新授权");
+    node.classList.toggle("is-error", !authorized);
+    node.setAttribute("data-state", authorized ? "ok" : "error");
+  }
+
+  function loginProxyHeaders(extra = {}) {
+    return { ...(extra || {}) };
+  }
+
+  async function loginIcloudStream(path, body, onEvent, signal) {
+    const controller = new AbortController();
+    const streamSignal = AbortSignal.any([controller.signal, signal, window.browserWorkspace?.signal].filter(Boolean));
+    const isCurrent = workspaceTaskIsCurrent(streamSignal);
+    const ownsWorkspace = workspaceTaskIsCurrent();
+    const operationId = body?.operationId || crypto.randomUUID();
+    const history = { operationId, kind: path.split('/').at(-1), startedAt: Date.now(), status: 'pending' };
+    state.operationHistory.push(history);
+    await persistBrowserWorkspace(true, true);
+    requireCurrentWorkspace(isCurrent);
+    let reader;
+    let completed = false;
+    const cancelReader = () => { void reader?.cancel().catch(() => {}); };
+    streamSignal.addEventListener('abort', cancelReader, { once: true });
+    try {
+    const response = await pageFetch(path, {
+      method: "POST",
+      credentials: "same-origin",
+      signal: streamSignal,
+      headers: loginProxyHeaders({ Accept: "text/event-stream", "Content-Type": "application/json" }),
+      body: JSON.stringify(browserRequestBody({ ...(body || {}), operationId, schemaVersion: OPERATION_SCHEMA_VERSION, stream: true })),
+    });
+    requireCurrentWorkspace(isCurrent);
+    const contentType = response.headers.get("content-type") || "";
+    if (!response.ok || !contentType.includes("text/event-stream")) {
+      const payload = await response.json().catch(() => ({}));
+      requireCurrentWorkspace(isCurrent);
+      if (response.status === 401) updateLoginProxySessionState(false, "会话未授权");
+      throw new Error(String(payload.message || payload.error?.message || payload.error || `登录服务 HTTP ${response.status}`));
+    }
+    updateLoginProxySessionState(true);
+    reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let summary = null;
+    const yieldToLoginRender = () => new Promise((resolve) => setTimeout(resolve, 0));
+    const handleChunk = async (chunk) => {
+      requireCurrentWorkspace(isCurrent);
+      if (!chunk.trim() || chunk.trimStart().startsWith(":")) return;
+      let name = "message";
+      const dataLines = [];
+      chunk.split(/\r?\n/).forEach((line) => {
+        if (line.startsWith("event:")) name = line.slice(6).trim();
+        if (line.startsWith("data:")) dataLines.push(line.slice(5).trimStart());
+      });
+      if (!dataLines.length) return;
+      const data = validateOperationEvent(name, JSON.parse(dataLines.join("\n")), { operationId });
+      if (name === "browser_state") { await acceptBrowserState(data); return; }
+      if (name === "summary") summary = data;
+      if (name === "error") throw new Error(String(data.message || data.error?.message || data.error || "协议登录失败"));
+      onEvent?.(name, data);
+    };
+    while (true) {
+      const { value, done } = await reader.read();
+      requireCurrentWorkspace(isCurrent);
+      buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+      const chunks = buffer.split(/\r?\n\r?\n/);
+      buffer = chunks.pop() || "";
+      for (const chunk of chunks) {
+        await handleChunk(chunk);
+      }
+      if (chunks.length) await yieldToLoginRender();
+      if (done) break;
+    }
+    if (buffer.trim()) {
+      await handleChunk(buffer);
+      await yieldToLoginRender();
+    }
+    requireCurrentWorkspace(isCurrent);
+    if (!summary) throw new Error("登录服务未返回汇总结果");
+    history.status = summary.failed || summary.results?.some(item => item.ok === false) ? 'failed' : 'success';
+    history.completedAt = Date.now();
+    history.success = summary.success;
+    history.failed = summary.failed;
+    completed = true;
+    await persistBrowserWorkspace(true, true);
+    return summary;
+    } finally {
+      streamSignal.removeEventListener('abort', cancelReader);
+      if (!completed) {
+        controller.abort();
+        history.status = 'unknown';
+        history.completedAt = Date.now();
+      }
+      if (reader) {
+        if (!completed) await reader.cancel().catch(() => {});
+        reader.releaseLock();
+      }
+      if (!completed && ownsWorkspace()) await persistBrowserWorkspace(true, true);
+    }
+  }
+
+  async function loginIcloudRequest(path, body, signal) {
+    return loginIcloudJson(path, { method: "POST", body, signal });
+  }
+
+  async function loginIcloudJson(path, { method = "GET", body, signal } = {}) {
+    const isCurrent = workspaceTaskIsCurrent(signal);
+    const operationId = body === undefined ? undefined : (body.operationId || crypto.randomUUID());
+    const response = await pageFetch(path, {
+      method,
+      signal,
+      credentials: "same-origin",
+      headers: loginProxyHeaders({ "Content-Type": "application/json" }),
+      body: body === undefined ? undefined : JSON.stringify(browserRequestBody({ ...body, operationId, schemaVersion: OPERATION_SCHEMA_VERSION })),
+    });
+    const payload = await response.json().catch(() => ({}));
+    requireCurrentWorkspace(isCurrent);
+    validateOperationEvent('json', payload, { operationId });
+    await acceptBrowserState(payload.browserState);
+    if (!response.ok || payload.ok === false) {
+      if (response.status === 401) updateLoginProxySessionState(false, "会话未授权");
+      const error = payload.message || payload.error?.message || payload.error || `登录服务 HTTP ${response.status}`;
+      const message = String(error);
+      if (/手机号|手机|验证码|otp|phone|mfa|2fa/i.test(message)) {
+        showLoginModal(message);
+      }
+      throw new Error(message);
+    }
+    updateLoginProxySessionState(true);
+    return payload;
+  }
+
+  function selectedPushTarget() {
+    return elements.pushTarget.querySelector('input:checked')?.value || 'none';
+  }
+
+  function pushFeedbackTarget() {
+    return state.format === 'model-evaluation' ? 'sub2api' : selectedPushTarget();
+  }
+
+  function convertedPushSelection() {
+    return { accounts: selectedConverted(), skippedFree: state.converted.filter(skipFreeConverted).length };
+  }
+
+  let converterFilterSaving = false;
+
+  function normalizePushAddress(value, target) {
+    const raw = String(value || '').trim();
+    if (!raw) throw new Error('请填写服务地址');
+    const url = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(raw) ? raw : `https://${raw}`);
+    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search) throw new Error('请填写 HTTP(S) 服务地址，不要包含密码或查询参数');
+    url.hash = '';
+    url.pathname = url.pathname.replace(/\/+$/, '').replace(target === 'cpa'
+      ? /\/(?:management\.html|v0\/management(?:\/auth-files)?)$/i
+      : /\/(?:admin|login|dashboard|api(?:\/v1)?(?:\/admin)?)$/i, '');
+    return url.href.replace(/\/+$/, '');
+  }
+
+  function pushSettings(target) {
+    const settings = target === 'sub2api' ? state.browserSettings.sub2apiSettings : state.cpaSettings;
+    if (!['sub2api', 'cpa'].includes(target)) throw new Error('请先选择 Sub2API 或 CPA');
+    if (!settings?.baseUrl?.trim() || !(target === 'sub2api' ? settings.adminApiKey?.trim() && settings.groupIds?.length : settings.managementKey?.trim())) {
+      throw new Error(`请先打开 ${target === 'sub2api' ? 'Sub2API' : 'CPA'} 配置并保存地址和管理密钥${target === 'sub2api' ? '、推送分组' : ''}`);
+    }
+    return { ...structuredClone(settings), baseUrl: normalizePushAddress(settings.baseUrl, target) };
+  }
+
+  function updatePushControls() {
+    const target = pushFeedbackTarget();
+    const login = state.format === 'protocol-login';
+    const slot = login ? elements.loginPushSlot : elements.converterPushSlot;
+    const feedbackSlot = state.format === 'model-evaluation' ? elements.evaluationPushFeedbackSlot
+      : login ? elements.loginPushFeedbackSlot : elements.converterPushFeedbackSlot;
+    if (elements.pushControls.parentElement !== slot) slot.append(elements.pushControls);
+    if (elements.pushFeedback.parentElement !== feedbackSlot) feedbackSlot.append(elements.pushFeedback);
+    elements.pushControls.classList.toggle('hidden', state.format === 'sub2api-tools');
+    elements.pushConverted.classList.toggle('hidden', login || target === 'none' || state.format === 'sub2api-tools');
+    const selection = convertedPushSelection();
+    elements.converterFreeFilter.classList.toggle('hidden', login || state.format === 'sub2api-tools');
+    elements.loginNonPersonalFilter.classList.toggle('hidden', !login);
+    elements.loginRequireNonPersonal.disabled = monitorBusy || protocolLogoutBusy || elements.startProtocolLogin.disabled;
+    elements.converterSkipFree.disabled = pushBusy || monitorBusy || converterFilterSaving;
+    elements.converterFreeCount.textContent = converterFilterSaving ? '保存中…' : selection.skippedFree ? `（${selection.skippedFree}）` : '';
+    elements.pushConverted.disabled = pushBusy || monitorBusy || converterFilterSaving || target === 'none' || !selection.accounts.length;
+    elements.pushConverted.title = selection.skippedFree ? `已跳过 ${selection.skippedFree} 个 free 账号，可推送 ${selection.accounts.length} 个账号` : '';
+    elements.retryPush.classList.toggle('hidden', !state.pushRetry?.accounts?.length);
+    elements.retryPush.disabled = pushBusy || monitorBusy || !state.pushRetry?.accounts?.length || state.pushRetry.target !== target;
+    const operation = activePushOperation();
+    const unresolved = operation?.items.some(item => item.account && !item.disabled && (item.status === 'unknown' || (item.status === 'failed' && !item.retryable)));
+    elements.reconcilePush?.classList.toggle('hidden', !unresolved);
+    if (elements.reconcilePush) elements.reconcilePush.disabled = pushBusy || monitorBusy || !unresolved || operation.target !== target;
+    if (elements.pushOperationHistory) elements.pushOperationHistory.disabled = pushBusy || monitorBusy;
+    for (const radio of elements.pushTarget.querySelectorAll('input')) radio.disabled = pushBusy || monitorBusy;
+    elements.pushHint.textContent = login
+      ? '选择目标并保存配置后，获取全部工作区 RT 时自动推送非 free 账号；手动下载包含所有类型。配置加密保存在当前浏览器。'
+      : `配置加密保存在当前浏览器。推送范围沿用下载范围，格式由推送目标决定。${elements.converterSkipFree.checked ? `测活、展示、转换和推送均跳过 free，当前跳过 ${selection.skippedFree} 个账号。` : '已允许测活、展示、转换和推送 free 账号。'}`;
+    modelEvaluation.refresh();
+  }
+
+  function renderPushResults() {
+    syncPushOperationViews();
+    elements.pushResultDetails.hidden = !state.pushResults.length && !state.pushOperations.length;
+    elements.pushFeedback.hidden = !state.pushResults.length && !state.pushOperations.length && !elements.pushStatus.textContent;
+    const labels = { success: '成功', failed: '失败', pending: '处理中', inflight: '处理中', unknown: '待核对' };
+    elements.pushResults.innerHTML = state.pushResults.map(row => `<li>${escapeHtml(row.name)} · ${labels[row.status] || '待核对'}${row.error ? `：${escapeHtml(row.error)}` : ''}</li>`).join('');
+    if (elements.pushOperationHistory) {
+      elements.pushOperationHistory.innerHTML = `${state.activePushOperationId ? '' : '<option value="">选择已有记录</option>'}`
+        + [...state.pushOperations].reverse().map(operation => `<option value="${escapeHtml(operation.operationId)}">${escapeHtml(new Date(operation.startedAt).toLocaleString())} · ${operation.target === 'cpa' ? 'CPA' : 'Sub2API'} · ${operation.items.length} 项</option>`).join('');
+      elements.pushOperationHistory.value = state.activePushOperationId;
+    }
+    updatePushControls();
+  }
+
+  async function remotePushRequest(path, body, signal) {
+    const isCurrent = workspaceTaskIsCurrent(signal);
+    const response = await pageFetch(`/api/push/${path}`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal,
+    });
+    requireCurrentWorkspace(isCurrent);
+    const payload = await response.json();
+    requireCurrentWorkspace(isCurrent);
+    if (!response.ok) throw Object.assign(new Error(payload.message || payload.detail || payload.error?.message || payload.error || `HTTP ${response.status}`), {
+      validation: ['INVALID_PUSH_PAYLOAD', 'MONITOR_LEASE_LOST'].includes(payload.code),
+    });
+    return payload;
+  }
+
+  function hidePushToast() {
+    clearTimeout(pushToastTimer);
+    elements.pushToast.hidden = true;
+    elements.pushToast.textContent = '';
+  }
+
+  function showPushSuccessToast(target, count) {
+    hidePushToast();
+    elements.pushToast.textContent = `${target === 'cpa' ? 'CPA' : 'Sub2API'} 推送成功，共 ${count} 个账号。`;
+    elements.pushToast.hidden = false;
+    pushToastTimer = setTimeout(hidePushToast, 4000);
+  }
+
+  function activePushOperation() {
+    return state.pushOperations.find(operation => operation.operationId === state.activePushOperationId);
+  }
+
+  function accountActionLines(key, lines) {
+    const retry = state.accountActionRetries[key];
+    if (!retry) return lines;
+    if (JSON.stringify(retry.inputEmails) !== JSON.stringify(loginInputIdentity(lines))) {
+      delete state.accountActionRetries[key];
+      updateLoginExportActions();
+      return lines;
+    }
+    const emails = new Set(retry.emails);
+    return lines.filter(line => emails.has(loginAccountEmail(line).toLowerCase()));
+  }
+
+  function saveAccountActionRetry(key, inputLines, lines, results) {
+    const byEmail = new Map(results.map(row => [String(row.email || '').toLowerCase(), row]));
+    const emails = loginInputIdentity(lines).filter(email => {
+      const row = byEmail.get(email);
+      // An interrupted request is retryable for logout, but a self-leave with
+      // an uncertain outcome requires manual verification before another DELETE.
+      return key === 'selfLeave'
+        ? row && !row.ok && !row.unconfirmed && !row.terminalReason
+        : !row?.ok && !row?.terminalReason;
+    });
+    if (emails.length) state.accountActionRetries[key] = { inputEmails: loginInputIdentity(inputLines), emails };
+    else delete state.accountActionRetries[key];
+    updateLoginExportActions();
+  }
+
+  function syncPushOperationViews() {
+    const operation = activePushOperation();
+    if (!operation) return;
+    state.pushResults = operation.items.map(({ account, ...item }, index) => ({ ...item, index }));
+    const failed = operation.items.filter(item => item.account && !item.disabled && item.status === 'failed' && item.retryable === true);
+    state.pushRetry = failed.length ? {
+      operationId: operation.operationId, target: operation.target, baseUrl: operation.baseUrl,
+      groupIds: operation.groupIds, proxyId: operation.proxyId, upsert: operation.upsert,
+      accounts: failed.map(item => item.account), itemIds: failed.map(item => item.itemId),
+    } : null;
+  }
+
+  function pushAccountIdentity(account) {
+    const credentials = account?.credentials || account || {};
+    return `${credentials.email || account?.name || ''}:${credentials.chatgpt_account_id || credentials.account_id || account?.account_id || ''}`.toLowerCase();
+  }
+
+  function requirePushOperationSettings(operation, settings, target) {
+    if (operation.target !== target || operation.baseUrl !== settings.baseUrl
+      || JSON.stringify(operation.groupIds) !== JSON.stringify(settings.groupIds)
+      || String(operation.proxyId || '') !== String(settings.proxyId || '')) {
+      throw new Error('目标地址、分组或代理已变更，请恢复该记录的目标配置后再核对或重试');
+    }
+  }
+
+  function applyPushOperationResults(operation, items, payload) {
+    validatePushResults(payload, { operationId: operation.operationId, itemIds: items.map(item => item.itemId) });
+    for (const row of payload.results) {
+      const item = items[row.index];
+      item.status = row.status;
+      // Legacy failed responses lack a proof that retry is safe: reconcile first.
+      item.retryable = row.status === 'failed' && row.retryable === true;
+      item.error = row.error || '';
+    }
+    operation.updatedAt = Date.now();
+    state.pushOperations = workspaceSchema.compactPushOperations(state.pushOperations);
+  }
+
+  async function reconcilePushOperation() {
+    if (pushBusy || monitorBusy) return;
+    const operation = activePushOperation();
+    if (!operation) return;
+    const isCurrent = workspaceTaskIsCurrent();
+    try {
+      const target = pushFeedbackTarget();
+      const settings = pushSettings(target);
+      requirePushOperationSettings(operation, settings, target);
+      const items = operation.items.filter(item => item.account && !item.disabled && (item.status === 'unknown' || (item.status === 'failed' && !item.retryable)));
+      if (!items.length) return;
+      pushBusy = true;
+      updatePushControls();
+      setStatus(elements.pushStatus, `正在核对 ${items.length} 个账号的远端结果…`);
+      const payload = await remotePushRequest(`${target}/reconcile`, {
+        operationId: operation.operationId, schemaVersion: OPERATION_SCHEMA_VERSION,
+        itemIds: items.map(item => item.itemId), accounts: items.map(item => item.account), settings, upsert: operation.upsert === true,
+      });
+      requireCurrentWorkspace(isCurrent);
+      applyPushOperationResults(operation, items, payload);
+      await persistBrowserWorkspace(true, true);
+      renderPushResults();
+      const unknown = items.filter(item => item.status === 'unknown').length;
+      setStatus(elements.pushStatus, `核对完成：已确认 ${items.filter(item => item.status === 'success').length}，可重试 ${items.filter(item => item.retryable).length}，待核对 ${unknown}。${unknown ? '未确认的账号不会重复推送。' : ''}`);
+    } catch (error) {
+      if (isCurrent()) setStatus(elements.pushStatus, `核对未完成：${error.message}；保留当前结果，请稍后核对。`, 'error');
+    } finally {
+      if (isCurrent()) { pushBusy = false; updatePushControls(); }
+    }
+  }
+
+  async function runPush(buildAccounts, { retry = false, emptyMessage = '', upsert = false, signal, target = selectedPushTarget() } = {}) {
+    if (pushBusy || (monitorBusy && !signal)) return;
+    hidePushToast();
+    const isCurrent = workspaceTaskIsCurrent(signal);
+    const ownsWorkspace = workspaceTaskIsCurrent();
+    let accounts;
+    let operation;
+    let items = [];
+    let submitted = false;
+    try {
+      const settings = pushSettings(target);
+      pushBusy = true;
+      updatePushControls();
+      if (retry) {
+        operation = activePushOperation();
+        if (!operation) throw new Error('没有可重试的推送记录');
+        requirePushOperationSettings(operation, settings, target);
+        items = operation.items.filter(item => item.account && !item.disabled && item.status === 'failed' && item.retryable === true);
+        accounts = items.map(item => item.account);
+      } else accounts = await buildAccounts(target);
+      requireCurrentWorkspace(isCurrent);
+      if (!accounts.length) {
+        if (!emptyMessage) throw new Error('当前范围没有可推送的账号');
+        state.pushRetry = null;
+        state.pushResults = [];
+        state.activePushOperationId = '';
+        renderPushResults();
+        setStatus(elements.pushStatus, emptyMessage);
+        persistBrowserWorkspace(true);
+        return { ok: true, imported: 0 };
+      }
+      if (!retry) {
+        const identities = new Set(accounts.map(pushAccountIdentity));
+        const uncertain = state.pushOperations.find(previous => previous.target === target && previous.baseUrl === settings.baseUrl
+          && previous.items.some(item => item.account && !item.disabled && (['pending', 'inflight', 'unknown'].includes(item.status) || (item.status === 'failed' && !item.retryable))
+            && identities.has(pushAccountIdentity(item.account))));
+        if (uncertain) {
+          state.activePushOperationId = uncertain.operationId;
+          renderPushResults();
+          throw new Error('这些账号有尚未确认的推送，请先核对远端结果');
+        }
+        operation = {
+          operationId: crypto.randomUUID(), target, baseUrl: settings.baseUrl,
+          groupIds: settings.groupIds, proxyId: settings.proxyId || '', upsert,
+          startedAt: Date.now(), updatedAt: Date.now(),
+          items: accounts.map((account, index) => ({ itemId: String(index), account: structuredClone(account),
+            name: account.name || account.email || account.credentials?.email || `账号 ${index + 1}`, status: 'pending', retryable: false, attempts: 0 })),
+        };
+        items = operation.items;
+        state.pushOperations.push(operation);
+      }
+      state.activePushOperationId = operation.operationId;
+      for (const item of items) { item.status = 'pending'; item.retryable = false; item.error = ''; item.attempts += 1; }
+      renderPushResults();
+      await persistBrowserWorkspace(true, true);
+      requireCurrentWorkspace(isCurrent);
+      setStatus(elements.pushStatus, `正在推送 ${accounts.length} 个账号到 ${target === 'cpa' ? 'CPA' : 'Sub2API'}…`);
+      submitted = true;
+      const result = await remotePushRequest(target, { settings, accounts, upsert,
+        operationId: operation.operationId, schemaVersion: OPERATION_SCHEMA_VERSION, itemIds: items.map(item => item.itemId),
+        ...(signal ? { monitorOwner: state.monitorOwner } : {}) }, signal);
+      requireCurrentWorkspace(isCurrent);
+      applyPushOperationResults(operation, items, result);
+      await persistBrowserWorkspace(true, true);
+      const failed = items.filter(item => item.status === 'failed' && item.retryable);
+      renderPushResults();
+      setStatus(elements.pushStatus, `推送完成：成功 ${result.imported || 0}，失败 ${result.failed || 0}，待核对 ${result.unknown || 0}。${failed.length ? '可重试失败项。' : ''}`, result.ok ? 'ok' : 'error');
+      if (result.ok && result.imported > 0) showPushSuccessToast(target, result.imported);
+      return result;
+    } catch (error) {
+      if (!ownsWorkspace()) return;
+      for (const item of items) if (item.status === 'pending') {
+        item.status = !submitted || error.validation ? 'failed' : 'unknown';
+        item.retryable = !submitted || error.validation === true;
+        item.error = item.status === 'unknown' ? '结果未确认，请先核对远端' : error.message;
+      }
+      if (operation) {
+        operation.updatedAt = Date.now();
+        renderPushResults();
+        try { await persistBrowserWorkspace(true, true); } catch { /* Storage status already explains the failure. */ }
+      }
+      setStatus(elements.pushStatus, `${error.message}${accounts?.length && !error.validation ? '；若请求已发出，请在目标服务核对结果。' : ''}`, 'error');
+      return { ok: false };
+    } finally {
+      if (ownsWorkspace()) { pushBusy = false; updatePushControls(); }
+    }
+  }
+
+  async function autoPushLoginResults({ ids: selectedIds, upsert = false, signal } = {}) {
+    return runPush(async target => {
+      const ids = selectedIds || [...new Set([...state.loginPersonalIds, ...state.loginBusinessIds])];
+      if (!ids.length) return [];
+      const payload = await loginIcloudRequest('/api/v2/accounts/export-sub2api', { ids, rtKind: 'all', validateSession: false }, signal);
+      // Classify each exported workspace by its own plan, not the parent login.
+      const accounts = buildLoginSub2apiPayload(payload).accounts.filter(account => {
+        const plan = String(account.credentials?.plan_type || '').trim().toLowerCase();
+        return plan && plan !== 'free';
+      });
+      return target === 'sub2api' ? accounts : accounts.map(account => convertSession(account).cpa);
+    }, { emptyMessage: '没有可推送的非 free 账号，已跳过自动推送。', upsert, signal });
+  }
+
+  const monitorStopLabels = { account_unavailable: '账号已删除、停用或不存在', password_invalid: '密码错误', totp_invalid: '2FA 凭据错误', self_leave_pending: '自踢结果待确认', sessions_logged_out: '已主动退出全部会话，手动登录后恢复' };
+
+  async function monitorLeaseRequest(accounts, owner, action = 'claim', signal) {
+    const response = await fetch('/api/v2/accounts/monitor-lease', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, signal,
+      body: JSON.stringify({ ids: accounts.map(account => String(account.id)), monitorOwner: owner, action,
+        browserState: { accounts: accounts.map(account => ({ id: account.id, email: account.email,
+          ...(action === 'release' ? {} : {
+            password: account.openai_password || account.password || '',
+            two_factor_secret: account.two_factor_secret || account.twoFactorSecret || '',
+          }),
+        })), settings: {} } }),
+    });
+    const payload = await response.json();
+    signal?.throwIfAborted();
+    if (!response.ok || payload.ok === false) throw new Error('测活租约请求失败');
+    return payload;
+  }
+
+  function stopSessionMonitor(release = false) {
+    clearTimeout(monitorTimer);
+    monitorController?.abort();
+    if (release && state.monitorOwner && state.browserAccounts.length) {
+      void monitorLeaseRequest(state.browserAccounts, state.monitorOwner, 'release').catch(() => {});
+    }
+  }
+
+  function markMonitorStopped(id, reason) {
+    if (!monitorStopLabels[reason]) return;
+    state.monitorStopped[id] = reason;
+    delete state.monitorRetries[id];
+  }
+
+  function monitorEligibility() {
+    if (!state.monitorEnabled) return { reason: '请在推送目标左侧开启定时测活' };
+    if (!browserStorageReady || browserStorageCleared || monitorPaused) return { reason: '等待浏览器存储就绪' };
+    if (!navigator.locks) return { reason: '此浏览器不支持多标签页任务协调，请使用新版浏览器及 HTTPS' };
+    const target = selectedPushTarget();
+    try { pushSettings(target); } catch { return { reason: '请选择并保存 Sub2API 或 CPA 推送配置' }; }
+    const accounts = state.browserAccounts.filter(account => account.id && !account.totp_reset_pending && !state.monitorStopped[account.id] && account.email?.includes('@')
+      && (account.openai_password || account.password) && (account.two_factor_secret || account.twoFactorSecret)
+      && (account.session_access_token || account.openai_access_token || state.monitorRetries[account.id]));
+    return accounts.length ? { accounts } : { reason: state.browserAccounts.some(account => state.monitorStopped[account.id])
+      ? '没有可检查的账号，异常账号已跳过，请修正凭据后手动登录'
+      : '请先完成协议登录，并保留邮箱、密码和 TOTP' };
+  }
+
+  function syncMonitorChoice() {
+    state.monitorEnabled = state.monitorEnabled === true;
+    for (const input of document.querySelectorAll('input[name="session-monitor"]')) {
+      input.checked = input.value === (state.monitorEnabled ? 'on' : 'off');
+    }
+  }
+
+  function requireMonitorPushConfig() {
+    if (!state.monitorEnabled) return;
+    try { pushSettings(selectedPushTarget()); }
+    catch (error) {
+      state.monitorEnabled = false;
+      stopSessionMonitor(true);
+      syncMonitorChoice();
+      setStatus(elements.loginStatus, `测活未开启：${error.message}。配置完成后请手动开启测活。`, 'error');
+      persistBrowserWorkspace();
+    }
+  }
+
+  function renderSessionMonitor(message) {
+    const node = document.querySelector('#session-monitor-status');
+    if (node) node.textContent = message;
+  }
+
+  function scheduleSessionMonitor() {
+    clearTimeout(monitorTimer);
+    requireMonitorPushConfig();
+    const skipped = state.browserAccounts.filter(account => state.monitorStopped[account.id]);
+    const skippedPanel = document.querySelector('#monitor-skipped');
+    if (skippedPanel) {
+      skippedPanel.hidden = !skipped.length;
+      document.querySelector('#monitor-skipped-list').innerHTML = skipped.map(account => `<li>${escapeHtml(account.email)} · ${escapeHtml(monitorStopLabels[state.monitorStopped[account.id]] || '需人工处理')}；修正后手动登录成功可恢复。</li>`).join('');
+    }
+    if (monitorBusy || monitorPaused || selfLeaveBusy || protocolLogoutBusy) return;
+    const eligibility = monitorEligibility();
+    if (eligibility.reason) {
+      renderSessionMonitor(state.monitorEnabled ? `定时测活等待中：${eligibility.reason}。` : '定时测活已关闭。');
+      return;
+    }
+    const due = Math.max(monitorNextAt, Number(state.monitorLastCheckAt || 0) + 60_000);
+    renderSessionMonitor(`定时测活已开启 · ${eligibility.accounts.length} 个账号 · 每分钟一次${skipped.length ? ` · 已跳过 ${skipped.length}` : ''}${monitorLastSummary ? ` · ${monitorLastSummary}` : ''}`);
+    monitorTimer = setTimeout(() => { void runSessionMonitor(); }, Math.max(0, due - Date.now()));
+  }
+
+  async function runSessionMonitor() {
+    if (monitorBusy || selfLeaveBusy || monitorEligibility().reason) { scheduleSessionMonitor(); return; }
+    // A manual login, logout, push or open configuration dialog takes priority.
+    if (navigator.onLine === false || elements.startProtocolLogin.disabled || elements.resetLoginTotp.disabled
+      || state.logoutInProgress || pushBusy || document.querySelector('dialog[open]')) {
+      monitorLastSummary = navigator.onLine === false ? '离线，稍后重试' : '等待当前操作完成';
+      monitorNextAt = Date.now() + 60_000;
+      scheduleSessionMonitor();
+      return;
+    }
+    try {
+      await navigator.locks.request('session-converter-monitor', { ifAvailable: true }, async lock => {
+        if (!lock || monitorEligibility().reason) return;
+        // Re-read the timestamp after acquiring the lock; stale tabs also fail the encrypted store's CAS check.
+        if (Date.now() - Number(state.monitorLastCheckAt || 0) < 60_000) return;
+        monitorBusy = true;
+        const controller = new AbortController();
+        monitorController = controller;
+        const isCurrent = workspaceTaskIsCurrent(controller.signal);
+        const ownsWorkspace = workspaceTaskIsCurrent();
+        const disabled = [...document.querySelectorAll('#login-workbench input:not([name="session-monitor"]), #login-workbench textarea, #login-workbench button, .push-config input, .push-config textarea, .push-config button, #logout-all-sessions, #push-controls input:not([name="session-monitor"]), #push-controls button')]
+          .map(node => ({ node, disabled: node.disabled }));
+        disabled.forEach(({ node }) => { node.disabled = true; });
+        let heartbeat;
+        try {
+          let accounts = monitorEligibility().accounts;
+          state.monitorOwner ||= crypto.randomUUID();
+          const owner = state.monitorOwner;
+          state.monitorLastCheckAt = Date.now();
+          await persistBrowserWorkspace(true, true);
+          requireCurrentWorkspace(isCurrent);
+          const leases = await monitorLeaseRequest(accounts, owner, 'claim', controller.signal);
+          requireCurrentWorkspace(isCurrent);
+          for (const row of leases.results) if (row.terminalReason) markMonitorStopped(row.id, row.terminalReason);
+          const owned = new Set(leases.results.filter(row => row.owned).map(row => String(row.id)));
+          accounts = accounts.filter(account => owned.has(String(account.id)));
+          const standby = leases.results.filter(row => !row.owned && !row.terminalReason).length;
+          if (!accounts.length) {
+            monitorLastSummary = standby ? `${standby} 个账号由其他浏览器负责，等待接管` : '异常账号已停止重试';
+            await persistBrowserWorkspace(true, true);
+            return;
+          }
+          let renewing = false;
+          heartbeat = setInterval(async () => {
+            if (renewing || !isCurrent()) return;
+            renewing = true;
+            try {
+              const renewed = await monitorLeaseRequest(accounts, owner, 'claim', controller.signal);
+              if (renewed.results.some(row => !row.owned && !row.terminalReason)) controller.abort();
+            } catch { controller.abort(); }
+            finally { renewing = false; }
+          }, 30_000);
+          const ids = accounts.map(account => String(account.id));
+          const network = { ...selectedLoginProxyNetwork(), monitorOwner: owner };
+          renderSessionMonitor(`定时测活中 · ${ids.length} 个账号`);
+          const probeIds = accounts.filter(account => account.session_access_token || account.openai_access_token).map(account => String(account.id));
+          const probe = probeIds.length ? await loginIcloudRequest('/api/v2/accounts/session-probe', { ids: probeIds, ...network }, controller.signal) : { results: [] };
+          requireCurrentWorkspace(isCurrent);
+          const health = new Map(probe.results.map(row => [String(row.id), row]));
+          const invalid = accounts.filter(account => {
+            const result = health.get(String(account.id));
+            if (result?.health === 'deactivated') markMonitorStopped(account.id, 'account_unavailable');
+            if (result?.terminalReason) markMonitorStopped(account.id, result.terminalReason);
+            const retry = state.monitorRetries[account.id];
+            return !state.monitorStopped[account.id] && (result?.health === 'session_invalid' || (retry && (!result || result.health === 'alive'))) && (!retry || retry.after <= Date.now());
+          });
+          let refreshed = 0;
+          let pushed = true;
+          if (invalid.length) {
+            renderSessionMonitor(`定时测活 · ${invalid.length} 个账号失效，正在获取全部工作区 RT`);
+            for (const account of invalid) {
+              // All-workspace OAuth does not renew a Web Session. Discard only a
+              // confirmed invalid Session so it cannot trigger relogin every minute.
+              if (health.get(String(account.id))?.sessionInvalid) {
+                const cached = state.browserAccounts.find(item => String(item.id) === String(account.id));
+                if (cached) { cached.session_access_token = ''; cached.session_json = ''; }
+                state.loginSessionIds = state.loginSessionIds.filter(id => String(id) !== String(account.id));
+              }
+              const attempts = (state.monitorRetries[account.id]?.attempts || 0) + 1;
+              state.monitorRetries[account.id] = { attempts, after: Date.now() + Math.min(30, 5 * 2 ** Math.min(attempts - 1, 3)) * 60_000 };
+            }
+            await persistBrowserWorkspace(true, true);
+            requireCurrentWorkspace(isCurrent);
+            const onEvent = (name, data) => {
+              const record = ensureLoginProgressRecord(data, accounts.findIndex(account => String(account.id) === String(data?.id)));
+              if (data.terminalReason) markMonitorStopped(data.id, data.terminalReason);
+              if (record && name === 'account_done') record.validationFailure = validationFailureFields(data).validationFailure;
+              if (record && data.terminalReason) record.terminalReason = data.terminalReason;
+              if (record && data.error) record.error = sanitizeLoginLog(data.error);
+              if (name === 'account_start') appendLoginProgress(record, '定时测活发现失效，开始协议重登', { stage: 0, status: 'running' });
+              if (name === 'account_done') appendLoginProgress(record, data.ok ? '定时重登完成'
+                : data.terminalReason ? `${monitorStopLabels[data.terminalReason]}，已停止自动重试`
+                : data.monitorBusy ? '账号由其他浏览器负责，本轮跳过' : '定时重登失败，稍后重试', { stage: data.ok ? 6 : 0, status: data.ok ? 'success' : 'error' });
+            };
+            const reloginIds = invalid.map(account => String(account.id));
+            const pipeline = await loginIcloudStream('/api/v2/accounts/protocol-login-pipeline', { ids: reloginIds, workspaceMode: 'all', requireNonPersonal: elements.loginRequireNonPersonal.checked, ...network }, onEvent, controller.signal);
+            requireCurrentWorkspace(isCurrent);
+            const pipelineResults = Array.isArray(pipeline.results) ? pipeline.results : [];
+            state.loginLastResponse = pipeline;
+            const accountById = new Map([...state.loginLastAccounts, ...(pipeline.accounts || [])].map(account => [String(account.id), account]));
+            state.loginLastAccounts = [...accountById.values()];
+            state.loginLastRtKind = 'all';
+            for (const row of pipelineResults) {
+              if (row.terminalReason) markMonitorStopped(row.id, row.terminalReason);
+              if (row.monitorBusy) delete state.monitorRetries[row.id];
+            }
+            const successful = pipelineResults.filter(row => row.ok).map(row => String(row.id));
+            const rtReady = pipelineRtIds(pipelineResults);
+            refreshed = successful.length;
+            for (const id of successful) delete state.monitorRetries[id];
+            state.loginLastIds = [...new Set([...state.loginLastIds, ...successful])];
+            state.loginPersonalIds = [...new Set([...state.loginPersonalIds, ...pipelineResults.filter(row => row.personalOk).map(row => String(row.id))])];
+            state.loginBusinessIds = [...new Set([...state.loginBusinessIds, ...pipelineResults.filter(row => Number(row.businessSuccess) > 0).map(row => String(row.id))])];
+            state.loginSessionIds = state.browserAccounts.filter(account => account.session_access_token).map(account => String(account.id));
+            await persistBrowserWorkspace(true, true);
+            requireCurrentWorkspace(isCurrent);
+            if (rtReady.length) pushed = Boolean((await autoPushLoginResults({ ids: rtReady, upsert: true, signal: controller.signal }))?.ok);
+          }
+          requireCurrentWorkspace(isCurrent);
+          const unknown = probe.results.filter(row => row.health === 'probe_failed').length;
+          const deactivated = probe.results.filter(row => row.health === 'deactivated').length;
+          const retryCount = invalid.filter(account => state.monitorRetries[account.id]).length;
+          monitorLastSummary = `${new Date().toLocaleTimeString()} 已检查 ${probeIds.length}，重登成功 ${refreshed}${retryCount ? `，重登失败 ${retryCount}（5–30 分钟后重试）` : ''}${unknown ? `，网络/验证异常 ${unknown}` : ''}${deactivated ? `，账号停用 ${deactivated}` : ''}${standby ? `，其他浏览器负责 ${standby}` : ''}${pushed ? '' : '，推送未完成，请查看推送结果'}`;
+          await persistBrowserWorkspace(true, true);
+        } catch (error) {
+          if (isCurrent()) monitorLastSummary = '本轮未完成，稍后重试；请检查网络或推送结果';
+        } finally {
+          clearInterval(heartbeat);
+          monitorBusy = false;
+          if (monitorController === controller) monitorController = null;
+          if (ownsWorkspace()) {
+            disabled.forEach(({ node, disabled: wasDisabled }) => { node.disabled = wasDisabled; });
+            updateLoginExportActions();
+            elements.exportLoginSessions.disabled = state.loginSessionIds.length === 0;
+            updatePushControls();
+          }
+        }
+      });
+    } catch {
+      monitorLastSummary = '无法协调浏览器任务，稍后重试';
+    } finally {
+      monitorNextAt = Math.max(Date.now() + 1000, Number(state.monitorLastCheckAt || Date.now()) + 60_000);
+      scheduleSessionMonitor();
+    }
+  }
+
+  function sub2apiAccountConfigFields(source) {
+    return source === 'login' ? {
+      accountConcurrency: elements.loginSub2Concurrency, priority: elements.loginSub2Priority,
+      loadFactor: elements.loginSub2LoadFactor, fingerprintMode: elements.loginSub2FingerprintMode, models: elements.loginSub2Models,
+    } : {
+      accountConcurrency: elements.sub2apiConcurrency, priority: elements.sub2apiPriority,
+      loadFactor: elements.sub2apiLoadFactor, fingerprintMode: elements.sub2apiFingerprintMode, models: elements.sub2apiModels,
+    };
+  }
+
+  function readSub2apiAccountConfig(source) {
+    const fields = sub2apiAccountConfigFields(source);
+    return {
+      accountConcurrency: Number(fields.accountConcurrency.value || 50),
+      priority: Number(fields.priority.value || 1), loadFactor: Number(fields.loadFactor.value || 1000),
+      fingerprintMode: fields.fingerprintMode.value || 'session',
+      models: fields.models.value.split(/[\s,;]+/).map(value => value.trim()).filter(Boolean),
+    };
+  }
+
+  function normalizeSub2apiAccountConfig(settings = {}) {
+    const integer = (value, fallback, max) => Number.isFinite(Number(value)) && value !== '' && value != null
+      ? Math.max(1, Math.min(max, Math.trunc(Number(value)))) : fallback;
+    const models = [...new Set((Array.isArray(settings.models) ? settings.models : String(settings.models || '').split(/[\s,;]+/))
+      .map(value => String(value).trim()).filter(Boolean))];
+    return {
+      accountConcurrency: integer(settings.accountConcurrency, 50, 100), priority: integer(settings.priority, 1, 100),
+      loadFactor: integer(settings.loadFactor, 1000, 10000),
+      fingerprintMode: ['off', 'device', 'session', 'full'].includes(settings.fingerprintMode) ? settings.fingerprintMode : 'session',
+      models: models.length ? models : ['gpt-5.5', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-6-astra'],
+    };
+  }
+
+  function setSub2apiAccountConfig(settings, editingField = null) {
+    const parameters = normalizeSub2apiAccountConfig(settings);
+    state.browserSettings.sub2apiSettings = { ...state.browserSettings.sub2apiSettings, ...parameters };
+    for (const source of ['output', 'login']) {
+      for (const [key, field] of Object.entries(sub2apiAccountConfigFields(source))) {
+        if (field === editingField) continue;
+        field.value = key === 'models' ? parameters.models.join(source === 'login' ? '\n' : ', ') : String(parameters[key]);
+      }
+    }
+  }
+
+  function restoreSub2apiAccountConfig() {
+    // Saved account settings take precedence over conflicting legacy DOM snapshots.
+    setSub2apiAccountConfig({ ...readSub2apiAccountConfig('output'), ...state.browserSettings.sub2apiSettings });
+  }
+
+  function loginSub2ConfigPayload() {
+    return {
+      baseUrl: elements.loginSub2BaseUrl.value.trim(),
+      adminApiKey: elements.loginSub2AdminKey.value.trim(),
+      groupIds: [...state.loginSub2SelectedGroupIds],
+      ...readSub2apiAccountConfig('login'),
+      useProxy: elements.loginSub2UseProxy.checked,
+      proxyId: elements.loginSub2UseProxy.checked ? String(elements.loginSub2Proxy.value || '') : '',
+    };
+  }
+
+  function renderLoginSub2Proxies(proxies = state.loginSub2AvailableProxies) {
+    state.loginSub2AvailableProxies = Array.isArray(proxies) ? proxies : [];
+    const selected = String(state.loginSub2ProxyId || '');
+    elements.loginSub2Proxy.innerHTML = '<option value="">请选择代理</option>' + state.loginSub2AvailableProxies.map(proxy => {
+      const id = String(proxy.id);
+      const label = String(proxy.name || proxy.label || `代理 ${id}`);
+      const detail = proxy.host ? ` · ${proxy.host}${proxy.port ? `:${proxy.port}` : ''}` : '';
+      return `<option value="${escapeHtml(id)}" ${id === selected ? 'selected' : ''}>${escapeHtml(label)}${escapeHtml(detail)}</option>`;
+    }).join('');
+    elements.loginSub2ProxyWrap.classList.toggle('hidden', !elements.loginSub2UseProxy.checked);
+  }
+
+  function renderLoginSub2Groups(groups = state.loginSub2AvailableGroups) {
+    state.loginSub2AvailableGroups = Array.isArray(groups) ? groups : [];
+    const selected = new Set(state.loginSub2SelectedGroupIds.map(Number));
+    const byId = new Map(state.loginSub2AvailableGroups.map(group => [Number(group.id), group]));
+    for (const id of selected) if (!byId.has(id)) byId.set(id, { id, name: `分组 ${id}` });
+    elements.loginSub2GroupCount.textContent = `已选 ${selected.size} 个`;
+    elements.loginSub2Groups.innerHTML = [...byId.values()].map(group => {
+      const id = Number(group.id);
+      return `<label class="push-group-option"><input type="checkbox" data-sub2-group-id="${id}" ${selected.has(id) ? 'checked' : ''} /><span>${escapeHtml(group.name || `分组 ${id}`)}<small>ID ${id}${group.account_count !== undefined ? ` · ${Number(group.account_count)} 个账号` : ''}</small></span></label>`;
+    }).join('') || '<p>填写地址和密钥后，读取可选分组。</p>';
+  }
+
+  function fillLoginSub2Config(settings = {}) {
+    elements.loginSub2BaseUrl.value = settings.baseUrl || "";
+    elements.loginSub2AdminKey.value = state.browserSettings.sub2apiSettings?.adminApiKey || "";
+    state.loginSub2KeyConfigured = Boolean(elements.loginSub2AdminKey.value) || settings.keyConfigured === true;
+    state.loginSub2SelectedGroupIds = (settings.groupIds || []).map(Number).filter(Number.isFinite);
+    setSub2apiAccountConfig(settings);
+    elements.loginSub2UseProxy.checked = settings.useProxy === true || settings.proxyEnabled === true;
+    state.loginSub2ProxyId = String(settings.proxyId ?? settings.proxy_id ?? '');
+    renderLoginSub2Proxies();
+    renderLoginSub2Groups();
+  }
+
+  async function loadLoginSub2Config() {
+    fillLoginSub2Config(state.browserSettings.sub2apiSettings || {});
+    state.loginSub2Loaded = true;
+    setStatus(elements.loginSub2Status, state.loginSub2KeyConfigured ? '已读取此浏览器的加密配置。' : '请填写地址、Admin Key 并读取分组。');
+  }
+
+  async function loadLoginSub2Groups({ silent = false } = {}) {
+    const isCurrent = workspaceTaskIsCurrent();
+    const baseUrl = elements.loginSub2BaseUrl.value.trim();
+    const adminApiKey = elements.loginSub2AdminKey.value.trim();
+    if (!baseUrl || (!adminApiKey && !state.loginSub2KeyConfigured)) {
+      if (!silent) throw new Error("请先填写 Sub2 地址和 Admin Key");
+      return;
+    }
+    elements.loadLoginSub2Groups.disabled = true;
+    try {
+      const data = await remotePushRequest("sub2api/groups", { settings: { baseUrl, adminApiKey } });
+      requireCurrentWorkspace(isCurrent);
+      renderLoginSub2Groups(data.groups || []);
+      setStatus(elements.loginSub2Status, `已读取 ${data.groups?.length || 0} 个分组。`, "ok");
+    } finally {
+      if (isCurrent()) elements.loadLoginSub2Groups.disabled = false;
+    }
+  }
+
+  async function loadLoginSub2Proxies({ silent = false } = {}) {
+    const isCurrent = workspaceTaskIsCurrent();
+    const baseUrl = elements.loginSub2BaseUrl.value.trim();
+    const adminApiKey = elements.loginSub2AdminKey.value.trim();
+    if (!baseUrl || (!adminApiKey && !state.loginSub2KeyConfigured)) {
+      if (!silent) throw new Error("请先填写 Sub2 地址和 Admin Key");
+      return;
+    }
+    try {
+      const data = await remotePushRequest("sub2api/proxies", { settings: { baseUrl, adminApiKey } });
+      requireCurrentWorkspace(isCurrent);
+      renderLoginSub2Proxies(data.proxies || []);
+    } catch (error) {
+      if (!silent) throw error;
+      renderLoginSub2Proxies([]);
+    }
+  }
+
+  async function saveLoginSub2Config() {
+    const isCurrent = workspaceTaskIsCurrent();
+    elements.saveLoginSub2Config.disabled = true;
+    try {
+      const settings = loginSub2ConfigPayload();
+      const hasConnection = Boolean(settings.baseUrl || settings.adminApiKey || settings.groupIds.length || settings.useProxy || settings.proxyId);
+      if (hasConnection) {
+        settings.baseUrl = normalizePushAddress(settings.baseUrl, 'sub2api');
+        if (!settings.adminApiKey || !settings.groupIds.length) throw new Error('请填写 Admin Key 并选择至少一个推送分组');
+        if (settings.useProxy && !settings.proxyId) throw new Error('请选择要使用的 Sub2API 代理');
+      }
+      for (const [name, value, max] of [['每账号并发', settings.accountConcurrency, 100], ['优先级', settings.priority, 100], ['负载因子', settings.loadFactor, 10000]]) {
+        if (!Number.isInteger(value) || value < 1 || value > max) throw new Error(`${name}必须是 1–${max} 的整数`);
+      }
+      state.browserSettings.sub2apiSettings = settings;
+      state.loginSub2ProxyId = settings.proxyId;
+      fillLoginSub2Config(settings);
+      updateOutput();
+      await persistBrowserWorkspace(true, true);
+      requireCurrentWorkspace(isCurrent);
+      state.loginSub2Loaded = true;
+      setStatus(elements.loginSub2Status, hasConnection ? `配置已加密保存在此浏览器 · ${settings.groupIds.length} 个推送分组。` : '账号参数已加密保存；配置地址、密钥和分组后可启用推送。', 'ok');
+
+    } finally {
+      if (isCurrent()) elements.saveLoginSub2Config.disabled = false;
+    }
+  }
+
+  function showLoginModal(message) {
+    if (!elements.loginModal) return;
+    const wasHidden = typeof elements.loginModal.classList?.contains === "function"
+      ? elements.loginModal.classList.contains("hidden")
+      : elements.loginModal.hidden === true;
+    if (wasHidden) {
+      const activeElement = document.activeElement;
+      loginModalReturnFocus = activeElement && typeof activeElement.focus === "function" ? activeElement : null;
+      loginModalPreviousOverflow = document.body.style.overflow;
+    }
+    elements.loginModalMessage.textContent = message || "登录服务返回了需要人工完成的验证步骤。";
+    elements.loginModal.classList.remove("hidden");
+    elements.loginModal.setAttribute("aria-hidden", "false");
+    document.body.style.overflow = "hidden";
+    if (typeof elements.closeLoginModal?.focus === "function") elements.closeLoginModal.focus();
+  }
+
+  function hideLoginModal() {
+    if (!elements.loginModal) return;
+    elements.loginModal.classList.add("hidden");
+    elements.loginModal.setAttribute("aria-hidden", "true");
+    document.body.style.overflow = loginModalPreviousOverflow;
+    const target = loginModalReturnFocus;
+    loginModalReturnFocus = null;
+    loginModalPreviousOverflow = "";
+    const attached = typeof document.contains !== "function" || document.contains(target);
+    if (target && attached) target.focus();
+  }
+
+  function buildLoginSub2apiPayload(payload) {
+    const source = payload?.data && typeof payload.data === "object" ? payload.data : payload;
+    const accounts = Array.isArray(source?.accounts) ? source.accounts : [];
+    if (!accounts.length) throw new Error("登录服务未返回可导出的账号");
+    return {
+      type: source.type || "sub2api-data",
+      version: source.version ?? 1,
+      exported_at: source.exported_at || new Date().toISOString(),
+      proxies: Array.isArray(source.proxies) ? source.proxies : [],
+      accounts: accounts.map(applySub2apiOutputConfig),
+    };
+  }
+
+  function readLoginProxyMode() {
+    const mode = elements.loginProxyMode?.querySelector('input[name="login-proxy-mode"]:checked')?.value;
+    return ["local", "pool"].includes(mode) ? mode : "direct";
+  }
+
+  function syncLoginProxyControls() {
+    if (!elements.loginProxyMode || !elements.loginProxyPool || !elements.loginProxyLocalPort) return;
+    const mode = readLoginProxyMode();
+    const local = mode === "local";
+    const pool = mode === "pool";
+    elements.loginProxyLocalWrap?.classList.toggle("hidden", !local);
+    elements.loginProxyLocalPort.disabled = !local;
+    elements.loginProxyCustomWrap?.classList.toggle("hidden", !pool);
+    elements.loginProxyPool.disabled = !pool;
+    if (elements.loginProxyStatus) {
+      elements.loginProxyStatus.textContent = local
+        ? `使用本地代理 127.0.0.1:${elements.loginProxyLocalPort.value || "7890"}，协议登录将按账号固定使用。`
+        : pool
+        ? (elements.loginProxyPool.value.trim() ? "已配置浏览器代理池，协议登录将按账号固定一个代理。" : "代理池为空，协议登录将直连。")
+        : "使用服务器默认出口：已配置代理时走代理，未配置时直连。";
+    }
+  }
+
+  function selectedLoginProxyNetwork() {
+    const mode = readLoginProxyMode();
+    const localProxyPort = Math.max(1, Math.min(65535, Math.trunc(Number(elements.loginProxyLocalPort?.value) || 7890)));
+    const proxyPool = mode === "pool" ? String(elements.loginProxyPool?.value || "").trim() : "";
+    state.loginProxyMode = mode;
+    state.loginProxyLocalPort = localProxyPort;
+    state.loginProxyPool = String(elements.loginProxyPool?.value || "").trim();
+    state.browserSettings.protocolSettings = {
+      ...(state.browserSettings.protocolSettings || {}),
+      proxyMode: mode,
+      localProxyPort,
+      proxyPool,
+    };
+    persistBrowserWorkspace();
+    syncLoginProxyControls();
+    return { proxyMode: mode, localProxyPort, proxyPool };
+  }
+
+  function restoreLoginProxySettings() {
+    const settings = state.browserSettings?.protocolSettings || {};
+    const savedMode = settings.proxyMode ?? state.loginProxyMode;
+    const mode = ["local", "pool"].includes(savedMode) ? savedMode : "direct";
+    const localProxyPort = Math.max(1, Math.min(65535, Math.trunc(Number(settings.localProxyPort ?? state.loginProxyLocalPort) || 7890)));
+    const pool = String(state.loginProxyPool || settings.proxyPool || "").trim();
+    state.loginProxyMode = mode;
+    state.loginProxyLocalPort = localProxyPort;
+    state.loginProxyPool = pool;
+    elements.loginProxyMode?.querySelectorAll('input[name="login-proxy-mode"]').forEach(input => {
+      input.checked = input.value === mode;
+    });
+    if (elements.loginProxyLocalPort) elements.loginProxyLocalPort.value = String(localProxyPort);
+    if (elements.loginProxyPool) elements.loginProxyPool.value = pool;
+    syncLoginProxyControls();
+  }
+
+  function showLoginResetCredentials(credentials) {
+    const lines = (credentials || []).map(item => String(item?.line || '').trim()).filter(Boolean);
+    if (!elements.loginResetOutput || !elements.loginResetCredentials) return;
+    elements.loginResetCredentials.textContent = lines.join("\n");
+    elements.loginResetOutput.classList.toggle("hidden", lines.length === 0);
+    state.loginSensitiveValues.push(...credentials.flatMap(item => [item?.password, item?.totp]).filter(Boolean));
+  }
+
+  function syncResetTotpInput(accountId) {
+    // Use the unredacted browser snapshot, never credentials in SSE log payloads.
+    const account = state.browserAccounts.find(row => String(row.id) === String(accountId));
+    if (!account?.two_factor_secret) return;
+    elements.loginAccounts.value = elements.loginAccounts.value.split(/\r?\n/).map(line => {
+      const parts = splitLoginAccount(line);
+      if (parts.length !== 3 || parts[0].toLowerCase() !== account.email.toLowerCase()) return line;
+      return [account.email, account.openai_password || account.password, account.two_factor_secret].join('----');
+    }).join('\n');
+    state.loginSensitiveValues.push(account.two_factor_secret);
+    return { password: account.openai_password || account.password, totp: account.two_factor_secret,
+      line: [account.email, account.openai_password || account.password, account.two_factor_secret].join('----') };
+  }
+
+  function renderTotpResetRecovery() {
+    const confirmed = state.browserAccounts.filter(account => !account.totp_reset_pending && account.status === '已换绑2FA');
+    if (confirmed.length) showLoginResetCredentials(confirmed.map(account => syncResetTotpInput(account.id)).filter(Boolean));
+    const pending = state.browserAccounts.filter(account => account.totp_reset_pending);
+    const panel = document.querySelector('#login-reset-pending');
+    if (!panel) return;
+    panel.classList.toggle('hidden', !pending.length);
+    const labels = {
+      preparing: '准备请求结果未收到，请在账号安全设置中核对；不要使用旧密钥重登',
+      prepared: '新密钥已生成，等待激活',
+      activating: '激活已提交，结果待确认',
+      activated: '新密钥已激活，状态待确认',
+    };
+    document.querySelector('#login-reset-pending-status').replaceChildren(...pending.map(account => {
+      const item = document.createElement('li');
+      item.textContent = `${account.email} · ${labels[account.totp_reset_pending.phase] || '状态待确认'}`;
+      return item;
+    }));
+    const credentials = pending.filter(account => account.totp_reset_pending.secret).map(account => {
+      const password = account.openai_password || account.password || '';
+      const secret = account.totp_reset_pending.secret;
+      state.loginSensitiveValues.push(password, secret);
+      if (account.totp_reset_pending.phase === 'activated') syncResetTotpInput(account.id);
+      return [account.email, password, secret].join('----');
+    });
+    document.querySelector('#login-reset-pending-credentials').textContent = credentials.join('\n');
+    document.querySelector('#copy-login-reset-pending').disabled = !credentials.length;
+    document.querySelector('#download-login-reset-pending').disabled = !credentials.length;
+    state.loginSensitiveValues = [...new Set(state.loginSensitiveValues.filter(Boolean))];
+  }
+
+  async function resetLoginTotp({ resume = false } = {}) {
+    if (monitorBusy || selfLeaveBusy || protocolLogoutBusy || elements.startProtocolLogin.disabled) return;
+    const isCurrent = workspaceTaskIsCurrent();
+    if (!resume && !window.confirm('重设 2FA 会先禁用旧验证器。新密钥加密保存到浏览器后才会激活；结果不明时保留新密钥并停止重试。请保留当前登录并备份新密钥。')) return;
+    const controls = [elements.resetLoginTotp, elements.protocolLogoutAll, elements.selfLeaveWorkspaces,
+      elements.importLoginFile, elements.startProtocolLogin, elements.loginAccounts, document.querySelector('#resume-login-totp')];
+    controls.forEach(node => { node.disabled = true; });
+    stopSessionMonitor(true);
+    const outcomes = new Map();
+    const completedCredentials = new Map();
+    try {
+      const configResponse = await pageFetch('/api/system/config', { cache: 'no-store' });
+      const config = configResponse.ok ? await configResponse.json() : null;
+      if (config?.totpResetProtocolVersion !== 2) throw new Error('服务端尚未支持安全换绑，请先重启服务并刷新页面');
+      requireCurrentWorkspace(isCurrent);
+      const pendingAccounts = state.browserAccounts.filter(account => account.totp_reset_pending);
+      const lines = resume ? pendingAccounts.map(account => [account.email, account.openai_password || account.password,
+        account.totp_reset_pending.secret || account.two_factor_secret].join('----')) : parseLoginAccounts(elements.loginAccounts.value);
+      if (!lines.length) throw new Error('没有需要恢复的 2FA 换绑');
+      initializeLoginProgress(lines, { preserveExports: true });
+      // Existing browser records are authoritative: stale input must not replace
+      // a candidate key or overwrite a key already acknowledged by the server.
+      const knownEmails = new Set(state.browserAccounts.map(account => account.email.toLowerCase()));
+      const newLines = lines.filter(line => !knownEmails.has(loginAccountEmail(line).toLowerCase()));
+      if (newLines.length) await loginIcloudRequest('/api/v2/accounts/import', { text: newLines.join('\n'), prepareRegistrationAssets: false });
+      requireCurrentWorkspace(isCurrent);
+      const emails = new Set(lines.map(line => loginAccountEmail(line).toLowerCase()));
+      const accounts = state.browserAccounts.filter(account => emails.has(account.email.toLowerCase()));
+      const concurrency = selectedTaskConcurrency();
+      const freshIds = accounts.filter(account => !account.totp_reset_pending).map(account => String(account.id));
+      const confirmIds = accounts.filter(account => account.totp_reset_pending && account.totp_reset_pending.phase !== 'prepared').map(account => String(account.id));
+      const runStep = async (action, ids) => {
+        if (!ids.length) return;
+        requireCurrentWorkspace(isCurrent);
+        const labels = { prepare: '生成并保存新密钥', activate: '激活已保存的新密钥', confirm: '核对新 2FA 状态' };
+        setStatus(elements.loginStatus, `正在${labels[action]}：${ids.length} 个账号…`);
+        const result = await loginIcloudStream("/api/v2/accounts/reset-totp", { ids, action, concurrency, ...selectedLoginProxyNetwork() }, (name, data) => {
+          const record = loginProgressRecord(data);
+          if (name === 'account_start') appendLoginProgress(record, labels[action], { stage: 1, status: 'running' });
+          if (name === 'account_log') appendLoginProgress(record, data.msg || data.error, { stage: 2, status: 'running', level: data.level });
+          if (name === 'account_done') {
+            outcomes.set(String(data.id), data);
+            if (data.phase === 'confirmed' && data.ok) {
+              const credential = syncResetTotpInput(data.id);
+              if (credential) completedCredentials.set(String(data.id), credential);
+              showLoginResetCredentials([...completedCredentials.values()]);
+            }
+            renderTotpResetRecovery();
+            appendLoginProgress(record, data.ok ? (data.phase === 'confirmed' ? '2FA 换绑成功' : '新密钥已保存，等待激活') : data.error || '2FA 状态待确认', {
+              stage: data.phase === 'confirmed' ? 4 : 3, status: data.ok ? (data.phase === 'confirmed' ? 'success' : 'running') : 'error',
+            });
+          }
+        });
+        for (const item of result.results || []) outcomes.set(String(item.id), item);
+        requireCurrentWorkspace(isCurrent);
+      };
+      if (freshIds.length) {
+        for (const account of accounts.filter(account => freshIds.includes(String(account.id)))) {
+          account.totp_reset_pending = { phase: 'preparing', createdAt: new Date().toISOString() };
+        }
+        try { await persistBrowserWorkspace(true, true); }
+        catch (error) {
+          for (const account of accounts.filter(account => freshIds.includes(String(account.id)))) account.totp_reset_pending = null;
+          throw error;
+        }
+        await runStep('prepare', freshIds);
+      }
+      await runStep('confirm', confirmIds);
+      const selectedIds = new Set(accounts.map(account => String(account.id)));
+      const prepared = state.browserAccounts.filter(account => selectedIds.has(String(account.id)) && account.totp_reset_pending?.phase === 'prepared');
+      if (prepared.length) {
+        // The candidate and the uncertain activation marker must both survive a
+        // reload even when the next HTTP request loses its entire response.
+        for (const account of prepared) account.totp_reset_pending.phase = 'activating';
+        try { await persistBrowserWorkspace(true, true); }
+        catch (error) {
+          for (const account of prepared) account.totp_reset_pending.phase = 'prepared';
+          throw error;
+        }
+        await runStep('activate', prepared.map(account => String(account.id)));
+      }
+      renderTotpResetRecovery();
+      await persistBrowserWorkspace(true, true);
+      const results = [...outcomes.values()];
+      const success = results.filter(item => item.ok && item.phase === 'confirmed').length;
+      const pending = state.browserAccounts.filter(account => selectedIds.has(String(account.id)) && account.totp_reset_pending).length;
+      const failed = results.filter(item => !item.ok && !state.browserAccounts.find(account => String(account.id) === String(item.id))?.totp_reset_pending).length;
+      setStatus(elements.loginStatus, `2FA 换绑完成：成功 ${success}，失败 ${failed}，待处理 ${pending}。${pending ? '请保留新密钥，使用“继续 / 核对换绑”处理。' : '请保存最新凭据。'}`, failed || pending ? 'error' : 'ok');
+    } catch (error) {
+      if (!isCurrent()) return;
+      renderTotpResetRecovery();
+      setStatus(elements.loginStatus, `${error.message || error}。已停止后续激活；如有新密钥，请立即复制或下载备份。`, 'error');
+    } finally {
+      if (isCurrent()) {
+        controls.forEach(node => { node.disabled = false; });
+        renderTotpResetRecovery();
+        scheduleSessionMonitor();
+      }
+    }
+  }
+
+  async function selfLeaveAccountWorkspaces() {
+    if (monitorBusy || selfLeaveBusy || protocolLogoutBusy || elements.startProtocolLogin.disabled || elements.resetLoginTotp.disabled) return;
+    const isCurrent = workspaceTaskIsCurrent();
+    let disabled = [];
+    let inputLines = [], lines = [];
+    const outcomes = new Map();
+    let submitted = false;
+    try {
+      inputLines = parseLoginAccounts(elements.loginAccounts.value);
+      lines = accountActionLines('selfLeave', inputLines);
+      if (!window.confirm(`确认对输入的 ${lines.length} 个账号执行自踢？\n\n将退出这些账号已加入的所有非 owner 团队工作区。退出后会失去对应工作区访问权限，需要重新邀请才能加入。个人空间保留。`)) return;
+      selfLeaveBusy = true;
+      stopSessionMonitor(true);
+      renderSessionMonitor('定时测活暂停：正在执行自踢。');
+      disabled = [...document.querySelectorAll('#login-workbench input, #login-workbench textarea, #login-workbench button, #push-controls input, #push-controls button')]
+        .map(node => ({ node, disabled: node.disabled }));
+      disabled.forEach(({ node }) => { node.disabled = true; });
+      initializeLoginProgress(lines, { preserveExports: true });
+      setStatus(elements.loginStatus, '正在导入自踢账号…');
+      const imported = await loginIcloudRequest('/api/v2/accounts/import', { text: lines.join('\n'), prepareRegistrationAssets: false });
+      requireCurrentWorkspace(isCurrent);
+      const ids = [];
+      for (const [index, row] of (imported.rows || []).entries()) {
+        const id = row.id || row.account?.id;
+        const record = loginProgressRecord({ id, email: row.email || row.account?.email || loginAccountEmail(lines[index]) });
+        if (!row.ok || !id) outcomes.set(record.email.toLowerCase(), { email: record.email, ok: false });
+        if (row.ok && id) { ids.push(String(id)); if (record) record.id = String(id); }
+        appendLoginProgress(record, row.ok ? '等待自踢队列调度' : row.error || '账号导入失败', { stage: 0, status: row.ok ? 'waiting' : 'error' });
+      }
+      if (!ids.length) throw new Error('没有可自踢的账号，请检查邮箱、密码和 TOTP 格式');
+      setStatus(elements.loginStatus, `正在自踢 ${ids.length} 个账号，并发 ${selectedTaskConcurrency()}…`);
+      submitted = true;
+      const result = await loginIcloudStream('/api/v2/accounts/self-leave', { ids, confirmed: true, ...selectedLoginProxyNetwork() }, (name, data) => {
+        const record = loginProgressRecord(data);
+        if (name === 'account_start') appendLoginProgress(record, '开始核实团队工作区', { stage: 0, status: 'running' });
+        if (name === 'account_log') appendLoginProgress(record, data.msg, { stage: 5, status: 'running', level: data.level });
+        if (name === 'account_done') {
+          outcomes.set(String(data.email || record?.email || '').toLowerCase(), { ...data, email: data.email || record?.email });
+          if (data.unconfirmed) markMonitorStopped(data.id, 'self_leave_pending');
+          if (data.terminalReason) markMonitorStopped(data.id, data.terminalReason);
+          appendLoginProgress(record, data.error || `已退出 ${data.left || 0} 个工作区，跳过 ${data.skipped || 0}，待确认 ${data.unconfirmed || 0}，失败 ${data.failed || 0}`,
+            { stage: 5, status: data.ok ? 'success' : 'error' });
+        }
+      });
+      requireCurrentWorkspace(isCurrent);
+      const leftIds = new Set();
+      for (const row of result.results || []) {
+        outcomes.set(String(row.email).toLowerCase(), row);
+        if (row.unconfirmed) markMonitorStopped(row.id, 'self_leave_pending');
+        if (row.terminalReason) markMonitorStopped(row.id, row.terminalReason);
+        for (const workspace of row.workspaces || []) if (workspace.status === 'left') leftIds.add(workspace.workspaceId);
+      }
+      state.loginBusinessIds = state.loginBusinessIds.filter(id => state.browserAccounts.some(account => String(account.id) === id
+        && (account.business_openai_rt || account.business_workspace_credentials?.some(row => row.refreshToken))));
+      state.loginSessionIds = state.loginSessionIds.filter(id => state.browserAccounts.some(account => String(account.id) === id && account.session_access_token));
+      if (state.pushRetry?.accounts) {
+        state.pushRetry.accounts = state.pushRetry.accounts.filter(account => !leftIds.has(account.account_id || account.credentials?.chatgpt_account_id || account.credentials?.account_id));
+        if (!state.pushRetry.accounts.length) state.pushRetry = null;
+      }
+      for (const operation of state.pushOperations) for (const item of operation.items) {
+        const account = item.account;
+        if (account && leftIds.has(account.account_id || account.credentials?.chatgpt_account_id || account.credentials?.account_id)) {
+          item.disabled = true;
+          item.retryable = false;
+        }
+      }
+      syncPushOperationViews();
+      const failed = Number(result.failed || 0) + Number(imported.failed || 0);
+      saveAccountActionRetry('selfLeave', inputLines, lines, [...outcomes.values()]);
+      setStatus(elements.loginStatus, `自踢完成：已确认退出 ${result.left || 0} 个工作区，${result.unconfirmed || 0} 个待确认，失败账号 ${failed}。${state.accountActionRetries.selfLeave ? '再次点击仅重试失败账号。' : ''}${result.unconfirmed ? '待确认账号已暂停测活，请在 ChatGPT 核对后手动登录。' : ''}`, failed || result.unconfirmed ? 'error' : 'ok');
+      await persistBrowserWorkspace(true, true);
+    } catch (error) {
+      if (isCurrent()) {
+        for (const record of state.loginProgress.values()) if (selfLeaveBusy && ['running', 'waiting'].includes(record.status)) {
+          appendLoginProgress(record, '自踢结果未确认，请核对工作区后再操作', { status: 'error' });
+          if (record.id) markMonitorStopped(record.id, 'self_leave_pending');
+        }
+        setStatus(elements.loginStatus, error.message || '自踢失败', 'error');
+        if (selfLeaveBusy) {
+          if (!submitted) for (const email of loginInputIdentity(lines)) outcomes.set(email, { email, ok: false });
+          saveAccountActionRetry('selfLeave', inputLines, lines, [...outcomes.values()]);
+        }
+        persistBrowserWorkspace(true);
+      }
+    } finally {
+      selfLeaveBusy = false;
+      if (isCurrent()) {
+        disabled.forEach(({ node, disabled: value }) => { node.disabled = value; });
+        updateLoginExportActions();
+        elements.exportLoginSessions.disabled = !state.loginSessionIds.length;
+        updatePushControls();
+        scheduleSessionMonitor();
+      }
+    }
+  }
+
+  async function protocolLogoutAllSessions() {
+    if (monitorBusy || selfLeaveBusy || protocolLogoutBusy || elements.startProtocolLogin.disabled || elements.resetLoginTotp.disabled) return;
+    const isCurrent = workspaceTaskIsCurrent();
+    let disabled = [];
+    let inputLines = [], lines = [];
+    const outcomes = new Map();
+    try {
+      inputLines = parseLoginAccounts(elements.loginAccounts.value);
+      lines = accountActionLines('logoutAll', inputLines);
+      if (!window.confirm(`确认对输入的 ${lines.length} 个账号退出全部 ChatGPT 会话？\n\n优先复用 Session 或 RT 调用 logout_all，均不可用时才使用密码和 TOTP 登录。退出成功后会清理本地认证缓存，并暂停这些账号的自动重登。`)) return;
+      protocolLogoutBusy = true;
+      stopSessionMonitor(true);
+      renderSessionMonitor('定时测活暂停：正在退出全部会话。');
+      disabled = [...document.querySelectorAll('#login-workbench input, #login-workbench textarea, #login-workbench button, #push-controls input, #push-controls button')]
+        .map(node => ({ node, disabled: node.disabled }));
+      disabled.forEach(({ node }) => { node.disabled = true; });
+      initializeLoginProgress(lines, { preserveExports: true });
+      setStatus(elements.loginStatus, '正在导入退出会话账号…');
+      const imported = await loginIcloudRequest('/api/v2/accounts/import', { text: lines.join('\n'), prepareRegistrationAssets: false });
+      requireCurrentWorkspace(isCurrent);
+      const ids = [];
+      for (const [index, row] of (imported.rows || []).entries()) {
+        const id = row.id || row.account?.id;
+        const record = loginProgressRecord({ id, email: row.email || row.account?.email || loginAccountEmail(lines[index]) });
+        if (row.ok && id) { ids.push(String(id)); if (record) record.id = String(id); }
+        if (!row.ok) outcomes.set(record.email.toLowerCase(), { email: record.email, ok: false });
+        appendLoginProgress(record, row.ok ? '等待退出会话队列调度' : row.error || '账号导入失败', { stage: 0, status: row.ok ? 'waiting' : 'error' });
+      }
+      if (!ids.length) throw new Error('没有可退出会话的账号，请检查邮箱、密码和 TOTP 格式');
+      setStatus(elements.loginStatus, `正在退出 ${ids.length} 个账号的全部会话，并发 ${selectedTaskConcurrency()}…`);
+      const result = await loginIcloudStream('/api/v2/accounts/protocol-logout-all', { ids, confirmed: true, ...selectedLoginProxyNetwork() }, (name, data) => {
+        const record = loginProgressRecord(data);
+        if (name === 'account_start') appendLoginProgress(record, '优先复用缓存会话，开始退出全部会话', { stage: 0, status: 'running' });
+        if (name === 'account_log') appendLoginProgress(record, data.msg, { stage: inferLoginStage(data.msg, record?.stage || 0, 'chatgpt'), status: 'running', level: data.level });
+        if (name === 'account_done') {
+          if (record) record.validationFailure = validationFailureFields(data).validationFailure;
+          outcomes.set(String(data.email || record?.email || '').toLowerCase(), { ...data, email: data.email || record?.email });
+          if (data.ok) {
+            markMonitorStopped(data.id, 'sessions_logged_out');
+            for (const key of ['loginSessionIds', 'loginPersonalIds', 'loginBusinessIds']) state[key] = state[key].filter(id => String(id) !== String(data.id));
+            // A queued push must never restore a token invalidated by logout.
+            state.pushRetry = null;
+            for (const operation of state.pushOperations) for (const item of operation.items) {
+              if (item.account && String(item.account.email || item.account.credentials?.email || item.account.name).toLowerCase() === String(record?.email || '').toLowerCase()) {
+                item.disabled = true;
+                item.retryable = false;
+              }
+            }
+            syncPushOperationViews();
+            persistBrowserWorkspace(true);
+          }
+          if (data.terminalReason) markMonitorStopped(data.id, data.terminalReason);
+          appendLoginProgress(record, validationFailureHint(data) || data.error || (data.ok ? '全部会话已退出' : '退出全部会话失败'),
+            { stage: data.ok ? 6 : record?.stage || 0, status: data.ok ? 'success' : 'error' });
+        }
+      });
+      requireCurrentWorkspace(isCurrent);
+      for (const row of result.results || []) outcomes.set(String(row.email).toLowerCase(), row);
+      saveAccountActionRetry('logoutAll', inputLines, lines, [...outcomes.values()]);
+      const failed = Number(result.failed || 0) + Number(imported.failed || 0);
+      setStatus(elements.loginStatus, `退出全部会话完成：成功 ${result.success || 0}，失败 ${failed}。${state.accountActionRetries.logoutAll ? '再次点击仅重试失败账号。' : ''}`, failed ? 'error' : 'ok');
+      await persistBrowserWorkspace(true, true);
+    } catch (error) {
+      if (isCurrent()) {
+        for (const record of state.loginProgress.values()) if (protocolLogoutBusy && ['running', 'waiting'].includes(record.status)) {
+          appendLoginProgress(record, '退出结果未确认，请核对账号会话状态', { status: 'error' });
+        }
+        setStatus(elements.loginStatus, error.message || '退出全部会话失败', 'error');
+        if (protocolLogoutBusy) saveAccountActionRetry('logoutAll', inputLines, lines, [...outcomes.values()]);
+        persistBrowserWorkspace(true);
+      }
+    } finally {
+      protocolLogoutBusy = false;
+      if (isCurrent()) {
+        disabled.forEach(({ node, disabled: value }) => { node.disabled = value; });
+        updateLoginExportActions();
+        elements.exportLoginSessions.disabled = !state.loginSessionIds.length;
+        updatePushControls();
+        scheduleSessionMonitor();
+      }
+    }
+  }
+
+  async function startProtocolLogin() {
+    if (monitorBusy || selfLeaveBusy || protocolLogoutBusy || elements.resetLoginTotp.disabled) return;
+    const isCurrent = workspaceTaskIsCurrent();
+    elements.startProtocolLogin.disabled = true;
+    elements.loginRequireNonPersonal.disabled = true;
+    elements.resetLoginTotp.disabled = true;
+    elements.protocolLogoutAll.disabled = true;
+    elements.selfLeaveWorkspaces.disabled = true;
+    elements.importLoginFile.disabled = true;
+    elements.exportLoginSessions.disabled = true;
+    elements.exportLoginPersonal.disabled = true;
+    elements.exportLoginBusiness.disabled = true;
+    let retryInputLines = [];
+    let retryWorkspaceMode = "all";
+    try {
+      const inputLines = parseLoginAccounts(elements.loginAccounts.value);
+      const concurrency = selectedTaskConcurrency();
+      const workspaceMode = getLoginWorkspaceMode();
+      retryInputLines = inputLines;
+      retryWorkspaceMode = workspaceMode;
+      const retry = pendingLoginRetry(inputLines, workspaceMode);
+      const lines = retry
+        ? retry.accounts.map(item => inputLines.find(line => loginAccountEmail(line).toLowerCase() === String(item.email || '').toLowerCase()) || item.email)
+        : inputLines;
+      const previousLoginAccounts = retry ? [...state.loginLastAccounts] : [];
+      const previousLastIds = retry ? [...state.loginLastIds] : [];
+      const previousSessionIds = retry ? [...state.loginSessionIds] : [];
+      const previousPersonalIds = retry ? [...state.loginPersonalIds] : [];
+      const previousBusinessIds = retry ? [...state.loginBusinessIds] : [];
+
+      initializeLoginProgress(lines, { preserveExports: Boolean(retry), workspaceMode });
+      let imported = { rows: [], failed: 0 };
+      let importedRows = [];
+      let ids = retry ? retry.ids.map(String) : [];
+      if (retry) {
+        setStatus(elements.loginStatus, `正在重试 ${ids.length} 个失败账号，并发 ${concurrency}...`);
+        for (const item of retry.accounts) {
+          const record = loginProgressRecord(item);
+          if (record) record.id = String(item.id);
+          appendLoginProgress(record, "失败账号已加入重试队列", { stage: 0, status: "waiting" });
+        }
+      } else {
+        setStatus(elements.loginStatus, `正在导入 ${lines.length} 个账号，并发 ${concurrency}...`);
+        imported = await loginIcloudRequest("/api/v2/accounts/import", {
+          text: lines.join("\n"),
+          prepareRegistrationAssets: false,
+        });
+        if (!isCurrent()) return;
+        importedRows = Array.isArray(imported.rows) ? imported.rows : [];
+        ids = importedRows.map((row) => row.id || row.account?.id).filter(Boolean);
+      }
+      state.loginLastIds = ids.map(String);
+      if (!retry) importedRows.forEach((row, index) => {
+        const record = loginProgressRecord({ id: row.id || row.account?.id, email: row.email || row.account?.email || loginAccountEmail(lines[index]) });
+        if (!record) return;
+        record.id = String(row.id || row.account?.id || "");
+        appendLoginProgress(record, "账号已导入，等待并发队列调度", { stage: 0, status: "waiting" });
+      });
+      setStatus(elements.loginStatus, `正在${workspaceMode === "session" ? "协议登录" : "获取全部工作区 RT"} ${lines.length} 个账号，并发 ${concurrency}...`);
+      const pipeline = await loginIcloudStream("/api/v2/accounts/protocol-login-pipeline", {
+        ids,
+        concurrency,
+        workspaceMode,
+        requireNonPersonal: elements.loginRequireNonPersonal.checked,
+        ...selectedLoginProxyNetwork(),
+      }, (name, data) => {
+        const record = loginProgressRecord(data);
+        if (name === 'account_timing') { updateLoginTimings(record, { [data.stage]: data }); return; }
+        if (name === 'account_done' && data.timings) updateLoginTimings(record, data.timings);
+        if (name === "account_start") {
+          appendLoginProgress(record, "准备检测代理连通性", { stage: 0, status: "running", time: data.time });
+        } else if (name === "account_phase") {
+          const stage = data.phase === "business" ? 5 : 0;
+          const message = data.phase === "business" ? "逐个授权已加入的工作区" : "准备检测代理连通性";
+          appendLoginProgress(record, message, { stage, status: "running", time: data.time });
+        } else if (name === "account_log") {
+          appendLoginProgress(record, data.msg || data.error, {
+            stage: data.phase === "business" ? 5 : inferLoginStage(data.msg || data.error, record?.stage || 0, data.phase),
+            status: "running", level: data.level, time: data.time,
+          });
+        } else if (name === "account_done") {
+          if (record) record.validationFailure = validationFailureFields(data).validationFailure;
+          if (record && data.terminalReason) record.terminalReason = data.terminalReason;
+          if (record && data.error) record.error = sanitizeLoginLog(data.error);
+          if (data.ok) {
+            const doneText = workspaceMode === "session"
+              ? "协议登录完成，Session 已就绪"
+              : `RT 已就绪：个人 ${data.personalOk ? 1 : 0} 个，工作区 ${data.businessSuccess || 0} 个`;
+            appendLoginProgress(record, doneText, { stage: workspaceMode === "session" ? 4 : 6, status: "success" });
+          } else {
+            const hint = validationFailureHint(data);
+            appendLoginProgress(record, hint ? `${hint} [${data.validationFailure.code}]` : (data.error || "账号处理失败"), { status: "error", level: "error" });
+          }
+        }
+      });
+      if (!isCurrent()) return;
+      state.loginLastResponse = pipeline;
+      const accountById = new Map([...previousLoginAccounts, ...(pipeline.accounts || [])].map(account => [String(account.id), account]));
+      state.loginLastAccounts = [...accountById.values()];
+      const results = pipeline.results || [];
+      const successful = results.filter((item) => item.ok);
+      for (const item of successful) { delete state.monitorRetries[item.id]; delete state.monitorStopped[item.id]; }
+      state.loginSessionIds = [...new Set([...previousSessionIds, ...results.filter((item) => item.sessionOk).map((item) => String(item.id))])];
+      state.loginPersonalIds = [...new Set([...previousPersonalIds, ...results.filter((item) => item.personalOk).map((item) => String(item.id))])];
+      state.loginBusinessIds = [...new Set([...previousBusinessIds, ...results.filter((item) => Number(item.businessSuccess) > 0).map((item) => String(item.id))])];
+      state.loginLastIds = [...new Set([...previousLastIds, ...successful.map((item) => String(item.id))])];
+      state.loginLastRtKind = workspaceMode;
+      setLoginRetry(results, inputLines, workspaceMode);
+      elements.exportLoginSessions.disabled = state.loginSessionIds.length === 0;
+      updateLoginExportActions();
+      if (selectedPushTarget() !== 'none' && workspaceMode !== "session") {
+        const exportIds = pipelineRtIds(results);
+        await autoPushLoginResults({ ids: exportIds });
+        if (!isCurrent()) return;
+      }
+      const retryCount = Number(state.loginRetry?.ids?.length || 0);
+      setStatus(elements.loginStatus, `全部流程完成：成功 ${pipeline.success || 0}，失败 ${pipeline.failed || 0}，账号级并发 ${pipeline.concurrency || concurrency}。${retryCount ? `可再次点击“重试失败账号 (${retryCount})”。` : ''}`, pipeline.failed ? "error" : "ok");
+      hideLoginModal();
+      return;
+   } catch (error) {
+      if (!isCurrent()) return;
+      const message = error instanceof Error ? error.message : String(error);
+      Array.from(state.loginProgress.values()).filter((record) => record.status === "waiting" || record.status === "running").forEach((record) => {
+        appendLoginProgress(record, `服务连接中断：${message}`, { status: "error", level: "error" });
+      });
+      setLoginRetryFromProgress(retryInputLines, retryWorkspaceMode);
+      if (/手机号|手机|验证码|otp|phone|mfa|2fa/i.test(message)) showLoginModal(message);
+      setStatus(elements.loginStatus, message, "error");
+    } finally {
+      if (isCurrent()) {
+        elements.startProtocolLogin.disabled = false;
+        elements.resetLoginTotp.disabled = false;
+        elements.protocolLogoutAll.disabled = false;
+        elements.selfLeaveWorkspaces.disabled = false;
+        elements.importLoginFile.disabled = false;
+        updatePushControls();
+        persistBrowserWorkspace(true);
+      }
+    }
+  }
+
+  function downloadLoginFile(text, fileName, type = "application/json;charset=utf-8") {
+    const url = URL.createObjectURL(new Blob([text], { type }));
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = fileName;
+    document.body.append(anchor);
+    anchor.click();
+    anchor.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  function loginAccountLinesByStatus(status) {
+    return String(elements.loginAccounts.value || "").split(/\r?\n/)
+      .map(line => line.trim())
+      .filter(line => line && state.loginProgress.get(loginAccountEmail(line).toLowerCase())?.status === status);
+  }
+
+  function updateLoginCopyActions() {
+    elements.copyLoginSuccess.disabled = !loginAccountLinesByStatus("success").length;
+    elements.copyLoginFailed.disabled = !loginAccountLinesByStatus("error").length;
+  }
+
+  async function copyLoginAccounts(status) {
+    const lines = loginAccountLinesByStatus(status);
+    if (!lines.length) return;
+    const isCurrent = workspaceTaskIsCurrent();
+    const label = status === "success" ? "成功" : "失败";
+    try {
+      await navigator.clipboard.writeText(lines.join("\n"));
+      if (isCurrent()) setStatus(elements.loginStatus, `已复制 ${lines.length} 个${label}账号。`, "ok");
+    } catch {
+      if (isCurrent()) setStatus(elements.loginStatus, "复制失败，请允许浏览器访问剪贴板后重试。", "error");
+    }
+  }
+
+  async function exportLoginSessions() {
+    const isCurrent = workspaceTaskIsCurrent();
+    elements.exportLoginSessions.disabled = true;
+    try {
+      if (!state.loginSessionIds.length) throw new Error("本次流程没有可导出的 Session");
+      const response = await pageFetch("/api/v2/accounts/export-sessions", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: loginProxyHeaders({ "Content-Type": "application/json" }),
+        body: JSON.stringify(browserRequestBody({ ids: state.loginSessionIds, aliveOnly: false, download: true })),
+      });
+      const text = await response.text();
+      if (!isCurrent()) return;
+      if (!response.ok) {
+        let detail = "";
+        try { detail = JSON.parse(text || "{}").error || ""; } catch {}
+        throw new Error(detail || `Session 导出失败：HTTP ${response.status}`);
+      }
+      downloadLoginFile(text, `chatgpt-sessions.${getTimestampToken()}.txt`, "text/plain;charset=utf-8");
+      setStatus(elements.loginStatus, `已下载 Session TXT，共 ${state.loginSessionIds.length} 行。`, "ok");
+    } catch (error) {
+      if (!isCurrent()) return;
+      setStatus(elements.loginStatus, error instanceof Error ? error.message : String(error), "error");
+    } finally {
+      if (isCurrent()) elements.exportLoginSessions.disabled = state.loginSessionIds.length === 0;
+    }
+  }
+
+  async function exportLoginSub2api(rtKind) {
+    const isCurrent = workspaceTaskIsCurrent();
+    const button = rtKind === "business" ? elements.exportLoginBusiness : elements.exportLoginPersonal;
+    const ids = rtKind === "business" ? state.loginBusinessIds : state.loginPersonalIds;
+    button.disabled = true;
+    try {
+      if (!ids.length) throw new Error(`本次流程没有可导出的${rtKind === "business" ? " Business" : "个人"} RT`);
+      const payload = await loginIcloudRequest("/api/v2/accounts/export-sub2api", { ids, rtKind, validateSession: false });
+      if (!isCurrent()) return;
+      const exportPayload = buildLoginSub2apiPayload(payload);
+      downloadLoginFile(JSON.stringify(exportPayload, null, 2), `sub2api-login-${rtKind}.${getTimestampToken()}.json`);
+      setStatus(elements.loginStatus, `已下载${rtKind === "business" ? " Business" : "个人"} sub2api，共 ${exportPayload.accounts.length} 个账号。`, "ok");
+    } catch (error) {
+      if (!isCurrent()) return;
+      setStatus(elements.loginStatus, error instanceof Error ? error.message : String(error), "error");
+    } finally {
+      if (isCurrent()) button.disabled = ids.length === 0;
+    }
+  }
+
+  async function copyOutput() {
+    const isCurrent = workspaceTaskIsCurrent();
+    if (!state.outputText) {
+      return;
+    }
+
+    try {
+      await navigator.clipboard.writeText(state.outputText);
+      if (!isCurrent()) return;
+      setStatus(elements.outputStatus, "已复制到剪贴板。", "ok");
+    } catch {
+      if (!isCurrent()) return;
+      elements.output.select();
+      document.execCommand("copy");
+      setStatus(elements.outputStatus, "已复制到剪贴板。", "ok");
+    }
+  }
+
+  async function readFiles(files) {
+    cancelHealthCheck();
+    const isCurrent = workspaceTaskIsCurrent();
+    if (state.format === "sub2api-tools") {
+      const sourceFiles = Array.from(files).filter((file) => /\.(json|txt)$/i.test(file.name));
+      if (!sourceFiles.length) {
+        setStatus(elements.inputStatus, "没有选择 JSON 或 TXT 文件。", "error");
+        return;
+      }
+      const texts = await Promise.all(sourceFiles.map((file) => file.text()));
+      if (!isCurrent()) return;
+      elements.input.value = texts.join("\n");
+      scheduleConvert();
+      return;
+    }
+
+    const sourceFiles = Array.from(files).filter((file) => /\.(json|txt)$/i.test(file.name));
+    if (!sourceFiles.length) {
+      setStatus(elements.inputStatus, "没有选择 JSON 或 TXT 文件。", "error");
+      return;
+    }
+
+    const documents = [];
+    const sourceTexts = [];
+    const skipped = [];
+
+    for (const file of sourceFiles) {
+      try {
+        const text = await file.text();
+        if (!isCurrent()) return;
+        const parsedValues = parseJsonValues(text);
+        sourceTexts.push(text);
+        const found = parsedValues.flatMap((parsed) => collectSessionLikeObjects(parsed, file.webkitRelativePath || file.name));
+        if (!found.length) {
+          skipped.push({
+            sourceName: file.webkitRelativePath || file.name,
+            path: "$",
+            reason: "未找到包含 accessToken 和 user/email 的 session 对象",
+          });
+        }
+        documents.push(...found);
+      } catch (error) {
+        if (!isCurrent()) return;
+        skipped.push({
+          sourceName: file.webkitRelativePath || file.name,
+          path: "$",
+          reason: error instanceof Error ? error.message : "无法读取文件",
+        });
+      }
+    }
+
+    const now = new Date();
+    state.conversionAt = now.toISOString();
+    const converted = [];
+    const convertSkipped = [...skipped];
+    documents.forEach((item) => {
+      try {
+        converted.push(convertSession(item.value, {
+          now,
+          sourceName: item.sourceName,
+          sourcePath: item.path,
+        }));
+      } catch (error) {
+        convertSkipped.push({
+          sourceName: item.sourceName,
+          path: item.path,
+          reason: error instanceof Error ? error.message : "无法转换",
+        });
+      }
+    });
+
+    modelEvaluation.reset();
+    elements.input.value = sourceTexts.join('\n');
+    rebuildSharedAccounts(elements.input.value, documents.map(({ sourceName, path }) => ({ sourceName, path })));
+    state.skipped = convertSkipped;
+    updateOutput();
+    startHealthCheck({ force: false });
+    setStatus(elements.inputStatus, `读取 ${sourceFiles.length} 个文件，生成 ${converted.length} 个账号，跳过 ${convertSkipped.length} 项。`, converted.length ? "ok" : "error");
+  }
+
+  function updateToolControls() {
+    elements.formatButtons.forEach((item) => {
+      const isConverterGroup = item.dataset.formatGroup === "converter"
+        && state.format !== "sub2api-tools"
+        && state.format !== "protocol-login"
+        && state.format !== "model-evaluation"
+        && state.format !== "team-checkout";
+      item.setAttribute("aria-pressed", String(item.dataset.format === state.format || isConverterGroup));
+    });
+    updatePushControls();
+    const isTool = state.format === "sub2api-tools";
+    const isLogin = state.format === "protocol-login";
+    const isTeamCheckout = state.format === "team-checkout";
+    const isEvaluation = state.format === 'model-evaluation';
+    document.body.classList.toggle('is-model-evaluation', isEvaluation);
+    document.querySelector('#model-evaluation').classList.toggle('hidden', !isEvaluation);
+    document.querySelector('#model-evaluation').setAttribute('aria-hidden', String(!isEvaluation));
+    modelEvaluation.refresh();
+    document.body.classList.toggle('is-team-checkout', isTeamCheckout);
+    teamCheckout.refresh();
+    const isDedicatedPage = isLogin || isTeamCheckout || isEvaluation;
+    document.querySelector('#team-checkout-workbench').classList.toggle('hidden', !isTeamCheckout);
+    document.querySelector('#team-checkout-workbench').setAttribute('aria-hidden', String(!isTeamCheckout));
+    const isSub2apiOutput = state.format === "sub2api" || isTool;
+    const isSplit = isTool && elements.sub2apiOperation.value === "split";
+    elements.sub2apiToolConfig.classList.toggle("hidden", !isTool);
+    elements.sub2apiToolConfig.setAttribute("aria-hidden", String(!isTool));
+    elements.toolOperationButtons.classList.toggle("is-visible", isTool);
+    elements.operationButtons.forEach((button) => {
+      const active = button.dataset.operation === elements.sub2apiOperation.value;
+      button.setAttribute("aria-pressed", String(active));
+      button.setAttribute("aria-selected", String(active));
+      button.tabIndex = active ? 0 : -1;
+      if (active) elements.sub2apiToolConfig.setAttribute("aria-labelledby", button.id);
+    });
+    elements.sub2apiOutputConfig.classList.toggle("hidden", !isSub2apiOutput);
+    elements.mailInputLabel.classList.toggle("hidden", !isSplit);
+    elements.splitScopeLabel.classList.toggle("hidden", !isSplit);
+    elements.sessionGuide.classList.toggle("hidden", isTool || isLogin);
+    elements.healthFilterLabel.classList.remove("hidden");
+    elements.usageFilterLabel.classList.toggle("hidden", !isTool);
+    elements.loginWorkbench.classList.toggle("hidden", !isLogin);
+    elements.converterWorkspace.classList.toggle("hidden", isDedicatedPage);
+    elements.converterWorkspace.setAttribute("aria-hidden", String(isDedicatedPage));
+    elements.converterActions.classList.toggle("hidden", isDedicatedPage);
+    elements.formatToolbar.classList.toggle("hidden", isDedicatedPage);
+    elements.formatRail.classList.toggle("hidden", isLogin || isTool);
+    const formatTabs = [...document.querySelectorAll("#format-list [role=\"tab\"]")];
+    for (const tab of formatTabs) {
+      const active = tab.dataset.format === state.format;
+      tab.setAttribute("aria-selected", String(active));
+      tab.tabIndex = active ? 0 : -1;
+      if (active) elements.converterWorkspace.setAttribute("aria-labelledby", tab.id);
+    }
+    elements.healthStatus.classList.remove("hidden");
+    elements.healthTable.classList.remove("hidden");
+    elements.inputTitle.textContent = isTool ? "sub2api 批处理" : (isLogin ? "协议登录输入" : "Session JSON");
+    elements.inputSubtitle.textContent = isTool ? "沿用共享账号，也可粘贴或导入 Sub2API、Session、CPA 文件。" : (isLogin ? "在左侧输入账号并启动协议登录，右侧查看结果。" : "粘贴或导入账号；协议登录的结果会自动合并，无需再次导入。");
+    elements.loadExample.textContent = isTool ? "填入 sub2api 示例" : "填入示例结构";
+    elements.input.disabled = isLogin;
+    elements.pickFiles.disabled = isLogin;
+    elements.loadExample.disabled = isLogin;
+    elements.clearInput.disabled = isLogin;
+    syncLogoutAllSessionsButton();
+  }
+
+  const teamCheckout = initializeTeamCheckout({ request: pageFetch, isWorkspaceCurrent: workspaceTaskIsCurrent });
+  async function logoutEvaluationAccounts(accounts) {
+    const isCurrent = workspaceTaskIsCurrent();
+    const disabled = [...document.querySelectorAll('input, textarea, select, button')].map(node => ({ node, disabled: node.disabled }));
+    evaluationLogoutBusy = true;
+    protocolLogoutBusy = true;
+    stopSessionMonitor(true);
+    cancelHealthCheck();
+    disabled.forEach(({ node }) => { node.disabled = true; });
+    const outcomes = [];
+    const wanted = new Set(accounts.map(evaluationAccountOwner));
+    const linked = state.browserAccounts.filter(account => wanted.has(evaluationAccountOwner(account)));
+    const linkedOwners = new Set(linked.map(evaluationAccountOwner));
+    const manual = accounts.filter(account => !linkedOwners.has(evaluationAccountOwner(account)));
+    const record = rows => outcomes.push(...rows);
+    try {
+      if (linked.length) {
+        const results = new Map();
+        try {
+          const result = await loginIcloudStream('/api/v2/accounts/protocol-logout-all', {
+            ids: linked.map(account => String(account.id)), confirmed: true, ...selectedLoginProxyNetwork(),
+          }, (name, data) => { if (name === 'account_done') results.set(String(data.id), data); });
+          requireCurrentWorkspace(isCurrent);
+          for (const row of result.results || []) results.set(String(row.id), row);
+        } catch (error) {
+          requireCurrentWorkspace(isCurrent);
+          for (const account of linked) if (!results.has(String(account.id))) results.set(String(account.id), { ok: false, error: error.message });
+        }
+        record(linked.map(account => ({ ...results.get(String(account.id)), email: account.email })));
+      }
+      if (manual.length) {
+        try {
+          const response = await pageFetch('/api/logout-all-sessions', { method: 'POST', credentials: 'same-origin',
+            headers: loginProxyHeaders({ 'Content-Type': 'application/json' }),
+            body: JSON.stringify({ accounts: manual.map((account, index) => ({ ...account, index })), concurrency: selectedTaskConcurrency() }),
+          });
+          const result = await readJsonResponse(response);
+          if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+          requireCurrentWorkspace(isCurrent);
+          record(manual.map((account, index) => ({ ...result.results?.find(row => row.index === index), email: account.email })));
+        } catch (error) { requireCurrentWorkspace(isCurrent); record(manual.map(account => ({ email: account.email, ok: false, error: error.message }))); }
+      }
+      const succeeded = new Set(outcomes.filter(row => row.ok).map(evaluationAccountOwner));
+      if (succeeded.size) {
+        const ids = new Set(state.browserAccounts.filter(account => succeeded.has(evaluationAccountOwner(account))).map(account => String(account.id)));
+        for (const id of ids) markMonitorStopped(id, 'sessions_logged_out');
+        for (const key of ['loginSessionIds', 'loginPersonalIds', 'loginBusinessIds', 'loginLastIds']) state[key] = state[key].filter(id => !ids.has(String(id)));
+        clearLoginRetry();
+        // Remove imported copies too: logging out one workspace invalidates its siblings.
+        if (elements.input.value.trim()) {
+          const remaining = parseJsonValues(elements.input.value).map(document => {
+            const removed = new Set(collectSessionLikeObjects(document).filter(source => {
+              try { return succeeded.has(evaluationAccountOwner(convertSession(source.value).cpa)); } catch { return false; }
+            }).map(source => source.path));
+            const prune = (value, path = '$') => {
+              if (removed.has(path)) return undefined;
+              if (Array.isArray(value)) return value.map((child, index) => prune(child, `${path}[${index}]`)).filter(child => child !== undefined);
+              if (isPlainObject(value)) return Object.fromEntries(Object.entries(value)
+                .map(([key, child]) => [key, prune(child, `${path}.${key}`)]).filter(([, child]) => child !== undefined));
+              return value;
+            };
+            return prune(document);
+          }).filter(document => document !== undefined);
+          elements.input.value = remaining.map(document => JSON.stringify(document, null, 2)).join('\n');
+        }
+        state.pushRetry = null;
+        for (const operation of state.pushOperations) for (const item of operation.items) {
+          if (item.account && succeeded.has(evaluationAccountOwner({ email: item.account.email || item.account.credentials?.email || item.account.name }))) {
+            item.disabled = true; item.retryable = false; delete item.account;
+          }
+        }
+        syncPushOperationViews();
+        scheduleConvert();
+        updateLoginExportActions();
+        elements.exportLoginSessions.disabled = !state.loginSessionIds.length;
+        await persistBrowserWorkspace(true, true);
+      }
+      return outcomes;
+    } finally {
+      evaluationLogoutBusy = false; protocolLogoutBusy = false;
+      if (isCurrent()) {
+        disabled.forEach(({ node, disabled: value }) => { node.disabled = value; });
+        updateLoginExportActions();
+        elements.exportLoginSessions.disabled = !state.loginSessionIds.length;
+        updatePushControls(); scheduleSessionMonitor();
+      }
+    }
+  }
+  const modelEvaluation = initializeModelEvaluation({
+    request: pageFetch, isWorkspaceCurrent: workspaceTaskIsCurrent, getHeaders: loginProxyHeaders,
+    getEligibility: () => evaluationEligibility,
+    getConcurrency: () => taskConcurrency,
+    isPushBusy: () => pushBusy || monitorBusy || protocolLogoutBusy || selfLeaveBusy || state.logoutInProgress || elements.startProtocolLogin.disabled || elements.resetLoginTotp.disabled,
+    getAccounts: () => state.converted.map(convertedHealthAccount),
+    getLoginAccounts: () => ({ input: elements.loginAccounts.value, accounts: state.browserAccounts }),
+    onLogoutFailed: logoutEvaluationAccounts,
+    onPushPassed: async accounts => {
+      try { pushSettings('sub2api'); }
+      catch (error) {
+        openSub2PushConfig();
+        setStatus(elements.loginSub2Status, `${error.message}，保存后再点击推送。`, 'error');
+        return;
+      }
+      const keys = new Set(accounts.map(healthCredentialKey));
+      return runPush(async () => state.converted
+        .filter(item => keys.has(healthCredentialKey(convertedHealthAccount(item))))
+        .map(item => applySub2apiOutputConfig(item.sub2apiAccount)),
+      { target: 'sub2api', emptyMessage: '没有可推送的答案正确账号，请重新测试。' });
+    },
+    onImport: text => {
+      const sources = parseInputDocuments(text);
+      const valid = sources.filter(item => { try { convertSession(item.value); return true; } catch { return false; } });
+      if (!valid.length) throw new Error('未找到有效账号，请检查 Session、CPA 或 Sub2API JSON。');
+      elements.input.value = text;
+      scheduleConvert();
+      return { count: state.converted.length, skipped: state.skipped.length };
+    },
+  });
+  const selectFormat = (format) => {
+    state.format = format;
+    updateToolControls();
+    updateOutput();
+    if (format === 'protocol-login') useSharedLoginAccounts(false);
+    if (format === 'model-evaluation' && !healthController && !evaluationEligibility.accounts.length && state.converted.length) startHealthCheck({ force: false });
+    if (state.format === "protocol-login" && !state.loginSub2Loaded) {
+      const isCurrent = workspaceTaskIsCurrent();
+      loadLoginSub2Config().catch((error) => {
+        if (!isCurrent()) return;
+        setStatus(elements.loginSub2Status, `加载 Sub2 配置失败：${error instanceof Error ? error.message : String(error)}`, "error");
+      });
+    }
+    persistBrowserWorkspace(true);
+  };
+  elements.formatButtons.forEach((button) => button.addEventListener("click", () => selectFormat(button.dataset.format)));
+  document.querySelectorAll('[data-account-destination]').forEach(button => button.addEventListener('click', () => selectFormat(button.dataset.accountDestination)));
+  document.querySelector('#use-shared-login-accounts').addEventListener('click', () => useSharedLoginAccounts(true));
+  for (const selector of ['#evaluation-health-check', '#shared-health-check']) {
+    document.querySelector(selector).addEventListener('click', () => startHealthCheck());
+  }
+  const bindTabKeyboard = (selector, onSelect) => {
+    const tabs = [...document.querySelectorAll(selector)];
+    for (const tab of tabs) {
+      tab.addEventListener("keydown", (event) => {
+        if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+        event.preventDefault();
+        const index = tabs.indexOf(tab);
+        const nextIndex = event.key === "Home" ? 0 : event.key === "End" ? tabs.length - 1 : (index + (event.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length;
+        const next = tabs[nextIndex];
+        onSelect(next);
+        next.focus();
+      });
+    }
+  };
+  bindTabKeyboard("#format-list [role=\"tab\"]", (tab) => selectFormat(tab.dataset.format));
+
+  elements.input?.addEventListener("input", scheduleConvert);
+  ["dragenter", "dragover"].forEach((type) => elements.inputDropzone?.addEventListener(type, (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    elements.inputDropzone.classList.add("is-dragging");
+  }));
+  ["dragleave", "drop"].forEach((type) => elements.inputDropzone?.addEventListener(type, (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    elements.inputDropzone.classList.remove("is-dragging");
+  }));
+  elements.inputDropzone?.addEventListener("drop", (event) => {
+    const files = event.dataTransfer?.files;
+    if (files?.length) readFiles(files);
+  });
+  elements.loginAccounts?.addEventListener("input", () => {
+    updateLoginCopyActions();
+    clearLoginRetry();
+    state.accountActionRetries = {};
+    updateLoginExportActions();
+    if (!state.loginProgress.size) elements.loginAccountCount.textContent = `${countLoginAccountLines()} 个账号`;
+  });
+  elements.loginWorkspaceMode?.addEventListener("change", () => {
+    if (state.loginRetry && state.loginRetry.workspaceMode !== getLoginWorkspaceMode()) clearLoginRetry();
+    updateLoginExportActions();
+    updateLoginStageRail([...state.loginProgress.values()]);
+  });
+  elements.loginProxyMode?.addEventListener("change", () => selectedLoginProxyNetwork());
+  elements.loginProxyLocalPort?.addEventListener("input", () => selectedLoginProxyNetwork());
+  elements.loginProxyPool?.addEventListener("input", () => selectedLoginProxyNetwork());
+  syncLoginProxyControls();
+  elements.copyOutput?.addEventListener("click", copyOutput);
+  elements.downloadOutput?.addEventListener("click", downloadOutput);
+  elements.logoutAllSessions?.addEventListener("click", () => logoutAllHealthySessions());
+  elements.downloadMatched?.addEventListener("click", () => downloadSplitGroup("matched"));
+  elements.downloadUnmatched?.addEventListener("click", () => downloadSplitGroup("unmatched"));
+  elements.startProtocolLogin?.addEventListener("click", () => startProtocolLogin());
+  elements.resetLoginTotp?.addEventListener("click", () => resetLoginTotp());
+  document.querySelector('#resume-login-totp').addEventListener('click', () => resetLoginTotp({ resume: true }));
+  document.querySelector('#copy-login-reset-pending').addEventListener('click', async () => {
+    try {
+      await navigator.clipboard.writeText(document.querySelector('#login-reset-pending-credentials').textContent);
+      setStatus(elements.loginStatus, '待确认的新密钥凭据已复制，请保留并核对状态。', 'ok');
+    } catch { setStatus(elements.loginStatus, '复制失败，请下载备份或手动复制。', 'error'); }
+  });
+  document.querySelector('#download-login-reset-pending').addEventListener('click', () => {
+    const accounts = state.browserAccounts.filter(account => account.totp_reset_pending?.secret).map(account => ({
+      email: account.email, password: account.openai_password || account.password, ...account.totp_reset_pending,
+    }));
+    downloadLoginFile(JSON.stringify({ warning: '新密钥尚未全部确认生效，请保留当前登录并核对状态', accounts }, null, 2), '2fa-reset-backup.json');
+  });
+  elements.protocolLogoutAll?.addEventListener('click', () => protocolLogoutAllSessions());
+  elements.selfLeaveWorkspaces?.addEventListener('click', () => selfLeaveAccountWorkspaces());
+  elements.copyLoginResetOutput?.addEventListener("click", async () => {
+    const isCurrent = workspaceTaskIsCurrent();
+    const text = elements.loginResetCredentials?.textContent || "";
+    if (!text) return;
+    try {
+      await navigator.clipboard.writeText(text);
+      if (!isCurrent()) return;
+      setStatus(elements.loginStatus, "最新账号凭据已复制。", "ok");
+    } catch {
+      if (!isCurrent()) return;
+      setStatus(elements.loginStatus, "复制失败，请手动选择并复制最新账号凭据。", "error");
+    }
+  });
+  elements.exportLoginSessions?.addEventListener("click", exportLoginSessions);
+  elements.exportLoginPersonal?.addEventListener("click", () => exportLoginSub2api("personal"));
+  elements.exportLoginBusiness?.addEventListener("click", () => exportLoginSub2api("business"));
+  elements.copyLoginSuccess?.addEventListener("click", () => copyLoginAccounts("success"));
+  elements.copyLoginFailed?.addEventListener("click", () => copyLoginAccounts("error"));
+  elements.importLoginFile?.addEventListener('click', () => elements.loginFileInput.click());
+  elements.loginFileInput?.addEventListener('change', event => {
+    const files = Array.from(event.target.files || []);
+    event.target.value = '';
+    void importLoginFiles(files);
+  });
+  elements.pushTarget?.addEventListener('change', () => {
+    requireMonitorPushConfig();
+    updatePushControls();
+    persistBrowserWorkspace();
+    scheduleSessionMonitor();
+  });
+  document.querySelector('#session-monitor-choice')?.addEventListener('change', () => {
+    state.monitorEnabled = document.querySelector('input[name="session-monitor"]:checked')?.value === 'on';
+    requireMonitorPushConfig();
+    syncMonitorChoice();
+    monitorLastSummary = '';
+    if (!state.monitorEnabled) {
+      stopSessionMonitor(true);
+      renderSessionMonitor('定时测活已关闭。');
+    } else monitorNextAt = Date.now() + 60_000;
+    persistBrowserWorkspace();
+    scheduleSessionMonitor();
+  });
+  elements.loginRequireNonPersonal.addEventListener('change', () => {
+    clearLoginRetry(); updateLoginExportActions(); persistBrowserWorkspace();
+  });
+  elements.converterSkipFree?.addEventListener('change', async () => {
+    const isCurrent = workspaceTaskIsCurrent();
+    const previous = !elements.converterSkipFree.checked;
+    converterFilterSaving = true;
+    cancelHealthCheck();
+    updateOutput();
+    try { await persistBrowserWorkspace(true, true); }
+    catch (error) {
+      if (isCurrent()) {
+        elements.converterSkipFree.checked = previous;
+        setStatus(elements.pushStatus, `账号筛选设置保存失败：${error.message}`, 'error');
+      }
+    } finally {
+      if (isCurrent()) { converterFilterSaving = false; startHealthCheck({ force: false }); }
+    }
+  });
+  elements.pushConverted?.addEventListener('click', () => runPush(async target => convertedPushSelection().accounts.map(item => target === 'cpa' ? item.cpa : applySub2apiOutputConfig(item.sub2apiAccount)),
+    { emptyMessage: '当前范围没有可推送的账号；已按设置跳过 free 账号。' }));
+  elements.retryPush?.addEventListener('click', () => runPush(async () => state.pushRetry?.accounts || [], { retry: true, upsert: state.pushRetry?.upsert === true, target: pushFeedbackTarget() }));
+  elements.reconcilePush?.addEventListener('click', reconcilePushOperation);
+  elements.pushOperationHistory?.addEventListener('change', () => {
+    state.activePushOperationId = elements.pushOperationHistory.value;
+    renderPushResults();
+    persistBrowserWorkspace();
+  });
+  function openSub2PushConfig() {
+    void loadLoginSub2Config();
+    void loadLoginSub2Proxies({ silent: true });
+    elements.sub2PushDialog.showModal();
+  }
+  document.querySelector('#open-sub2-push-config')?.addEventListener('click', openSub2PushConfig);
+  document.querySelector('#evaluation-sub2-config')?.addEventListener('click', openSub2PushConfig);
+  document.querySelector('#open-cpa-push-config')?.addEventListener('click', () => {
+    elements.cpaBaseUrl.value = state.cpaSettings.baseUrl || '';
+    elements.cpaManagementKey.value = state.cpaSettings.managementKey || '';
+    elements.cpaPushDialog.showModal();
+  });
+  for (const button of document.querySelectorAll('[data-close-dialog]')) button.addEventListener('click', () => document.getElementById(button.dataset.closeDialog).close());
+  const cpaFormSettings = () => ({ baseUrl: normalizePushAddress(elements.cpaBaseUrl.value, 'cpa'), managementKey: elements.cpaManagementKey.value.trim() });
+  document.querySelector('#save-cpa-config')?.addEventListener('click', async () => {
+    const isCurrent = workspaceTaskIsCurrent();
+    try {
+      const settings = cpaFormSettings();
+      if (!settings.managementKey) throw new Error('请填写 CPA Management Key');
+      state.cpaSettings = settings;
+      await persistBrowserWorkspace(true, true);
+      requireCurrentWorkspace(isCurrent);
+      elements.cpaBaseUrl.value = settings.baseUrl;
+      setStatus(elements.cpaConfigStatus, 'CPA 配置已加密保存在此浏览器。', 'ok');
+    } catch (error) { if (isCurrent()) setStatus(elements.cpaConfigStatus, error.message, 'error'); }
+  });
+  document.querySelector('#check-cpa-config')?.addEventListener('click', async () => {
+    const isCurrent = workspaceTaskIsCurrent();
+    const button = document.querySelector('#check-cpa-config');
+    button.disabled = true;
+    try {
+      const result = await remotePushRequest('cpa/check', { settings: cpaFormSettings() });
+      requireCurrentWorkspace(isCurrent);
+      setStatus(elements.cpaConfigStatus, `CPA 连接成功，当前 ${result.files} 个认证文件。`, 'ok');
+    } catch (error) { if (isCurrent()) setStatus(elements.cpaConfigStatus, error.message, 'error'); }
+    finally { if (isCurrent()) button.disabled = false; }
+  });
+  document.querySelector('#toggle-cpa-key')?.addEventListener('click', event => {
+    const reveal = elements.cpaManagementKey.type === 'password';
+    elements.cpaManagementKey.type = reveal ? 'text' : 'password';
+    event.currentTarget.textContent = reveal ? '隐藏' : '显示';
+  });
+  for (const input of [elements.loginSub2BaseUrl, elements.loginSub2AdminKey]) input.addEventListener('input', () => {
+    state.loginSub2SelectedGroupIds = [];
+    state.loginSub2AvailableGroups = [];
+    state.loginSub2AvailableProxies = [];
+    state.loginSub2KeyConfigured = Boolean(elements.loginSub2AdminKey.value);
+    renderLoginSub2Groups();
+    renderLoginSub2Proxies();
+  });
+  elements.loginSub2UseProxy?.addEventListener('change', () => {
+    renderLoginSub2Proxies();
+    if (elements.loginSub2UseProxy.checked) void loadLoginSub2Proxies({ silent: true });
+  });
+  for (const [dialog, key, toggle] of [
+    [elements.sub2PushDialog, elements.loginSub2AdminKey, elements.toggleLoginSub2Key],
+    [elements.cpaPushDialog, elements.cpaManagementKey, document.querySelector('#toggle-cpa-key')],
+  ]) dialog.addEventListener('close', () => { key.type = 'password'; toggle.textContent = '显示'; });
+
+  elements.loginWorkspaceMode?.addEventListener("change", updateLoginExportActions);
+  const runSub2Action = (action) => {
+    const isCurrent = workspaceTaskIsCurrent();
+    action().catch((error) => {
+      if (isCurrent()) setStatus(elements.loginSub2Status, error instanceof Error ? error.message : String(error), "error");
+    });
+  };
+  elements.loadLoginSub2Groups?.addEventListener("click", () => runSub2Action(loadLoginSub2Groups));
+  elements.saveLoginSub2Config?.addEventListener("click", () => runSub2Action(saveLoginSub2Config));
+  elements.loginSub2Groups?.addEventListener('change', event => {
+    const input = event.target;
+    if (!input.matches('input[data-sub2-group-id]')) return;
+    const id = Number(input.dataset.sub2GroupId);
+    const selected = new Set(state.loginSub2SelectedGroupIds);
+    if (input.checked) selected.add(id); else selected.delete(id);
+    state.loginSub2SelectedGroupIds = [...selected];
+    elements.loginSub2GroupCount.textContent = `已选 ${selected.size} 个`;
+    persistBrowserWorkspace();
+  });
+  elements.toggleLoginSub2Key?.addEventListener("click", () => {
+    const reveal = elements.loginSub2AdminKey.type === "password";
+    elements.loginSub2AdminKey.type = reveal ? "text" : "password";
+    elements.toggleLoginSub2Key.textContent = reveal ? "隐藏" : "显示";
+  });
+  elements.closeLoginModal?.addEventListener("click", hideLoginModal);
+  elements.loginModal?.addEventListener("click", (event) => {
+    if (event.target === elements.loginModal) hideLoginModal();
+  });
+  if (typeof document.addEventListener === "function") document.addEventListener("keydown", (event) => {
+    if (!elements.loginModal || elements.loginModal.classList.contains("hidden")) return;
+    if (event.key === "Escape") {
+      event.preventDefault();
+      hideLoginModal();
+      return;
+    }
+    if (event.key !== "Tab") return;
+    const focusable = [...elements.loginModal.querySelectorAll("button:not(:disabled), [href], [tabindex]:not([tabindex=\"-1\"])")];
+    if (!focusable.length) {
+      event.preventDefault();
+      elements.loginModal.focus();
+      return;
+    }
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  });
+  elements.downloadScope?.addEventListener("change", updateOutput);
+  elements.healthBody.addEventListener("click", event => {
+    const button = event.target.closest?.('[data-device-index]');
+    if (!button) return;
+    const index = Number(button.dataset.deviceIndex);
+    const result = state.health.find(item => item?.index === index);
+    if (!result) return;
+    const account = state.format === "sub2api-tools" ? state.toolRecords[index]?.account : state.converted[index];
+    openDeviceDetails(result, account?.name || account?.email);
+  });
+  elements.healthFilter?.addEventListener("change", renderHealth);
+  elements.usageFilter?.addEventListener("change", () => {
+    renderHealth();
+    updateOutput();
+  });
+  const selectOperation = (operation) => {
+    elements.sub2apiOperation.value = operation;
+    updateToolControls();
+    updateOutput();
+  };
+  elements.operationButtons.forEach((button) => button.addEventListener("click", () => selectOperation(button.dataset.operation)));
+  bindTabKeyboard("#tool-operation-buttons [role=\"tab\"]", (tab) => selectOperation(tab.dataset.operation));
+  for (const source of ['output', 'login']) {
+    for (const [key, field] of Object.entries(sub2apiAccountConfigFields(source))) {
+      const sync = event => {
+        setSub2apiAccountConfig(readSub2apiAccountConfig(source), event.type === 'input' ? field : null);
+        updateOutput();
+        persistBrowserWorkspace();
+      };
+      if (key !== 'fingerprintMode') field?.addEventListener('input', sync);
+      field?.addEventListener('change', sync);
+    }
+  }
+  elements.splitScope?.addEventListener("change", updateOutput);
+  elements.mailInput?.addEventListener("input", updateOutput);
+  elements.pickMailFile?.addEventListener("click", () => elements.mailFileInput?.click());
+  elements.mailFileInput?.addEventListener("change", async (event) => {
+    const isCurrent = workspaceTaskIsCurrent();
+    const [file] = Array.from(event.target.files || []);
+    if (file) {
+      const text = await file.text();
+      if (!isCurrent()) return;
+      elements.mailInput.value = text;
+      updateOutput();
+    }
+    event.target.value = "";
+  });
+  elements.pickFiles.addEventListener("click", () => elements.fileInput.click());
+  elements.fileInput.addEventListener("change", (event) => {
+    readFiles(event.target.files);
+    event.target.value = "";
+  });
+
+  elements.clearInput.addEventListener("click", () => {
+    elements.input.value = "";
+    scheduleConvert();
+  });
+
+  elements.loadExample.addEventListener("click", () => {
+    elements.input.value = state.format === "sub2api-tools"
+      ? JSON.stringify({
+        type: "sub2api-data",
+        version: 1,
+        exported_at: new Date().toISOString(),
+        proxies: [],
+        accounts: [{
+          name: "mark@example.com",
+          platform: "openai",
+          type: "oauth",
+          credentials: { access_token: "access-token", email: "mark@example.com" },
+        }],
+      }, null, 2)
+      : JSON.stringify(exampleSession, null, 2);
+    scheduleConvert();
+  });
+
+  if (typeof window !== 'undefined' && window.browserWorkspace) {
+    const storageStatus = document.querySelector('#browser-storage-status');
+    const clearButton = document.querySelector('#clear-browser-data');
+    const clearLoginButton = document.querySelector('#clear-login-data');
+    const initialControls = [...document.querySelectorAll('input, textarea, select, button')].map(node => ({
+      node, value: node.value, checked: node.checked, disabled: node.disabled, type: node.type,
+    }));
+    const blockWorkspaceTasks = (release = false) => {
+      sharedHealth.clear();
+      freshHealth.clear();
+      knownHealthPlans.clear();
+      evaluationEligibility = { accounts: [], total: 0, pending: false };
+      teamCheckout.reset();
+      modelEvaluation.reset();
+      cancelHealthCheck();
+      // A stale tab shares the browser owner ID: only an explicit clear may release it.
+      stopSessionMonitor(release);
+      monitorLastSummary = '';
+      renderSessionMonitor('定时测活已停止：本地数据已清空或其他标签页已更新。');
+      browserStorageCleared = true;
+      workspaceGeneration += 1;
+      hidePushToast();
+      clearTimeout(browserSaveTimer);
+      if (state.loginRenderFrame) cancelAnimationFrame(state.loginRenderFrame);
+      state.loginRenderFrame = 0;
+    };
+    const disableWorkspaceControls = () => {
+      document.querySelectorAll('input, textarea, select, button').forEach(node => { node.disabled = true; });
+    };
+    const resetWorkspaceView = (retained = null) => {
+      teamCheckout.reset();
+      modelEvaluation.reset();
+      pushBusy = false;
+      converterFilterSaving = false;
+      const format = state.format;
+      Object.assign(state, createWorkspaceState(), { format }, retained?.state, { loginProgress: new Map() });
+      initialControls.forEach(({ node, value, checked, disabled, type }) => {
+        if (node.tagName === 'INPUT') node.type = type;
+        node.value = node.type === 'file' ? '' : value;
+        node.scrollTop = 0;
+        node.scrollLeft = 0;
+        if (typeof checked === 'boolean') node.checked = checked;
+        node.disabled = disabled;
+      });
+      if (retained) restoreBrowserFields(retained.fields);
+      restoreSub2apiAccountConfig();
+      syncMonitorChoice();
+      loginModalReturnFocus = null;
+      hideLoginModal();
+      elements.loginModalMessage.textContent = '';
+      elements.loginResetCredentials.textContent = '';
+      elements.loginResetOutput.classList.add('hidden');
+      renderTotpResetRecovery();
+      elements.toggleLoginSub2Key.textContent = '显示';
+      document.querySelector('#toggle-cpa-key').textContent = '显示';
+      renderLogoutProgress();
+      renderLoginSub2Groups();
+      renderLoginProgress();
+      syncLoginProxyControls();
+      updateLoginExportActions();
+      updateToolControls();
+      updateOutput();
+      setStatus(elements.inputStatus, '等待输入。');
+      setStatus(elements.healthStatus, '等待自动测活。');
+      setStatus(elements.loginStatus, retained ? '登录数据已清空，代理和推送配置已保留。' : '所有数据已清空，可重新输入账号。');
+      setStatus(elements.loginSub2Status, retained ? '已保留此浏览器的 Sub2API 配置。' : '尚未配置 Admin Key');
+      setStatus(elements.cpaConfigStatus, retained ? '已保留此浏览器的 CPA 配置。' : '尚未配置 CPA。');
+      setStatus(elements.pushStatus, '');
+      for (const dialog of [elements.sub2PushDialog, elements.cpaPushDialog]) if (dialog.open) dialog.close();
+      renderPushResults();
+    };
+    try {
+      const stored = await window.browserWorkspace.read();
+      const saved = workspaceSchema.restore(stored);
+      if (saved?.state) {
+        for (const key of Object.keys(state)) if (Object.hasOwn(saved.state, key)) state[key] = saved.state[key];
+        state.loginProgress = new Map(saved.state.loginProgress || []);
+        state.loginRenderFrame = 0;
+        state.logoutInProgress = false;
+        for (const record of state.loginProgress.values()) {
+          if (['running', 'waiting'].includes(record.status)) {
+            record.status = 'error';
+            record.message = '页面已重新打开，请重新启动未完成的操作';
+          }
+        }
+        restoreBrowserFields(saved.fields);
+        restoreSub2apiAccountConfig();
+        elements.input.value = saved.state.conversionInput?.text || '';
+        restoreDerivedWorkspace(saved.state.conversionInput?.sources || []);
+        syncMonitorChoice();
+        elements.loginResetCredentials.textContent = saved.resetCredentials || '';
+        elements.loginResetOutput.classList.toggle('hidden', !saved.resetCredentials);
+        renderTotpResetRecovery();
+        renderLoginSub2Groups();
+        renderLoginProgress();
+        restoreLoginProxySettings();
+        renderAccounts();
+        renderHealth();
+        elements.exportLoginSessions.disabled = state.loginSessionIds.length === 0;
+        updateLoginExportActions();
+        renderPushResults();
+        if (stored.schemaVersion !== workspaceSchema.SCHEMA_VERSION
+          || workspaceSchema.needsPushHistoryCompaction(stored.state?.pushOperations)
+          || (stored.state?.pushOperations || []).some(operation => operation.items?.some(item => ['pending', 'inflight', 'running'].includes(item.status)))
+          || (stored.state?.operationHistory || []).some(operation => ['pending', 'inflight', 'running'].includes(operation.status))) {
+          await window.browserWorkspace.save(saved, { barrier: true });
+        }
+      }
+      browserStorageAvailable = true;
+    } catch (error) {
+      document.querySelector('#browser-storage-status').textContent = error.code === 'INVALID_WORKSPACE_SCHEMA' ? error.message : '浏览器存储不可用，请及时下载结果';
+    }
+    window.browserWorkspace.subscribe((kind) => {
+      blockWorkspaceTasks();
+      if (kind === 'clear') resetWorkspaceView();
+      if (kind === 'clear-login') resetWorkspaceView(settingsOnlyWorkspace());
+      storageStatus.textContent = ['clear', 'clear-login'].includes(kind)
+        ? (kind === 'clear-login' ? '另一个标签页已清空登录数据，请刷新后继续' : '另一个标签页已清空数据，请刷新后继续')
+        : '另一个标签页已更新数据，请刷新后继续';
+      disableWorkspaceControls();
+    });
+    window.addEventListener('pagehide', () => {
+      monitorPaused = true;
+      clearTimeout(monitorTimer);
+      monitorController?.abort();
+      persistBrowserWorkspace(true);
+    });
+    window.addEventListener('pageshow', () => { monitorPaused = false; scheduleSessionMonitor(); });
+    window.addEventListener('online', scheduleSessionMonitor);
+    document.addEventListener('visibilitychange', () => { if (!document.hidden) scheduleSessionMonitor(); });
+    document.addEventListener('input', persistBrowserWorkspace);
+    document.addEventListener('change', persistBrowserWorkspace);
+    const clearWorkspace = async (loginOnly) => {
+      if (clearingBrowserData) return;
+      if (!loginOnly && !window.confirm('确认清空所有数据？\n\n将删除此浏览器中的账号、密码、TOTP、Session、RT 和结果，以及自定义代理、Sub2API 和 CPA 配置。定时测活也会停止。\n\n此操作无法撤销。如需保留配置，请取消并使用“清空登录数据”。')) return;
+      clearingBrowserData = true;
+      const retained = loginOnly ? settingsOnlyWorkspace() : null;
+      blockWorkspaceTasks(true);
+      const clearing = loginOnly ? window.browserWorkspace.clearLoginData(retained) : window.browserWorkspace.clear();
+      resetWorkspaceView(retained);
+      const clearedControls = [...document.querySelectorAll('input, textarea, select, button')].map(node => ({ node, disabled: node.disabled }));
+      disableWorkspaceControls();
+      storageStatus.textContent = loginOnly ? '正在清空登录数据…' : '正在清空所有数据…';
+      try {
+        await clearing;
+        if (window.browserWorkspace.signal.aborted) return;
+        clearedControls.forEach(({ node, disabled }) => { node.disabled = disabled; });
+        browserStorageCleared = false;
+        browserStorageReady = browserStorageAvailable = true;
+        monitorNextAt = Date.now() + 60_000;
+        scheduleSessionMonitor();
+        storageStatus.textContent = loginOnly ? '登录数据已清空，配置已保留' : '所有数据已清空';
+      } catch {
+        storageStatus.textContent = '清空失败，请刷新后重试，或清空所有数据';
+        clearButton.disabled = false;
+      } finally {
+        clearingBrowserData = false;
+      }
+    };
+    clearButton.addEventListener('click', () => clearWorkspace(false));
+    clearLoginButton.addEventListener('click', () => clearWorkspace(true));
+
+  }
+  restoreSub2apiAccountConfig();
+  updateToolControls();
+  updateOutput();
+  browserStorageReady = browserStorageAvailable;
+  if (typeof window !== 'undefined' && window.browserWorkspace) {
+    document.addEventListener('input', scheduleSessionMonitor);
+    document.addEventListener('change', scheduleSessionMonitor);
+    // Saving credentials/configuration may finish after its DOM event has fired.
+    document.addEventListener('click', () => setTimeout(scheduleSessionMonitor, 500));
+    scheduleSessionMonitor();
+  }
+  try {
+    const response = await fetch('/api/system/config', { cache: 'no-store' });
+    if (!response.ok) throw new Error('配置读取失败');
+    const config = await response.json();
+    if (!Number.isInteger(config.taskConcurrency) || config.taskConcurrency < 1) throw new Error('并发配置无效');
+    taskConcurrency = config.taskConcurrency;
+    modelEvaluation.refresh();
+    elements.taskConcurrencyValue.textContent = String(taskConcurrency);
+    if (state.format === 'model-evaluation' && state.converted.length) startHealthCheck({ force: false });
+  } catch {
+    elements.taskConcurrencyValue.textContent = '按服务端设置';
+  }
+})();

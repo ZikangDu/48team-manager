@@ -138,6 +138,20 @@ async def _expected_workspace(db: AsyncSession, account: Account, workspace_id: 
     return official
 
 
+def remote_pushed_at(remote: dict[str, Any] | None):
+    """Push time as Sub2API recorded it (account updated_at after the write); local time if absent."""
+    from datetime import datetime, timezone
+
+    value = (remote or {}).get("updated_at") or (remote or {}).get("updatedAt")
+    if isinstance(value, str) and value:
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+        except ValueError:
+            pass
+    return utcnow()
+
+
 def _build_credentials(account: Account) -> dict[str, Any]:
     access = decrypt_secret(account.access_token_encrypted)
     refresh = decrypt_secret(account.refresh_token_encrypted)
@@ -302,6 +316,7 @@ async def account_sub2api_push(
     confirm_mixed_channel_risk: bool = False,
     workspace_id: int | None = None,
     dry_run: bool = False,
+    rotation_operation_id: str | None = None,
 ) -> dict[str, Any]:
     account = await db.get(Account, int(account_id))
     if account is None:
@@ -317,6 +332,10 @@ async def account_sub2api_push(
             "message": eligibility.get("reason") or "该账号不适用 Sub2API 推送",
             **eligibility,
         }
+    from app.application.refresh_ownership import codex_refresh_owner
+    if await codex_refresh_owner(db, account.id) is not None:
+        return {"ok": False, "error_code": "codex_rs_bound", "outcome": "not_eligible", "status": "failed",
+                "message": "该号已导入 codex-rs，由 codex-rs 续期，不能再推送 Sub2API"}
 
     try:
         workspace, expected_ws = await _resolve_push_context(db, account, workspace_id)
@@ -471,6 +490,17 @@ async def account_sub2api_push(
             "schedulable": schedulable,
         },
     )
+
+    if rotation_operation_id:
+        root = await operation_store.get_by_public_id(db, rotation_operation_id)
+        if root is None or root.source != "manual_rotation" or root.workspace_id != scoped_workspace_id:
+            raise ValueError("invalid rotation publication context")
+        await operation_store.mark_step(db, root, "published", state="running", result={
+            "intent": "publish", "sub2api_operation_id": operation.public_id,
+            "credential_revision": int(account.credential_revision or 1),
+        })
+        # Save the concrete write identity before sending anything externally.
+        await db.commit()
 
     create_body: dict[str, Any] = {
         "name": account_name,
@@ -780,6 +810,7 @@ async def account_sub2api_push(
         binding.verified_workspace_id = remote_workspace_id_from(remote) or expected_ws
         binding.last_error = None
         binding.last_observed_at = utcnow()
+        binding.last_pushed_at = remote_pushed_at(remote)
         binding.updated_at = utcnow()
 
     schedulable_error = None
@@ -980,6 +1011,7 @@ async def push_refreshed_tokens_to_bound_sub2api(
             raise RuntimeError(binding.last_error)
         binding.last_error = None
         binding.last_observed_at = utcnow()
+        binding.last_pushed_at = remote_pushed_at(after)
         step_result = {
             **sync_step_receipt(sync),
             "remote_id": remote_id,

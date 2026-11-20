@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from app.application.codex_export import CodexTransferError, export_document
-from app.web.schemas.accounts import CodexTransferRequest, CodexPushRequest
+from app.web.schemas.accounts import CodexRsImportRequest, CodexTransferRequest
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.application import console_actions
@@ -22,7 +22,7 @@ from app.application.settings import save_console_settings
 from app.application.workspace_sync import workspace_sync_service
 from app.application.sub2api_usage import sub2api_usage_service
 from app.integrations.sub2api.client import sub2api_client
-from app.persistence.models.identity import Account
+from app.persistence.models.identity import Account, Workspace
 from app.web.deps import require_admin
 from app.web.schemas.accounts import AccountPhonePatch, DeleteAccountRequest, DeleteAccountsRequest, RegisterAccountRequest
 from app.web.schemas.resources import (
@@ -37,6 +37,7 @@ from app.web.schemas.resources import (
     PhoneStatusPatch,
     RevokeInviteRequest,
     RotateRequest,
+    RotationContinueRequest,
     Sub2ApiPushRequest,
     Sub2ApiUsageSyncRequest,
     WorkspaceAddChildRequest,
@@ -46,10 +47,11 @@ from app.web.schemas.resources import (
     WorkspacePurgeChildRequest,
     WorkspaceRemoveChildRequest,
 )
-from app.web.schemas.settings import ConnectionProbeRequest, SettingsPatch
+from app.web.schemas.settings import ConnectionProbeRequest, RunnerSelfcheckRequest, SettingsPatch
 from app.web.schemas.workspaces import CompleteAccountOAuthRequest, CompleteWorkspaceOAuthRequest, StartWorkspaceOAuthRequest
-from app.web.schemas.workspaces import WorkspaceExpiryPatch
+from app.web.schemas.workspaces import WorkspaceExpiryPatch, WorkspacePurchasePatch
 from app.application.workspace_expiry import update_workspace_expiry
+from app.application.workspace_purchase import reveal_owner_totp, update_workspace_purchase
 from app.application.workspace_switch_count import increment_workspace_switch_count
 
 
@@ -77,14 +79,40 @@ def build_api_router(get_db) -> APIRouter:
         from app.application.codex_publish import binding_status
         return JSONResponse(await binding_status(db), headers={"Cache-Control": "no-store"})
 
-    @router.post("/accounts/codex/push")
-    async def push_codex_accounts(payload: CodexPushRequest, _: dict = Depends(require_admin), db: AsyncSession = Depends(get_db)):
-        from app.application.codex_publish import push_accounts
-        try:
-            result = await push_accounts(db, payload.account_ids, expected_target=payload.expected_target)
-        except CodexTransferError as exc:
-            raise HTTPException(status_code=exc.status, detail={"message": str(exc), "error_code": exc.code}) from None
+    @router.post("/accounts/codex-rs/import")
+    async def import_codex_rs_accounts(payload: CodexRsImportRequest, _: dict = Depends(require_admin), db: AsyncSession = Depends(get_db)):
+        from app.application.codex_publish import import_accounts
+        result = await import_accounts(db, payload.account_ids)
         return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+    @router.get("/codex-rs/options")
+    async def codex_rs_options(_: dict = Depends(require_admin), db: AsyncSession = Depends(get_db)):
+        from app.application.codex_publish import options
+        return JSONResponse(await options(db), headers={"Cache-Control": "no-store"})
+
+    @router.post("/codex-rs/status/refresh")
+    async def codex_rs_health_refresh(_: dict = Depends(require_admin), db: AsyncSession = Depends(get_db)):
+        from app.application import codex_status
+        result = await codex_status.refresh(db)
+        return {"ok": result.get("ok", False), "checked_at": result.get("checked_at"), "message": result.get("error")}
+
+    @router.post("/accounts/{account_id}/codex-rs/reauth", status_code=202)
+    async def codex_rs_account_reauth(account_id: int, _: dict = Depends(require_admin), db: AsyncSession = Depends(get_db)):
+        from app.application import codex_reauth
+        result = await codex_reauth.start(db, account_id)
+        if not result.get("ok"):
+            raise HTTPException(status_code=409, detail=_error_detail(result, "无法启动 rs 重授权"))
+        return result
+
+    @router.get("/codex-rs/refill")
+    async def codex_rs_refill_status(_: dict = Depends(require_admin), db: AsyncSession = Depends(get_db)):
+        from app.application import codex_refill
+        return JSONResponse(await codex_refill.status(db), headers={"Cache-Control": "no-store"})
+
+    @router.post("/codex-rs/refill/resume")
+    async def codex_rs_refill_resume(_: dict = Depends(require_admin), db: AsyncSession = Depends(get_db)):
+        from app.application import codex_refill
+        return JSONResponse(await codex_refill.resume(db), headers={"Cache-Control": "no-store"})
 
     @router.post("/accounts/codex/export")
     async def export_codex_accounts(
@@ -111,6 +139,11 @@ def build_api_router(get_db) -> APIRouter:
     async def workspaces(_: dict = Depends(require_admin), db: AsyncSession = Depends(get_db)) -> dict:
         return await console_query.workspaces(db)
 
+    @router.get("/workspaces/{workspace_id}/revenue")
+    async def workspace_revenue(workspace_id: int, _: dict = Depends(require_admin), db: AsyncSession = Depends(get_db)) -> dict:
+        from app.application.revenue_ledger import revenue_ledger
+        totals = await revenue_ledger.totals(db)
+        return {"items": await revenue_ledger.entries(db, workspace_id), "settled": totals["by_workspace"].get(workspace_id, "0")}
     @router.post("/workspaces/oauth/start")
     async def start_workspace_oauth_route(
         payload: StartWorkspaceOAuthRequest,
@@ -180,6 +213,7 @@ def build_api_router(get_db) -> APIRouter:
             skip_invite=payload.skip_invite,
             role=payload.role,
             seat_intent=payload.seat_intent,
+            background=True,
         )
         if result.get("error_code") == "not_found":
             raise HTTPException(status_code=404, detail=result.get("error") or "not found")
@@ -203,10 +237,31 @@ def build_api_router(get_db) -> APIRouter:
             role=body.role,
             seat_intent=body.seat_intent,
             phone_line=body.phone_line,
+            background=True,
         )
         if result.get("error_code") == "not_found":
             raise HTTPException(status_code=404, detail=result.get("error") or "not found")
         return _accepted(result)
+
+    @router.post("/workspaces/{workspace_id}/rotate/preview")
+    async def preview_rotation(
+        workspace_id: int, payload: RotateRequest,
+        _: dict = Depends(require_admin), db: AsyncSession = Depends(get_db),
+    ) -> dict:
+        from app.application import manual_rotation
+        workspace = await db.get(Workspace, workspace_id)
+        if workspace is None:
+            raise HTTPException(status_code=404, detail="workspace not found")
+        old, new = payload.email.strip().lower(), payload.replacement_email.strip().lower()
+        blocked = await manual_rotation._local_blocker(db, workspace, old, new)
+        if blocked:
+            return blocked
+        try:
+            context = await manual_rotation.preflight(db, manual_rotation._default_rotate(), workspace_id, old, new)
+        except manual_rotation.RotationBlocked as exc:
+            return {"ok": False, "error_code": exc.code, "error": str(exc)}
+        return {"ok": True, "old_email": old, "replacement_email": new,
+                "role": context["role"], "seat_intent": context["seat_intent"]}
 
     @router.post("/workspaces/{workspace_id}/rotate", status_code=status.HTTP_202_ACCEPTED)
     async def rotate_workspace_member(
@@ -219,16 +274,57 @@ def build_api_router(get_db) -> APIRouter:
             db,
             workspace_id,
             email=payload.email,
-            email_line=payload.email_line,
-            phone_line=payload.phone_line,
-            proxy=payload.proxy,
-            force_refill=payload.force_refill,
-            reason=payload.reason,
-            role=payload.role,
+            replacement_email=payload.replacement_email,
+            confirm_vacancy=payload.confirm_vacancy,
+            background=True,
         )
         if result.get("error_code") == "not_found":
             raise HTTPException(status_code=404, detail=result.get("error") or "not found")
         return _accepted(result)
+
+    @router.post("/operations/{public_id}/continue-rotation", status_code=status.HTTP_202_ACCEPTED)
+    async def continue_rotation(
+        public_id: str,
+        payload: RotationContinueRequest | None = None,
+        _: dict = Depends(require_admin),
+        db: AsyncSession = Depends(get_db),
+    ) -> dict:
+        result = await console_actions.continue_manual_rotation(
+            db, public_id, confirm_vacancy=bool(payload and payload.confirm_vacancy), background=True,
+        )
+        if result.get("error_code") == "not_found":
+            raise HTTPException(status_code=404, detail=result.get("error") or "not found")
+        return _accepted(result)
+
+    @router.get("/operations/{public_id}/resolve-rotation")
+    async def resolve_rotation_check(
+        public_id: str,
+        _: dict = Depends(require_admin),
+        db: AsyncSession = Depends(get_db),
+    ) -> dict:
+        from app.application import manual_rotation
+
+        result = await manual_rotation.resolution_check(db, public_id)
+        if result.get("error_code") == "not_found":
+            raise HTTPException(status_code=404, detail=result.get("error") or "not found")
+        if not result.get("ok"):
+            raise HTTPException(status_code=400, detail=result.get("error") or "resolve check failed")
+        return result
+
+    @router.post("/operations/{public_id}/resolve-rotation")
+    async def resolve_rotation(
+        public_id: str,
+        _: dict = Depends(require_admin),
+        db: AsyncSession = Depends(get_db),
+    ) -> dict:
+        from app.application import manual_rotation
+
+        result = await manual_rotation.resolve_rotation(db, public_id)
+        if result.get("error_code") == "not_found":
+            raise HTTPException(status_code=404, detail=result.get("error") or "not found")
+        if not result.get("ok"):
+            raise HTTPException(status_code=400, detail=result.get("error") or "resolve failed")
+        return result
 
     @router.post("/workspaces/{workspace_id}/kick", status_code=status.HTTP_202_ACCEPTED)
     async def kick_workspace_member(
@@ -244,6 +340,7 @@ def build_api_router(get_db) -> APIRouter:
             user_id=payload.user_id,
             reason=payload.reason,
             unbind_sub2api=payload.unbind_sub2api,
+            background=True,
         )
         if result.get("error_code") == "not_found":
             raise HTTPException(status_code=404, detail=result.get("error") or "not found")
@@ -292,6 +389,31 @@ def build_api_router(get_db) -> APIRouter:
         if not result["ok"]:
             raise HTTPException(status_code=404, detail=result["error"])
         return result
+
+    @router.patch("/workspaces/{workspace_id}/purchase")
+    async def patch_workspace_purchase(
+        workspace_id: int,
+        payload: WorkspacePurchasePatch,
+        _: dict = Depends(require_admin),
+        db: AsyncSession = Depends(get_db),
+    ) -> dict:
+        result = await update_workspace_purchase(db, workspace_id, payload.changed_fields())
+        if not result["ok"]:
+            code = 404 if result["error_code"] == "not_found" else 422
+            raise HTTPException(status_code=code, detail=result["error"])
+        return result
+
+    @router.post("/workspaces/{workspace_id}/purchase/totp")
+    async def reveal_workspace_owner_totp(
+        workspace_id: int,
+        _: dict = Depends(require_admin),
+        db: AsyncSession = Depends(get_db),
+    ) -> JSONResponse:
+        # POST + no-store: the secret must not sit in browser cache or access-log query strings.
+        result = await reveal_owner_totp(db, workspace_id)
+        if not result["ok"]:
+            raise HTTPException(status_code=404, detail=result["error"])
+        return JSONResponse({"secret": result["secret"]}, headers={"Cache-Control": "no-store"})
 
     @router.post("/workspaces/{workspace_id}/switch-count/increment")
     async def increment_workspace_switch_count_route(
@@ -679,11 +801,17 @@ def build_api_router(get_db) -> APIRouter:
         _: dict = Depends(require_admin),
         db: AsyncSession = Depends(get_db),
     ) -> dict:
+        from app.application.settings import load_auth_push_target
+        push_target = await load_auth_push_target(db)
         result = await console_actions.account_reauth_complete(
             db,
             account_id,
             ticket=payload.ticket,
             callback_url=payload.callback_url,
+            workspace_id=payload.workspace_id,
+            push_sub2api=payload.push_sub2api,
+            count_switch=payload.count_switch,
+            push_target=push_target,
         )
         if result.get("error_code") in {"not_found", "account_not_found"}:
             raise HTTPException(status_code=404, detail=_error_detail(result, "account not found"))
@@ -1161,13 +1289,46 @@ def build_api_router(get_db) -> APIRouter:
         sub2api = await probe_sub2api(db, body) if target in {"all", "sub2api"} else empty
         hme = await probe_hme(db, body) if target in {"all", "hme"} else empty
         mail = await probe_mail(db, body) if target in {"all", "mail"} else empty
-        checked = [item for item in (sub2api, hme, mail) if not item.get("skipped")]
+        if target in {"all", "codex_rs"}:
+            from app.application.codex_publish import probe as probe_codex_rs
+            codex_rs = await probe_codex_rs(db, body)
+        else:
+            codex_rs = empty
+        checked = [item for item in (sub2api, hme, mail, codex_rs) if not item.get("skipped")]
         return {
             "ok": all(bool(item.get("ok")) for item in checked) if checked else False,
             "target": target,
             "sub2api": sub2api,
             "hme": hme,
             "mail": mail,
+            "codex_rs": codex_rs,
         }
+
+    @router.get("/runner/selfcheck")
+    async def runner_selfcheck_view(_: dict = Depends(require_admin), db: AsyncSession = Depends(get_db)):
+        return JSONResponse(await console_actions.runner_selfcheck_overview(db), headers={"Cache-Control": "no-store"})
+
+    @router.post("/runner/selfcheck", status_code=status.HTTP_202_ACCEPTED)
+    async def runner_selfcheck_start(
+        payload: RunnerSelfcheckRequest,
+        _: dict = Depends(require_admin),
+        db: AsyncSession = Depends(get_db),
+    ) -> dict:
+        result = await console_actions.start_runner_selfcheck(
+            db, platform=payload.platform, workspace_id=payload.workspace_id, background=True,
+        )
+        if not result.get("ok") and not result.get("accepted"):
+            code = status.HTTP_404_NOT_FOUND if result.get("error_code") == "not_found" else status.HTTP_409_CONFLICT
+            raise HTTPException(status_code=code, detail=_error_detail(result, "自检没有启动"))
+        return _accepted(result)
+
+    @router.get("/runner/selfcheck/{public_id}/screenshots/{name}")
+    async def runner_selfcheck_screenshot(public_id: str, name: str, _: dict = Depends(require_admin)):
+        path = console_actions.selfcheck_screenshot_path(public_id, name)
+        if path is None:
+            raise HTTPException(status_code=404, detail="not found")
+        return FileResponse(path, media_type="image/png", headers={
+            "Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff",
+        })
 
     return router
