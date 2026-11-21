@@ -75,7 +75,7 @@ class ProxyProbeServiceTests(unittest.IsolatedAsyncioTestCase):
             "password": "secret-pass",
             "url": "socks5://private-user:secret-pass@proxy.example:1080",
         }
-        with patch(
+        with patch("app.application.sub2api_proxy_catalog.sub2api_client.load_config", new=AsyncMock(return_value={"configured": True})), patch(
             "app.application.sub2api_proxy_catalog.sub2api_client.list_proxies",
             new=AsyncMock(return_value=[remote]),
         ):
@@ -94,7 +94,7 @@ class ProxyProbeServiceTests(unittest.IsolatedAsyncioTestCase):
             {"id": 1, "name": "Los Angeles", "protocol": "http", "host": "one.example", "port": 80},
             {"id": 2, "name": "Tokyo", "protocol": "socks5", "host": "two.example", "port": 1080},
         ]
-        with patch(
+        with patch("app.application.sub2api_proxy_catalog.sub2api_client.load_config", new=AsyncMock(return_value={"configured": True})), patch(
             "app.application.sub2api_proxy_catalog.sub2api_client.list_proxies",
             new=AsyncMock(return_value=remotes),
         ):
@@ -102,6 +102,14 @@ class ProxyProbeServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([item["id"] for item in payload["items"]], [2])
         self.assertTrue(payload["complete"])
         self.assertIsNone(payload["next_cursor"])
+
+    async def test_unconfigured_catalog_returns_an_empty_choice_without_remote_requests(self):
+        with patch("app.application.sub2api_proxy_catalog.sub2api_client.load_config", new=AsyncMock(return_value={"configured": False})), \
+                patch("app.application.sub2api_proxy_catalog.sub2api_client.list_proxies", new=AsyncMock()) as remote:
+            result = await sub2api_proxy_catalog.list(self.session)
+        self.assertEqual(result["items"], [])
+        self.assertFalse(result["configured"])
+        remote.assert_not_awaited()
 
     def test_runtime_url_encodes_remote_credentials(self):
         url = _runtime_url({
@@ -139,6 +147,7 @@ class ProxyProbeApiTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, make_client(Path(tmp)) as client:
             client.post("/auth/login", json={"username": "hixz12", "password": "test-password"})
             with (
+                patch("app.application.sub2api_proxy_catalog.sub2api_client.load_config", new=AsyncMock(return_value={"configured": True})),
                 patch(
                     "app.application.sub2api_proxy_catalog.sub2api_client.list_proxies",
                     new=AsyncMock(return_value=[remote]),

@@ -69,7 +69,8 @@ function browser(snapshot = {}) {
   const message = (type, detail = {}, event = {}) => listeners.get('message')({source: parent,
     origin: scope.location.origin, data: {channel: 'team48-auth-bridge', type, ...detail}, ...event});
   const ready = async () => { await scope.fetch('/api/system/config'); await tick(); };
-  return {scope, calls, messages, databases, channels, local, input, message, ready};
+  const authorization = id => listeners.get('team48:authorization-complete')({detail: {id}});
+  return {scope, calls, messages, databases, channels, local, input, message, ready, authorization};
 }
 
 test('routes only same-origin native API requests to the embedded gateway', async () => {
@@ -206,4 +207,27 @@ test('explicit backup export distinguishes confirmed keys from pending candidate
   assert.equal(result.backups[1].verification, 'official_activated');
   assert.equal(JSON.stringify(result).includes('private-password'), false);
   assert.equal(JSON.stringify(result).includes('OLDKEYVALUEABCDE'), false);
+});
+
+test('automatic save exports only a newly completed account after parent opt-in, without login secrets', async () => {
+  const b = browser({state: {browserAccounts: [
+    {id: 'fresh', email: 'fresh@example.test', openai_access_token: 'fresh-at', openai_rt: 'fresh-rt',
+      openai_password: 'never-auto-export-password', two_factor_secret: 'NEVEREXPORT2FA'},
+    {id: 'old', email: 'old@example.test', openai_access_token: 'old-at', openai_rt: 'old-rt'},
+  ]}});
+  await b.ready();
+  await b.authorization('fresh');
+  assert.equal(b.messages.filter(item => item.data.type === 'authorization-complete').length, 0);
+  b.message('auto-save', {enabled: true});
+  await b.authorization('fresh');
+  const saved = b.messages.find(item => item.data.type === 'authorization-complete').data;
+  assert.equal(saved.accounts.length, 1);
+  assert.equal(saved.accounts[0].email, 'fresh@example.test');
+  assert.equal(saved.accounts[0].refresh_token, 'fresh-rt');
+  assert.equal(JSON.stringify(saved).includes('never-auto-export-password'), false);
+  assert.equal(JSON.stringify(saved).includes('NEVEREXPORT2FA'), false);
+  assert.equal(JSON.stringify(saved).includes('old-rt'), false);
+  b.message('auto-save', {enabled: false});
+  await b.authorization('fresh');
+  assert.equal(b.messages.filter(item => item.data.type === 'authorization-complete').length, 1);
 });

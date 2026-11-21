@@ -99,6 +99,8 @@
 .protocol-label, .protocol-progress { display: grid; gap: var(--space-sm); }
 .protocol-label, .protocol-progress h3 { margin: 0; color: var(--text); font-size: var(--text-heading); font-weight: 600; }
 .protocol-label textarea { display: block; width: 100%; min-width: 0; resize: vertical; font-family: var(--font-mono); font-weight: 400; }
+.protocol-pane .assisted-field { display: grid; gap: var(--space-xs); min-width: 0; font-size: var(--text-body); }
+.protocol-pane select { width: 100%; min-width: 0; }
 .protocol-pane form > button, .protocol-progress > button { justify-self: start; }
 .protocol-progress { padding-block: var(--space-md); border-block: 1px solid var(--border); }
 .protocol-progress .assisted-link { margin-left: 0; }

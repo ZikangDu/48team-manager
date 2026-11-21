@@ -40,6 +40,7 @@ from app.persistence.models.operations import OperationStep
 from app.persistence.models.resources import HmeAliasLease, ProxyProfile
 
 SAFE_RETRY_TYPES = {
+    "authorization_followup",
     "quota_probe",
     "auth_probe",
     "proxy_check",
@@ -102,7 +103,8 @@ async def get_operation_detail(db: AsyncSession, public_id: str) -> dict[str, An
         if row.cancel_requested
         else ("" if payload["can_cancel"] else f"state={row.state} is not cancellable")
     )
-    payload["can_retry"] = row.state in {"failed", "cancelled"} and row.op_type in SAFE_RETRY_TYPES
+    retry_states = {"failed", "cancelled", "partial", "manual_required"} if row.op_type == "authorization_followup" else {"failed", "cancelled"}
+    payload["can_retry"] = row.state in retry_states and row.op_type in SAFE_RETRY_TYPES
     from app.application.manual_rotation import can_continue
 
     payload["can_continue_rotation"] = can_continue(row)
@@ -154,7 +156,8 @@ async def retry_operation(db: AsyncSession, public_id: str) -> dict[str, Any]:
             "error_code": "retry_forbidden",
             "operation_id": row.public_id,
         }
-    if row.op_type not in SAFE_RETRY_TYPES or row.state not in {"failed", "cancelled"}:
+    retry_states = {"failed", "cancelled", "partial", "manual_required"} if row.op_type == "authorization_followup" else {"failed", "cancelled"}
+    if row.op_type not in SAFE_RETRY_TYPES or row.state not in retry_states:
         return {
             "ok": False,
             "error": f"type={row.op_type} state={row.state} is not retryable",
@@ -169,6 +172,10 @@ async def retry_operation(db: AsyncSession, public_id: str) -> dict[str, Any]:
 
 async def _dispatch_retry(db: AsyncSession, row) -> dict[str, Any]:
     op_type = row.op_type
+    if op_type == "authorization_followup" and row.account_id:
+        from app.application.authorization_followup import enqueue
+        result = await enqueue(db, row.account_id, force=True)
+        return {"ok": bool(result.get("operation_id")), "message": "已重新安排身份识别和额度检查。", **result}
     if op_type == "workspace_sync" and row.workspace_id:
         from app.application.jobs.workspace_sync import enqueue_workspace_sync
 

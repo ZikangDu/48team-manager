@@ -6,12 +6,15 @@
   <div class="bridge-shell-toolbar">
     <span id="bridge-kernel-status" role="status">正在连接授权内核…</span>
     <div class="bridge-shell-actions">
+      <label class="bridge-auto-save"><input type="checkbox" id="bridge-auto-save" checked>授权成功后自动保存到 Team48</label>
       <button type="button" class="button" id="bridge-import" disabled>选择 Team48 账号</button>
       <button type="button" class="button" id="bridge-save" disabled>保存结果到 Team48</button>
       <a class="button ghost" href="/tools/auth-bridge?view=compact">快速检查</a>
     </div>
   </div>
   <p id="bridge-feedback" class="bridge-shell-feedback" role="status" hidden></p>
+  <p id="bridge-auto-save-status" class="bridge-shell-feedback" role="status" hidden></p>
+  <button type="button" class="button" id="bridge-auto-save-retry" hidden>重试自动保存</button>
   <div id="bridge-loading" class="bridge-shell-loading" role="status">正在加载工作台…</div>
   <div id="bridge-unavailable" class="bridge-shell-feedback" role="alert" hidden>
     <p>工作台连接中断，请重新连接。</p><button type="button" class="button" id="bridge-reconnect">重新连接</button>

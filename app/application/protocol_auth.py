@@ -22,6 +22,7 @@ from app.application.jobs.commands import command_runner
 from app.application.operations import operation_store
 from app.application.refresh_ownership import refresh_owner_kind
 from app.application.tokens import decrypt_secret
+from app.application.managed_auth import AuthRouteError, resolve_auth_route
 from app.core.config import load_settings
 from app.core.proxy import normalize_proxy_url
 from app.domain.automation import ACTIVE_STATES
@@ -164,7 +165,8 @@ def _split_line(line: str) -> tuple[str, str, str] | None:
 
 # ---------------------------------------------------------------- batch login
 
-async def start_batch_login(db, *, text, proxy=None, concurrency=None):
+async def start_batch_login(db, *, text, proxy=None, concurrency=None, proxy_mode="auto", workspace_id=None,
+                            proxy_profile_id=None):
     accounts = parse_account_lines(text)
     if not command_runner.ready:
         raise ProtocolAuthError("runner_unavailable", "后台执行器尚未就绪，请稍后重试", 503)
@@ -174,7 +176,16 @@ async def start_batch_login(db, *, text, proxy=None, concurrency=None):
     except BridgeError as exc:
         raise ProtocolAuthError(exc.code, MESSAGES.get(exc.code, exc.message), exc.status_code) from None
     settings = load_settings()
-    use_proxy = _default_proxy() if proxy is None else (normalize_proxy_url(proxy) or "")
+    # Keep legacy callers with an explicit URL compatible, while the UI defaults
+    # to resolving each account's own / mother-account exit independently.
+    if proxy is not None and proxy_mode == "auto":
+        proxy_mode = "custom" if proxy else "direct"
+    for item in accounts:
+        try:
+            item["route"] = await resolve_auth_route(db, item["email"], mode=proxy_mode, workspace_id=workspace_id,
+                                                      proxy=proxy, profile_id=proxy_profile_id)
+        except AuthRouteError as exc:
+            item["route_error"] = {"code": exc.code, "message": exc.message}
     limit = int(concurrency or settings.auth_bridge_concurrency or 5)
     limit = max(1, min(10, limit))
     operation = await operation_store.create(db, op_type=LOGIN_OP, source="manual",
@@ -183,7 +194,7 @@ async def start_batch_login(db, *, text, proxy=None, concurrency=None):
     await operation_store.note(db, operation, "protocol_login", f"协议批量登录：{len(accounts)} 个账号，并发 {limit}")
     await db.commit()
     payload = [dict(item) for item in accounts]
-    command_runner.spawn(public_id, lambda session: _run_batch(session, public_id, payload, use_proxy, limit))
+    command_runner.spawn(public_id, lambda session: _run_batch(session, public_id, payload, "", limit))
     return {"ok": True, "operation_id": public_id, "status": "running", "count": len(accounts), "concurrency": limit,
             "message": f"已开始协议登录 {len(accounts)} 个账号"}
 
@@ -191,22 +202,35 @@ async def start_batch_login(db, *, text, proxy=None, concurrency=None):
 async def _run_batch(db, public_id, accounts, proxy, concurrency):
     try:
         client = _bridge()
-        wire = [{"id": f"a{index}", "email": item["email"], "openai_password": item["password"],
-                 "two_factor_secret": item["totp"]} for index, item in enumerate(accounts)]
-        try:
-            rows = await client.login_batch(wire, proxy=proxy, concurrency=concurrency, workspace_mode="all")
-        finally:
-            for item in wire:
-                item.clear()
+        groups, rows, routes = {}, [], {}
+        for index, item in enumerate(accounts):
+            if item.get("route_error"):
+                rows.append({"email": item["email"], "ok": False, **item["route_error"]})
+                continue
+            route = item.get("route")
+            routes[item["email"]] = route
+            groups.setdefault(route.proxy if route else proxy, []).append({"id": f"a{index}", "email": item["email"],
+                "openai_password": item["password"], "two_factor_secret": item["totp"]})
+        for exit_url, wire in groups.items():
+            try:
+                rows.extend(await client.login_batch(wire, proxy=exit_url, concurrency=concurrency, workspace_mode="all"))
+            except BridgeError as exc:
+                rows.extend({"email": item["email"], "ok": False, "code": exc.code} for item in wire)
+            finally:
+                for item in wire:
+                    item.clear()
         results = []
         imported = 0
         operation = await operation_store.get_by_public_id(db, public_id)
         for row in rows:
             email = row["email"]
             entry = {"email": email, "login": "ok" if row["ok"] else "failed", "code": row["code"]}
+            if row.get("message"):
+                entry["message"] = row["message"]
             if row["ok"] and row.get("account"):
                 try:
-                    entry["import"] = await _import_account(db, email, row["account"], operation=operation)
+                    entry["import"] = await _import_account(db, email, row["account"], operation=operation,
+                                                           auth_route=routes.get(email))
                     if entry["import"] == "imported":
                         imported += 1
                 except CredentialImportError as exc:
@@ -226,10 +250,13 @@ async def _run_batch(db, public_id, accounts, proxy, concurrency):
     except Exception:
         return {"success": False, "status": "failed", "error_code": "protocol_login_failed",
                 "error": "协议批量登录未完成，请核对授权桥与任务记录"}
+    finally:
+        for item in accounts:
+            item.clear()
 
 
-async def _import_account(db, email: str, account: dict, *, operation: Operation | None = None) -> str:
-    """Import one account's personal credential; skip accounts owned by a remote refresher."""
+async def _import_account(db, email: str, account: dict, *, operation: Operation | None = None, auth_route=None) -> str:
+    """Prefer the managed workspace credential, retaining remote refresh ownership."""
     existing = await db.scalar(select(Account).where(func.lower(Account.email) == email))
     if existing is not None and await refresh_owner_kind(db, existing.id) is not None:
         return "skipped_remote_owned"
@@ -238,12 +265,19 @@ async def _import_account(db, email: str, account: dict, *, operation: Operation
                      ("openai_id_token", "id_token"), ("openai_account_id", "account_id")):
         if account.get(src):
             content[dst] = account[src]
-    if not content.get("access_token"):
+    desired = existing.official_account_id if existing else None
+    if not desired and auth_route and auth_route.workspace_id:
+        team = await db.get(Workspace, auth_route.workspace_id)
+        desired = team.official_workspace_id if team else None
+    workspaces = account.get("business_workspace_credentials") or []
+    matching = [item for item in workspaces if desired and desired in {item.get("workspaceId"), item.get("accountId")}]
+    if matching or not content.get("access_token"):
         # No personal credential; fall back to the first business workspace.
-        workspaces = account.get("business_workspace_credentials") or []
         if not workspaces:
             return "no_credential"
-        first = workspaces[0]
+        if not matching and len(workspaces) > 1:
+            return "workspace_selection_required"
+        first = matching[0] if matching else workspaces[0]
         content.update(access_token=first.get("accessToken"), refresh_token=first.get("refreshToken"),
                        id_token=first.get("idToken"), account_id=first.get("accountId"))
     if operation is not None and operation.state in ACTIVE_STATES and operation.current_step != "import":
@@ -259,7 +293,8 @@ async def _import_account(db, email: str, account: dict, *, operation: Operation
             except CredentialImportError:
                 pass
         return "conflict"
-    saved = await credential_import.commit_import(db, preview["draft_id"], [candidates[0]["id"]], verify_quota=False)
+    saved = await credential_import.commit_import(db, preview["draft_id"], [candidates[0]["id"]], verify_quota=False,
+                                                  auth_route=auth_route, manage_after_import=True)
     return "imported" if saved.get("imported") else "conflict"
 
 

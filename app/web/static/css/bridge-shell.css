@@ -4,6 +4,9 @@
 .bridge-shell-toolbar { justify-content: space-between; margin-bottom: var(--space-sm); }
 #bridge-kernel-status { color: var(--muted); font-size: var(--text-meta); }
 .bridge-shell-feedback { margin-block: var(--space-sm); overflow-wrap: anywhere; }
+.bridge-auto-save { display: flex; align-items: center; gap: var(--space-xs); font-size: var(--text-body); cursor: pointer; }
+.bridge-auto-save input { flex: 0 0 auto; }
+#bridge-auto-save-status[data-tone="danger"] { color: var(--danger-text); }
 .bridge-shell-feedback[data-tone="danger"], #bridge-exchange-error { color: var(--danger-text); }
 .bridge-shell-loading { padding-block: var(--space-lg); color: var(--muted); }
 #bridge-frame { display: block; width: 100%; min-height: 80vh; border: 0; background: var(--bg); }

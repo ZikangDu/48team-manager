@@ -188,7 +188,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         response = await call_next(request)
         if any(request.url.path == prefix or request.url.path.startswith(prefix + "/")
                for prefix in ("/api/credential-import", "/api/assisted-login", "/api/protocol-auth", "/api/bridge-workbench", "/auth-bridge")):
-            response.headers["Cache-Control"] = "no-store"
+            response.headers["Cache-Control"] = (
+                "no-store, no-transform" if "text/event-stream" in response.headers.get("content-type", "")
+                else "no-store"
+            )
             response.headers["Pragma"] = "no-cache"
         return response
 

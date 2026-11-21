@@ -8,6 +8,7 @@ import os
 import tempfile
 from pathlib import Path
 from urllib.parse import urlsplit
+from unittest.mock import patch
 
 from playwright.sync_api import expect, sync_playwright
 
@@ -29,7 +30,8 @@ def stream(events):
 
 
 def main():
-    with tempfile.TemporaryDirectory() as temp, make_client(Path(temp), _env_file=None) as client, sync_playwright() as pw:
+    with patch("app.application.jobs.scheduler.start_scheduler"), patch("app.application.jobs.scheduler.stop_scheduler"), \
+            tempfile.TemporaryDirectory() as temp, make_client(Path(temp), _env_file=None) as client, sync_playwright() as pw:
         assert client.post("/auth/login", json={"username": "hixz12", "password": "test-password"}).is_success
         browser = pw.chromium.launch(channel=os.getenv("TEAM48_CHROMIUM_CHANNEL", "chrome"), headless=True)
         context = browser.new_context(viewport={"width": 1280, "height": 900}, reduced_motion="reduce")
@@ -39,6 +41,7 @@ def main():
         calls = []
         reset_actions = []
         saved_backups = []
+        auto_saved = []
         records = []
         activation_attempted = False
         validation_blocked = False
@@ -144,6 +147,17 @@ def main():
                 assert request.post_data_json == {"account_ids": [7], "confirm": True}
                 return route.fulfill(json={"ok": True, "accounts": [{"email": EMAILS[0], "accessToken": token(email=EMAILS[0]),
                     "user": {"email": EMAILS[0], "id": "fixture-user"}, "account": {"id": WS, "planType": "team"}}]})
+            if path == "/api/bridge-workbench/authorizations/auto-save":
+                credentials = request.post_data_json["accounts"]
+                assert "fixture-password" not in json.dumps(credentials)
+                assert OLD_KEY not in json.dumps(credentials)
+                auto_saved.extend(row["email"] for row in credentials)
+                return route.fulfill(json={"ok": True, "saved": 1, "blocked": 0,
+                    "results": [{"email": row["email"], "status": "saved", "account_id": EMAILS.index(row["email"]) + 10,
+                        "followup": {"operation_id": "fixture-check", "queued": True}} for row in credentials]})
+            if path.startswith("/api/bridge-workbench/authorizations/") and path.endswith("/status"):
+                return route.fulfill(json={"ok": True, "done": True, "role": "owner", "quota": "ready", "sync": "success",
+                    "message": "已识别母号；额度刷新完成；成员同步完成"})
             if path == "/api/credential-import/preview":
                 assert request.post_data_json["content"]["accounts"]
                 return route.fulfill(json={"ok": True, "draft_id": "fixture-draft", "candidates": [{"id": "fixture-candidate",
@@ -182,6 +196,16 @@ def main():
         bridge.locator("#login-accounts").fill("\n".join(email + "----fixture-password----" + OLD_KEY for email in EMAILS))
         bridge.locator("#start-protocol-login").click()
         expect(bridge.locator("#login-status")).to_contain_text("全部流程完成：成功 3")
+        expect(page.locator("#bridge-auto-save-status")).to_contain_text("本页已保存 3 个账号")
+        expect(page.locator("#bridge-auto-save-status")).to_contain_text("额度刷新完成")
+        if os.getenv("TEAM48_SCREENSHOTS"):
+            for width, theme in [(1280, "light"), (390, "dark")]:
+                page.set_viewport_size({"width": width, "height": 900})
+                page.get_by_label("外观模式").select_option(theme)
+                page.evaluate("window.scrollTo(0, 0)")
+                page.screenshot(path=str(Path(os.environ["TEAM48_SCREENSHOTS"]) / f"followup-success-{width}-{theme}.png"))
+            page.set_viewport_size({"width": 1280, "height": 900})
+        assert sorted(set(auto_saved)) == sorted(EMAILS)
         expect(bridge.get_by_role("link", name="打开账号与团队")).to_have_count(0)
         expect(bridge.locator("#export-login-sessions")).to_be_enabled()
         expect(bridge.locator("#export-login-business")).to_be_enabled()
@@ -231,6 +255,9 @@ def main():
             expect(bridge.locator("html")).to_have_attribute("data-theme", theme)
             assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
             assert page.frame(url=BASE + "/auth-bridge/").evaluate("document.documentElement.scrollWidth <= innerWidth")
+            screenshot_dir = os.getenv("TEAM48_SCREENSHOTS")
+            if screenshot_dir:
+                page.screenshot(path=str(Path(screenshot_dir) / f"workbench-{width}-{theme}.png"), full_page=False)
         assert not errors, errors
         assert all(path.startswith("api/") for path in calls)
         context.close()

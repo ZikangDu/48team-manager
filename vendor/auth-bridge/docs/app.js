@@ -3822,6 +3822,11 @@ import { OPERATION_SCHEMA_VERSION, validatePushResults, validateOperationEvent }
           if (record && data.terminalReason) record.terminalReason = data.terminalReason;
           if (record && data.error) record.error = sanitizeLoginLog(data.error);
           if (data.ok) {
+            if (document.documentElement.dataset.team48Embedded === "true") {
+              window.dispatchEvent(new CustomEvent("team48:authorization-complete", {
+                detail: {id: String(data.id || data.accountId || "")},
+              }));
+            }
             const doneText = workspaceMode === "session"
               ? "协议登录完成，Session 已就绪"
               : `RT 已就绪：个人 ${data.personalOk ? 1 : 0} 个，工作区 ${data.businessSuccess || 0} 个`;

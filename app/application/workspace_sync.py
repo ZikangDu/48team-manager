@@ -6,7 +6,7 @@ import logging
 
 from typing import Any
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.application.operations import operation_store
@@ -369,6 +369,10 @@ class WorkspaceSyncService:
                 membership.removed_at = None
 
         await db.flush()
+        from app.application.managed_auth import match_account_memberships
+        auto_matched = 0
+        for account in await db.scalars(select(Account).where(func.lower(Account.email).in_(remote_rows))):
+            auto_matched += await match_account_memberships(db, account, workspace_id=workspace.id)
         reconciliation = self._reconciliation(
             workspace=workspace,
             owner=owner,
@@ -432,6 +436,7 @@ class WorkspaceSyncService:
             "invited": invited,
             "managed": reconciliation["managed"],
             "matched": reconciliation["matched"],
+            "auto_matched": auto_matched,
             "remote_only": reconciliation["remote_only"],
             "local_only": reconciliation["local_only"],
             "seat_limit": workspace.seat_limit,

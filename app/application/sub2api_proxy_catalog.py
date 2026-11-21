@@ -69,7 +69,11 @@ class Sub2ApiProxyCatalog:
         cursor: int = 0,
         limit: int = 100,
     ) -> dict[str, Any]:
-        remotes = await sub2api_client.list_proxies(db)
+        cfg = await sub2api_client.load_config(db)
+        if not cfg.get("configured"):
+            return {"items": [], "next_cursor": None, "source": "sub2api", "configured": False,
+                    "complete": True, "total_loaded": 0}
+        remotes = await sub2api_client.list_proxies(db, cfg)
         items = [item for remote in remotes if (item := self.serialize(remote)) is not None]
         query = str(q or "").strip().casefold()
         if query:

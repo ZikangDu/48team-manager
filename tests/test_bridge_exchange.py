@@ -141,6 +141,42 @@ class BridgeExchangeTests(unittest.TestCase):
         self.assertEqual(record["refresh_token"], "fixture-refresh")
         self.assertEqual(record["account"]["planType"], "team")
 
+    def test_auto_save_requires_admin_and_same_origin_and_returns_no_secrets(self):
+        path = "/api/bridge-workbench/authorizations/auto-save"
+        body = {"accounts": [{"email": "new@example.test", "access_token": token(email="new@example.test"),
+                              "refresh_token": "fixture-auto-refresh"}]}
+        self.assertEqual(self.client.post(path, json=body).status_code, 401)
+        self.login()
+        self.assertEqual(self.client.post(path, json=body, headers={"origin": "https://other.test"}).status_code, 403)
+        response = self.client.post(path, json=body)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["saved"], 1)
+        self.assertNotIn("fixture-auto-refresh", response.text)
+        self.assertNotIn(body["accounts"][0]["access_token"], response.text)
+        self.private(response)
+        repeated = self.client.post(path, json=body)
+        self.assertEqual(repeated.json()["results"][0]["status"], "unchanged")
+
+    def test_proxy_options_are_private_and_never_return_proxy_credentials(self):
+        path = "/api/protocol-auth/options"
+        self.assertEqual(self.client.get(path).status_code, 401)
+        self.login()
+        response = self.client.get(path)
+        self.assertEqual(response.status_code, 200)
+        self.private(response)
+        self.assertNotIn("fixture-proxy-secret", response.text)
+
+    def test_authorization_progress_is_private_admin_only_and_local(self):
+        path = f"/api/bridge-workbench/authorizations/{self.selected}/status"
+        self.assertEqual(self.client.get(path).status_code, 401)
+        self.login()
+        response = self.client.get(path)
+        self.assertEqual(response.status_code, 200)
+        self.private(response)
+        self.assertNotIn(self.access, response.text)
+        self.assertNotIn("fixture-refresh", response.text)
+        self.assertEqual(self.client.get("/api/bridge-workbench/authorizations/999999/status").status_code, 404)
+
 
 if __name__ == "__main__":
     unittest.main()

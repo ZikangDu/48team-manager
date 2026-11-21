@@ -231,7 +231,8 @@ async def _guard(db, candidate: dict, *, ignore_operation_id: int | None = None)
         codex = await db.get(CodexBinding, account.id, populate_existing=True)
         if probe is not None or codex and codex.lease_until and _future(codex.lease_until, stamp):
             raise CredentialImportError("account_busy", "账号有正在执行的凭据或检测任务", 409)
-    clauses = [or_(*matches), Operation.state.in_(("pending", "queued", "running", "waiting"))]
+    clauses = [or_(*matches), Operation.state.in_(("pending", "queued", "running", "waiting")),
+               Operation.op_type != "authorization_followup"]
     if ignore_operation_id is not None:
         clauses.append(Operation.id != ignore_operation_id)
     busy = await db.scalar(select(Operation.id).where(*clauses).limit(1))
@@ -290,7 +291,7 @@ async def preview_import(db, content: str | dict | list, *, expected_email=None,
     return {"ok": True, "draft_id": draft_id, "expires_at": expires, "candidates": public, "errors": errors}
 
 
-async def commit_import(db, draft_id, selected_ids: list[str], *, verify_quota=False) -> dict:
+async def commit_import(db, draft_id, selected_ids: list[str], *, verify_quota=False, auth_route=None, manage_after_import=False) -> dict:
     if type(verify_quota) is not bool:
         raise CredentialImportError("selection_invalid", "额度验证选项无效")
     if not isinstance(selected_ids, list) or not 1 <= len(selected_ids) <= 50 or any(not isinstance(item, str) or len(item) > 100 for item in selected_ids):
@@ -326,6 +327,12 @@ async def commit_import(db, draft_id, selected_ids: list[str], *, verify_quota=F
                 account = Account(email=candidate["email"], local_purpose="standby", operational_state="available", auth_state="unknown")
                 db.add(account)
                 await db.flush()
+            if auth_route is not None:
+                from app.application.managed_auth import apply_auth_route, AuthRouteError
+                try:
+                    await apply_auth_route(db, account, auth_route)
+                except AuthRouteError as exc:
+                    raise CredentialImportError(exc.code, exc.message, 409) from None
             # Replace the bundle as a whole. Never couple a new AT to an old RT,
             # ID token or session, even when the imported field is omitted.
             for field in ("access_token", "refresh_token", "id_token", "session_token"):
@@ -340,6 +347,8 @@ async def commit_import(db, draft_id, selected_ids: list[str], *, verify_quota=F
             # never a synthetic successful official check.
             account.auth_state = "healthy"
             await db.flush()
+            from app.application.managed_auth import match_account_memberships
+            await match_account_memberships(db, account)
             imported.append({"id": account.id, "account_id": account.id, "email": account.email,
                              "workspace_id": candidate["workspace_id"], "action": "created" if created else "updated",
                              "credential_revision": account.credential_revision, "verification": "pending"})
@@ -371,5 +380,15 @@ async def commit_import(db, draft_id, selected_ids: list[str], *, verify_quota=F
             except Exception:
                 await db.rollback()
                 verification.append({"account_id": item["account_id"], "queued": False, "message": "凭据已保存，额度验证未排队，请手动刷新额度"})
-    return {"ok": True, "imported": imported, "count": len(imported), "verification": verification,
+    followups = []
+    if manage_after_import:
+        from app.application.authorization_followup import enqueue
+        for item in imported:
+            try:
+                followups.append(await enqueue(db, item["account_id"]))
+            except Exception:
+                await db.rollback()
+                followups.append({"account_id": item["account_id"], "queued": False,
+                                  "message": "授权已保存，后台检查未排队，请在任务记录核对。"})
+    return {"ok": True, "imported": imported, "count": len(imported), "verification": verification, "followups": followups,
             "message": f"已导入 {len(imported)} 个账号的授权，等待官方验证；未修改团队成员或远端账号"}

@@ -157,7 +157,9 @@ class BridgeLoginClient:
             raise BridgeError("bridge_batch_too_large", f"单次最多 {MAX_BATCH} 个账号")
         body = {"ids": [item["id"] for item in accounts], "workspaceMode": workspace_mode,
                 "requireNonPersonal": False, "stream": False, "concurrency": int(concurrency),
-                "proxyMode": "pool" if proxy else "direct", "proxyPool": proxy,
+                # An explicit empty pool means direct. Bridge's legacy "direct"
+                # mode actually uses its default OPENAI_PROXY_URL when set.
+                "proxyMode": "pool", "proxyPool": proxy,
                 "browserState": {"accounts": [dict(item) for item in accounts]}}
         try:
             return await self._request(LOGIN_PATH, body=body, timeout=LOGIN_TIMEOUT_SECONDS)

@@ -139,6 +139,8 @@ class BridgeClientTests(unittest.IsolatedAsyncioTestCase):
         def handler(request):
             body = json.loads(request.content)
             self.assertEqual(body["workspaceMode"], "all")
+            self.assertEqual(body["proxyMode"], "pool")
+            self.assertEqual(body["proxyPool"], "")
             accounts = [{"id": "a0", "email": "ok@example.com", "openai_access_token": token("ok@example.com"),
                          "openai_rt": "rt-ok", "business_workspace_credentials": []},
                         {"id": "a1", "email": "bad@example.com"}]

@@ -31,6 +31,7 @@ OPERATION_TYPES = (
     "codex_reauth",
     "protocol_login",
     "protocol_reset",
+    "authorization_followup",
 )
 SENSITIVE_INPUT_KEYS = (
     "password",

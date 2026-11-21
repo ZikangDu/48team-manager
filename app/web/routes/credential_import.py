@@ -112,6 +112,7 @@ def build_credential_import_router(get_db) -> APIRouter:
         try:
             return await credential_import.commit_import(
                 db, payload.draft_id, payload.selected_ids, verify_quota=payload.verify_quota,
+                manage_after_import=payload.manage_after_import,
             )
         except credential_import.CredentialImportError as exc:
             _import_error(exc)

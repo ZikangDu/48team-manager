@@ -64,7 +64,7 @@ class EmbedGatewayTests(unittest.TestCase):
         self.assertEqual(self.client.post("/fixture/login").status_code, 200)
 
     def private(self, response):
-        self.assertEqual(response.headers.get("cache-control"), "no-store")
+        self.assertIn("no-store", response.headers.get("cache-control", "").split(", "))
         self.assertEqual(response.headers.get("pragma"), "no-cache")
         self.assertEqual(response.headers.get("referrer-policy"), "no-referrer")
 
@@ -119,6 +119,8 @@ class EmbedGatewayTests(unittest.TestCase):
         self.assertEqual(response.content, b"".join(chunks))
         self.private(response)
         self.assertEqual(response.headers["x-accel-buffering"], "no")
+        self.assertEqual(response.headers["content-encoding"], "identity")
+        self.assertEqual(response.headers["cache-control"], "no-store, no-transform")
         request = self.requests[-1]
         self.assertEqual(str(request.url), "http://127.0.0.1:4174/api/v2/accounts/reset-totp?after=2")
         self.assertEqual(json.loads(request.content), {"ids": [1, 2], "concurrency": 2})

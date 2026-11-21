@@ -681,13 +681,18 @@
       <header>
         <div>
           <strong id="register-title">登记团队</strong>
-          <p class="muted">用母号登录 ChatGPT 授权。团队和令牌从回调里取，不会在 OpenAI 开新团队。</p>
+          <p class="muted">支持账密＋2FA 导入，或手动 OAuth 授权。只登记已有团队，不会在 OpenAI 新建团队。</p>
         </div>
         <button type="button" class="button ghost" data-close-register>关闭</button>
       </header>
       <form id="register-form" class="sheet-body">
         <input type="hidden" name="ticket" value="">
         <div class="sheet-section">
+          <button type="button" class="button" id="register-protocol-import">账密＋2FA 批量导入</button>
+          <p class="hint">自动登录并保存授权，读取官方角色识别母号或子号，刷新额度；确认母号后自动登记团队并同步成员。</p>
+        </div>
+        <div class="sheet-section">
+          <strong>手动 OAuth 授权</strong>
           <label>母号邮箱<input name="email" type="email" autocomplete="off" required></label>
           <label>Sub2API 代理<select name="proxy_remote_id" data-proxy-select><option value="">正在读取代理目录…</option></select></label>
           <p class="hint">代理可选，只保存所选 Sub2API 代理 ID；完整地址和认证信息由服务器解析。</p>

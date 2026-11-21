@@ -34,9 +34,23 @@ def build_protocol_auth_router(get_db) -> APIRouter:
         from app.application.protocol_auth import ProtocolAuthError, start_batch_login
         data = await _payload(request, ProtocolBatchLoginRequest)
         try:
-            return await start_batch_login(db, text=data.text, proxy=data.proxy, concurrency=data.concurrency)
+            return await start_batch_login(db, text=data.text, proxy=data.proxy, concurrency=data.concurrency,
+                proxy_mode=data.proxy_mode, workspace_id=data.workspace_id, proxy_profile_id=data.proxy_profile_id)
         except ProtocolAuthError as exc:
             _raise(exc)
+
+    @router.get("/options")
+    async def options(db: AsyncSession = Depends(get_db)):
+        from sqlalchemy import select
+        from app.persistence.models.identity import Account, Workspace
+        from app.persistence.models.resources import ProxyProfile
+        from app.core.config import load_settings
+        teams = (await db.execute(select(Workspace, Account.email).join(Account,
+            Account.id == Workspace.owner_account_id).where(Workspace.status == "active").order_by(Workspace.id))).all()
+        profiles = await db.scalars(select(ProxyProfile).where(ProxyProfile.status == "active").order_by(ProxyProfile.id))
+        return {"ok": True, "workspaces": [{"id": team.id, "name": team.name or email, "owner_email": email}
+                for team, email in teams], "proxies": [{"id": row.id, "name": row.name or f"{row.host}:{row.port}"}
+                for row in profiles], "default_has_proxy": bool(load_settings().auth_bridge_proxy)}
 
     @router.post("/reset", status_code=202)
     async def reset(request: Request, db: AsyncSession = Depends(get_db)):

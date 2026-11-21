@@ -47,6 +47,7 @@ MEMBERSHIP_STATUS_LABELS = {
 }
 
 OPERATION_TYPE_LABELS = {
+    "authorization_followup": "授权后自动识别与检查",
     "assisted_login": "官方浏览器登录",
     "quota_probe": "额度刷新",
     "auth_probe": "检查授权",
@@ -99,6 +100,8 @@ BUSINESS_STEP_LABELS = {
     "cancelled": "已取消",
     "resolved": "已人工结束",
     "fetch_members": "读取官方成员",
+    "discover_identity": "识别官方母子号角色",
+    "identity_retry": "等待自动重试身份识别",
     "fetch_invites": "读取官方邀请",
     "commit_snapshot": "提交官方快照",
     "sub2api_sync": "对账 Sub2API",

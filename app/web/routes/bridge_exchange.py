@@ -26,9 +26,31 @@ class AccountExportRequest(BaseModel):
         return value
 
 
+class AuthorizationSaveRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    accounts: list[dict] = Field(min_length=1, max_length=50)
+
+
 def build_bridge_exchange_router(get_db):
     router = APIRouter(prefix="/api/bridge-workbench", tags=["bridge-workbench"],
                        dependencies=[Depends(require_admin), Depends(_no_store)])
+
+    @router.post("/authorizations/auto-save")
+    async def auto_save(request: Request, db: AsyncSession = Depends(get_db)):
+        from app.application.bridge_autosave import save_authorizations
+        payload = await _payload(request, AuthorizationSaveRequest)
+        try:
+            return await save_authorizations(db, payload.accounts)
+        except CredentialImportError as exc:
+            raise HTTPException(exc.status_code, detail={"error_code": exc.code, "message": exc.message}) from None
+
+    @router.get("/authorizations/{account_id}/status")
+    async def authorization_status(account_id: int, db: AsyncSession = Depends(get_db)):
+        from app.application.authorization_followup import status
+        value = await status(db, account_id)
+        if value is None:
+            raise HTTPException(404, detail={"error_code": "account_not_found", "message": "账号不存在。"})
+        return value
 
     @router.post("/accounts/export")
     async def export_accounts(request: Request, db: AsyncSession = Depends(get_db)):

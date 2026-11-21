@@ -9,6 +9,7 @@
   const NativeRequest = window.Request;
   const nativeFetch = window.fetch.bind(window);
   let initialized = false;
+  let autoSave = false;
   let lastWrite = Promise.resolve();
   let resolveReady;
   const ready = new Promise(resolve => { resolveReady = resolve; });
@@ -299,9 +300,32 @@
       post("error", {requestId: id, message: "授权工具暂时无法交换数据，请结束当前操作并核对浏览器保存状态后重试。"});
     }
   }
+  window.addEventListener("team48:authorization-complete", async event => {
+    if (!autoSave || window.parent === window) return;
+    const id = event.detail?.id;
+    if (typeof id !== "string" || !id) return;
+    try {
+      const saved = await snapshot();
+      if (!autoSave || window.browserWorkspace.signal?.aborted) return;
+      const account = (saved.state?.browserAccounts || []).find(item => String(item.id) === id);
+      if (!account) return;
+      const {projectLoginAccounts} = await import("/auth-bridge/account-workspace.js");
+      const records = projectLoginAccounts([account]).map(source => credentialOnly(source.value));
+      let session;
+      try { session = typeof account.session_json === "string" ? JSON.parse(account.session_json) : account.session_json; }
+      catch { session = null; }
+      if (session?.accessToken || account.session_access_token) {
+        records.push(credentialOnly({...session, email: account.email, accessToken: session?.accessToken || account.session_access_token}));
+      }
+      if (records.length) post("authorization-complete", {accounts: mergeSessions(records)});
+    } catch {
+      post("auto-save-error", {message: "授权已完成，但无法读取本次结果，请使用手动保存。"});
+    }
+  });
   window.addEventListener("message", event => {
     if (event.source !== window.parent || event.origin !== origin || event.data?.channel !== channel) return;
     const message = event.data;
+    if (message.type === "auto-save") { autoSave = message.enabled === true; return; }
     if (message.type === "theme") { syncTheme(message.theme); return; }
     if (message.type === "select-tool") {
       ready.then(() => {

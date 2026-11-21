@@ -103,6 +103,7 @@
     replenish: "补充团队",
     rotate: "轮转",
     workspace_sync: "同步官方成员",
+    authorization_followup: "授权后自动识别与检查",
     kick_member: "踢出成员",
     purge_child: "永久删除子号",
     revoke_invite: "撤回邀请",
@@ -3535,7 +3536,8 @@ function hmeRow(item) {
     try {
       const payload = await fetchEntity(`proxy-select-${requestId}`, "/api/resources/proxies?limit=200");
       if (select.dataset.proxyRequestId !== requestId) return false;
-      const empty = new Option(select.form?.id === "proxy-edit-form" ? "请选择代理" : "不使用代理", "");
+      const empty = new Option(payload.configured === false ? "未配置 Sub2API，可用协议导入选择代理或直连" :
+        select.form?.id === "proxy-edit-form" ? "请选择代理" : "不使用代理", "");
       const options = (payload.items || []).map((item) => {
         const option = new Option(proxyOptionLabel(item), String(item.id));
         option.disabled = ["disabled", "inactive", "deleted"].includes(String(item.status || "").toLowerCase());

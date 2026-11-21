@@ -125,6 +125,21 @@ class WorkspaceSyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(before, after)
         self.assertEqual(count_before, count_after)
 
+    async def test_sync_links_existing_registered_child_by_email_without_creating_accounts(self):
+        child = Account(email="known@example.com", local_purpose="standby", operational_state="available")
+        self.session.add(child)
+        await self.session.commit()
+        service = WorkspaceSyncService(workspaces=_FakeWorkspaces(members={"success": True, "members": [
+            {"email": "owner@example.com", "role": "account-owner", "id": "u-owner"},
+            {"email": "known@example.com", "role": "standard-user", "id": "u-known"},
+            {"email": "unknown@example.com", "role": "standard-user", "id": "u-unknown"}], "total": 3}))
+        result = await service.sync_workspace(self.session, self.workspace.id)
+        self.assertEqual(result["auto_matched"], 1)
+        self.assertEqual((result["managed"], result["remote_only"], result["created_local_accounts"]), (1, 1, 0))
+        self.assertEqual(child.local_purpose, "child")
+        membership = await self.session.scalar(select(WorkspaceMembership).where(WorkspaceMembership.account_id == child.id))
+        self.assertEqual(membership.membership_state, "joined")
+
     async def test_sync_promotes_local_invited_membership_when_official_has_joined(self):
         child, _ = await upsert_child_account(self.session, email="blimp_digging.1u@icloud.com", status="invited")
         await ensure_membership(

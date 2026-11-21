@@ -27,7 +27,7 @@ services:
       AUTO_REAUTH_ENABLED: "false"
       AUTO_ROTATE_ENABLED: "false"
       FORCE_REFILL: "false"
-      TEAM48_BRIDGE_TURNSTILE_BROWSER_FALLBACK: "false"
+      TEAM48_BRIDGE_TURNSTILE_BROWSER_FALLBACK: "${TEAM48_BRIDGE_TURNSTILE_BROWSER_FALLBACK:-false}"
     volumes:
       - ../data:/app/data
     extra_hosts:

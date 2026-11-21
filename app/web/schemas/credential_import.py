@@ -20,6 +20,7 @@ class CredentialCommitRequest(BaseModel):
     draft_id: str = Field(min_length=1, max_length=128)
     selected_ids: list[str] = Field(min_length=1, max_length=50)
     verify_quota: StrictBool = False
+    manage_after_import: StrictBool = True
 
     @field_validator("selected_ids")
     @classmethod

@@ -221,6 +221,9 @@ def build_bridge_embed_router() -> APIRouter:
             response_headers["Content-Disposition"] = disposition
         if "text/event-stream" in content_type:
             response_headers["X-Accel-Buffering"] = "no"
+            # Preserve SSE transport semantics across application/CDN encoders.
+            response_headers["Content-Encoding"] = "identity"
+            response_headers["Cache-Control"] = "no-store, no-transform"
         if request.method == "HEAD":
             await close_upstream()
             return Response(status_code=upstream.status_code, headers=response_headers)

@@ -503,10 +503,10 @@
 
   const IMPORT_LABELS = {
     imported: "已导入", skipped_remote_owned: "已跳过导入，刷新权在远端", conflict: "导入信息冲突",
-    no_credential: "缺少可导入的授权", failed: "导入失败",
+    no_credential: "缺少可导入的授权", failed: "导入失败", workspace_selection_required: "请在完整工作台选择工作区",
   };
   function protocolRow(row) {
-    if (row.login !== "ok") return [row.code === "bridge_email_verification" ? "warning" : "danger", ERRORS[row.code] || "登录失败"];
+    if (row.login !== "ok") return [row.code === "bridge_email_verification" ? "warning" : "danger", row.message || ERRORS[row.code] || "登录失败，请核对代理与凭据"];
     if (row.import === "imported") return ["success", "已登录，已导入"];
     const label = IMPORT_LABELS[row.import] || "未确认导入";
     return [row.import === "failed" ? "danger" : "warning", "已登录，" + label];
@@ -651,7 +651,38 @@
     const hint = node("p", "assisted-note", "每行一个账号，填写 邮箱----密码----2FA密钥。2FA 可省略，也可用 —— 或 | 分隔。");
     hint.id = "protocol-format"; lines.setAttribute("aria-describedby", hint.id);
     const batchBtn = node("button", "button primary", "开始批量登录"); batchBtn.type = "submit";
-    batch.append(inputLabel, hint, batchBtn);
+    const network = node("div", "assisted-pair");
+    const proxyLabel = node("label", "assisted-field", "登录代理");
+    const proxyMode = document.createElement("select"); proxyMode.name = "protocol_proxy_mode";
+    for (const [value, text] of [["auto", "自动：账号绑定 → 母号代理 → 系统默认"], ["inherit", "继承指定母号代理"],
+      ["profile", "选择代理档案"], ["custom", "自定义代理"], ["default", "系统默认出口"], ["direct", "服务器直连"]]) {
+      const option = document.createElement("option"); option.value = value; option.textContent = text; proxyMode.append(option);
+    }
+    proxyLabel.append(proxyMode);
+    const concurrencyLabel = node("label", "assisted-field", "同出口并发数");
+    const concurrency = document.createElement("input"); concurrency.type = "number"; concurrency.min = "1"; concurrency.max = "10";
+    concurrency.value = "5"; concurrency.name = "protocol_concurrency"; concurrencyLabel.append(concurrency);
+    concurrency.required = true;
+    network.append(proxyLabel, concurrencyLabel);
+    const teamLabel = node("label", "assisted-field", "母号团队（可选）");
+    const team = document.createElement("select"); team.name = "protocol_workspace_id";
+    const automatic = document.createElement("option"); automatic.value = ""; automatic.textContent = "按邮箱匹配已同步的团队"; team.append(automatic); teamLabel.append(team);
+    const profileLabel = node("label", "assisted-field", "代理档案");
+    const profile = document.createElement("select"); profile.name = "protocol_proxy_profile_id"; profileLabel.append(profile);
+    const custom = field("代理地址", "protocol_proxy_url", "password", "", false);
+    custom.input.placeholder = "http://用户名:密码@主机:端口 或 socks5://主机:端口";
+    const networkNote = node("p", "assisted-note", "优先保留账号固定出口。登录后自动保存、识别母号或子号并刷新额度；确认母号后自动登记团队和同步成员。");
+    const optionsState = node("p", "assisted-note", "正在读取团队和代理档案…"); optionsState.setAttribute("role", "status");
+    const retryOptions = button("重新读取代理选项", () => void loadOptions()); retryOptions.hidden = true;
+    function syncNetwork() {
+      profileLabel.hidden = proxyMode.value !== "profile";
+      custom.wrap.hidden = proxyMode.value !== "custom";
+      profile.required = proxyMode.value === "profile";
+      custom.input.required = proxyMode.value === "custom";
+    }
+    proxyMode.addEventListener("change", syncNetwork);
+    batch.append(inputLabel, hint, network, teamLabel, profileLabel, custom.wrap, networkNote, optionsState, retryOptions, batchBtn);
+    syncNetwork();
 
     const disclosure = node("details", "assisted-manual");
     const reset = node("form", "assisted-group"); reset.autocomplete = "off";
@@ -676,6 +707,7 @@
       const locked = Boolean(protocolSubmitting || protocolActive() || !available);
       batchBtn.disabled = resetBtn.disabled = locked;
       lines.readOnly = protocolSubmitting === "protocol_login";
+      for (const control of [proxyMode, team, profile, custom.input, concurrency]) control.disabled = locked;
       batchBtn.textContent = protocolSubmitting === "protocol_login" ? "正在提交…" : "开始批量登录";
       resetBtn.textContent = protocolSubmitting === "protocol_reset" ? "正在提交…" : "重设 2FA";
       if (protocolTask) progress.update(protocolTask);
@@ -693,6 +725,26 @@
       } catch (error) { if (attached()) tone(status, "warning", error.message); }
       if (attached()) { check.hidden = available; sync(); }
     }
+    async function loadOptions() {
+      retryOptions.hidden = true;
+      try {
+        const options = await request("/api/protocol-auth/options");
+        if (!attached()) return;
+        team.replaceChildren(automatic);
+        for (const item of options.workspaces || []) {
+          const option = document.createElement("option"); option.value = item.id;
+          option.textContent = item.name + " · " + item.owner_email; team.append(option);
+        }
+        profile.replaceChildren();
+        for (const item of options.proxies || []) {
+          const option = document.createElement("option"); option.value = item.id; option.textContent = item.name; profile.append(option);
+        }
+        optionsState.textContent = options.default_has_proxy ? "系统默认：已配置代理。" : "系统默认未配置代理；无法匹配账号或团队时将使用服务器直连。";
+        if (!(options.proxies || []).length) optionsState.textContent += " 暂无可用代理档案，可选择自定义代理。";
+      } catch (_) {
+        if (attached()) { optionsState.textContent = "团队和代理选项读取失败，可重试或使用自定义代理。"; retryOptions.hidden = false; }
+      }
+    }
     async function pollStatus() {
       const id = protocolTask?.operation_id;
       if (!id || !attached() || reading || !protocolActive()) return;
@@ -705,6 +757,7 @@
         if (protocolError) { protocolError = ""; clearError(); }
         refresh.hidden = true;
         sync();
+        if (!protocolActive() && data.result?.imported > 0) await api()?.bootPage();
         if (protocolActive()) view.timer = setTimeout(pollStatus, 2000);
       } catch (error) {
         if (!attached() || id !== protocolTask?.operation_id) return;
@@ -736,7 +789,11 @@
     batch.addEventListener("submit", event => {
       event.preventDefault();
       if (batchBtn.disabled || !batch.reportValidity()) return;
-      void start("protocol_login", "/api/protocol-auth/batch-login", {text: lines.value});
+      const payload = {text: lines.value, proxy_mode: proxyMode.value, concurrency: Number(concurrency.value),
+        workspace_id: team.value ? Number(team.value) : null,
+        proxy_profile_id: proxyMode.value === "profile" && profile.value ? Number(profile.value) : null};
+      if (proxyMode.value === "custom") payload.proxy = custom.input.value.trim();
+      void start("protocol_login", "/api/protocol-auth/batch-login", payload);
     });
     reset.addEventListener("submit", event => {
       event.preventDefault();
@@ -745,7 +802,7 @@
       pw.input.value = ""; totp.input.value = "";
       void start("protocol_reset", "/api/protocol-auth/reset", payload);
     });
-    sync(); void checkConnection(); void pollStatus();
+    sync(); void checkConnection(); void loadOptions(); void pollStatus();
   }
   function renderVault() {
     const section = node("section", "assisted-vault");
@@ -897,5 +954,7 @@
     if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", openProtocol, {once: true});
     else openProtocol();
   }
-  window.Team48AssistedLogin = {open, splitAccountLine};
+  function openProtocol(trigger) { mode = "protocol"; open(trigger || opener); }
+  document.getElementById("register-protocol-import")?.addEventListener("click", event => openProtocol(event.currentTarget));
+  window.Team48AssistedLogin = {open, openProtocol, splitAccountLine};
 })();

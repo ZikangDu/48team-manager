@@ -37,6 +37,9 @@ class ProtocolBatchLoginRequest(BaseModel):
     text: str = Field(min_length=1, max_length=200_000)
     proxy: str | None = Field(default=None, max_length=500)
     concurrency: int | None = Field(default=None, ge=1, le=10)
+    proxy_mode: Literal["auto", "inherit", "default", "profile", "custom", "direct"] = "auto"
+    workspace_id: int | None = Field(default=None, gt=0, strict=True)
+    proxy_profile_id: int | None = Field(default=None, gt=0, strict=True)
 
 
 class ProtocolResetRequest(BaseModel):

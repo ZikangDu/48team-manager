@@ -862,7 +862,7 @@ async def recover_stale_operations(session: AsyncSession) -> dict[str, Any]:
     stats = {"recovered": len(recovered), "manual": 0, "ids": []}
     for row in recovered:
         stats["ids"].append(row.public_id)
-        if row.op_type == "workspace_sync" and row.idempotency_key:
+        if row.op_type in {"workspace_sync", "authorization_followup"} and row.idempotency_key:
             row.state = "queued"
             row.current_step = "queued"
             row.started_at = None

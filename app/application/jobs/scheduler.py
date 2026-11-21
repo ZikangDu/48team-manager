@@ -150,11 +150,19 @@ async def dispatch_workspace_queue() -> None:
             await dispatch_workspace_sync(session)
 
 
+async def dispatch_authorization_queue() -> None:
+    from app.application.authorization_followup import dispatch
+    if _session_factory is not None:
+        async with _session_factory() as session:
+            await dispatch(session)
+
+
 def configure_jobs(settings: Settings) -> None:
     job_ids = (
         "official_quota_probe_scan",
         "quota_queue_dispatch",
         "workspace_queue_dispatch",
+        "authorization_queue_dispatch",
         "runtime_heartbeat",
         "auth_probe_scan",
         "auto_reauth_scan",
@@ -171,6 +179,7 @@ def configure_jobs(settings: Settings) -> None:
     scheduler.add_job(scheduled_quota_probe, IntervalTrigger(minutes=1), id="official_quota_probe_scan", replace_existing=True, max_instances=1, coalesce=True)
     scheduler.add_job(dispatch_quota_queue, IntervalTrigger(seconds=2), id="quota_queue_dispatch", replace_existing=True, max_instances=1, coalesce=True)
     scheduler.add_job(dispatch_workspace_queue, IntervalTrigger(seconds=2), id="workspace_queue_dispatch", replace_existing=True, max_instances=1, coalesce=True)
+    scheduler.add_job(dispatch_authorization_queue, IntervalTrigger(seconds=2), id="authorization_queue_dispatch", replace_existing=True, max_instances=1, coalesce=True)
     scheduler.add_job(scheduled_auth_probe, IntervalTrigger(minutes=1), id="auth_probe_scan", replace_existing=True)
     scheduler.add_job(scheduled_sub2api_status_sync, IntervalTrigger(seconds=15), id="sub2api_status_sync", replace_existing=True, max_instances=1, coalesce=True)
     scheduler.add_job(scheduled_auto_reauth, IntervalTrigger(minutes=30), id="auto_reauth_scan", replace_existing=True)

@@ -12,6 +12,87 @@
   const submit = byId("bridge-exchange-submit");
   const waiting = byId("bridge-loading");
   const unavailable = byId("bridge-unavailable");
+  const autoSave = byId("bridge-auto-save");
+  const autoStatus = byId("bridge-auto-save-status");
+  const autoRetry = byId("bridge-auto-save-retry");
+  let autoQueue = Promise.resolve(), failedAutoSave = [], pageClosed = false, retrying = 0;
+  const autoWarnings = new Map(), autoSaved = new Set();
+  const followupTimers = new Map(), followupProgress = new Map();
+  try { autoSave.checked = localStorage.getItem("team48.bridge.auto-save") !== "false"; } catch (_) {}
+  function autoFeedback(text, tone = "") {
+    autoStatus.textContent = text; autoStatus.dataset.tone = tone; autoStatus.hidden = !text;
+  }
+  function showAutoSummary() {
+    const pending = failedAutoSave.length;
+    autoFeedback([autoSaved.size ? "本页已保存 " + autoSaved.size + " 个账号的授权到 Team48。" : "",
+      ...autoWarnings.values(),
+      ...followupProgress.values(),
+      pending ? "另有 " + pending + " 批授权尚未保存：" + failedAutoSave.at(-1).message + " 授权仍在工作台中，可重试或手动保存。" : "",
+      retrying ? "正在重试 " + retrying + " 批授权…" : ""].filter(Boolean).join(" "), pending || autoWarnings.size ? "danger" : "");
+    autoRetry.hidden = pending === 0;
+    autoRetry.disabled = !autoSave.checked || retrying > 0;
+  }
+  function watchFollowup(accountId, email, attempt = 0) {
+    if (!Number.isInteger(accountId) || pageClosed) return;
+    clearTimeout(followupTimers.get(accountId));
+    const timer = setTimeout(async () => {
+      try {
+        const status = await request("/api/bridge-workbench/authorizations/" + accountId + "/status", undefined, "GET");
+        if (pageClosed) return;
+        followupProgress.set(accountId, email + "：" + status.message + "。");
+        showAutoSummary();
+        if (!status.done && attempt < 120) watchFollowup(accountId, email, attempt + 1);
+        else if (!status.done) {
+          followupProgress.set(accountId, email + "：后台仍在处理，可在任务记录查看进度。");
+          showAutoSummary();
+        }
+      } catch (error) {
+        if (pageClosed) return;
+        followupProgress.set(accountId, email + "：进度暂不可读，后台任务仍会继续。" + error.message);
+        showAutoSummary();
+        if (attempt < 5) watchFollowup(accountId, email, attempt + 1);
+      }
+    }, attempt ? 2000 : 300);
+    followupTimers.set(accountId, timer);
+  }
+  function queueAutoSave(accounts, retry = false) {
+    autoQueue = autoQueue.then(async () => {
+      if (pageClosed || !autoSave.checked) { if (retry) retrying--; return; }
+      autoFeedback("正在自动保存本次授权到 Team48…");
+      try {
+        const result = await request("/api/bridge-workbench/authorizations/auto-save", {accounts});
+        if (pageClosed) return;
+        const saved = (result.results || []).filter(item => item.status === "saved" || item.status === "unchanged");
+        for (const item of result.results || []) {
+          const key = item.email || item.code;
+          if (item.status === "blocked") autoWarnings.set(key, (item.email ? item.email + "：" : "") + item.message);
+          else { autoWarnings.delete(key); autoSaved.add(item.email); }
+          if (item.followup?.operation_id && Number.isInteger(item.account_id)) watchFollowup(item.account_id, item.email);
+          else if (item.followup?.message) autoWarnings.set(key, item.email + "：" + item.followup.message);
+        }
+        if (saved.length) window.dispatchEvent(new CustomEvent("team48:accounts-updated"));
+      } catch (error) {
+        if (!pageClosed) {
+          // Retain only in memory for an explicit retry; never write credentials
+          // to localStorage, logs, or the parent page's markup.
+          failedAutoSave.push({accounts, message: error.message});
+        }
+      } finally {
+        if (retry) retrying--;
+        if (!pageClosed) showAutoSummary();
+      }
+    });
+  }
+  autoSave.addEventListener("change", () => {
+    try { localStorage.setItem("team48.bridge.auto-save", String(autoSave.checked)); } catch (_) {}
+    send("auto-save", {enabled: autoSave.checked});
+    autoRetry.disabled = !autoSave.checked || retrying > 0;
+  });
+  autoRetry.addEventListener("click", () => {
+    if (!autoSave.checked) return;
+    const retry = failedAutoSave; failedAutoSave = []; retrying += retry.length; autoRetry.hidden = true;
+    for (const item of retry) queueAutoSave(item.accounts, true);
+  });
   let dialogMode = "", draft = null, backups = [], saving = false, ready = false;
   let exchangeGeneration = 0, preparing = false, closing = false;
   let loadTimeout;
@@ -77,9 +158,13 @@
       byId("bridge-import").disabled = byId("bridge-save").disabled = false;
       byId("bridge-kernel-status").textContent = "内嵌授权内核已连接";
       theme();
+      send("auto-save", {enabled: autoSave.checked});
       send("select-tool", {tool: desiredTool()});
     }
     if (message.type === "height" && Number.isFinite(message.height)) frame.style.height = Math.max(400, Math.min(message.height, 50000)) + "px";
+    if (message.type === "authorization-complete" && autoSave.checked && Array.isArray(message.accounts)
+        && message.accounts.length > 0 && message.accounts.length <= 50) queueAutoSave(message.accounts);
+    if (message.type === "auto-save-error") autoFeedback("本次授权无法自动读取，请使用「保存结果到 Team48」。", "danger");
     if (message.type === "tool-changed" && typeof message.tool === "string") {
       const url = new URL(location.href);
       url.searchParams.set("tool", message.tool);
@@ -260,6 +345,9 @@
             input.closest("label").append(node("small", "已保存"));
           }
           feedback("已保存 " + (result.imported?.length ?? credentials.length) + " 个账号的授权。");
+          for (const item of result.imported || []) {
+            if ((result.followups || []).some(task => task.account_id === item.account_id && task.operation_id)) watchFollowup(item.account_id, item.email);
+          }
         }
         for (const input of selected.filter(input => input.dataset.kind === "backup")) {
           const backup = backups[Number(input.value)];
@@ -284,6 +372,9 @@
     }
   });
   window.addEventListener("pagehide", () => {
+    pageClosed = true; failedAutoSave = [];
+    for (const timer of followupTimers.values()) clearTimeout(timer);
+    followupTimers.clear();
     exchangeGeneration++;
     backups = [];
     dialog.close();
